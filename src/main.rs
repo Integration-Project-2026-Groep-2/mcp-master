@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let base_url = env::var("MCP_BASE_URL").expect("MCP_BASE_URL must be set");
     let port = env::var("MCP_PORT").unwrap_or_else(|_| "5555".to_string());
 
-    let controlroom_url = format!("{}:{}", base_url, port);
+    let controlroom_url = format!("{}:{}/mcp", base_url, port);
 
     let server_url = Url::parse(&controlroom_url)?;
     let transport = StreamableHttpClientTransport::from_uri(server_url.as_str());
@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if tools.tools.iter().any(|t| t.name == "heartbeat_status") {
         use serde_json::json;
         let mut map = serde_json::Map::new();
-        map.insert("service".to_string(), json!("elasticsearch"));
+        map.insert("service".to_string(), json!(""));
 
         let result = client
             .call_tool(rmcp::model::CallToolRequestParams {
