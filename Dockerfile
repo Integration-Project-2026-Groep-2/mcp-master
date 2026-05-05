@@ -1,19 +1,28 @@
-FROM rust:latest as builder
-RUN USER=root cargo new --bin mcp-master
+FROM rust:latest AS builder
 
+RUN USER=root cargo new --bin mcp-master
 WORKDIR /mcp-master
 
 COPY ./Cargo.toml ./Cargo.toml
+COPY ./Cargo.lock ./Cargo.lock
+
 RUN cargo build --release
-RUN rm src/*.rs ./target/release/deps/mcp_master*
-ADD . ./
+RUN rm src/*.rs target/release/deps/mcp_master*
+
+COPY ./src ./src
 RUN cargo build --release
+
+FROM debian:bookworm-slim
 
 ARG APP=/app
 ARG APP_USER=nasr
 
-RUN groupadd $APP_USER && useradd -g $APP_USER $APP_USER && mkdir -p $APP
-RUN cp /mcp-master//target/release/mcp-master $APP/mcp-master
+RUN groupadd $APP_USER \
+ && useradd -g $APP_USER $APP_USER \
+ && mkdir -p $APP
 
-USER $USER
+COPY --from=builder /mcp-master/target/release/mcp-master $APP/mcp-master
+
+USER $APP_USER
 WORKDIR $APP
+CMD ["./mcp-master"]
