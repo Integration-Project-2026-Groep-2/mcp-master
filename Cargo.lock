@@ -838,6 +838,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "dotenvy",
  "rabbitmq-stream-client",
  "reqwest 0.12.28",

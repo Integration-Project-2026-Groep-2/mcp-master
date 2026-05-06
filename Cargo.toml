@@ -38,6 +38,7 @@ dotenvy = "0.15"
 
 # rabbitmq-stream-client speaks the Streams protocol, different wire format).
 rabbitmq-stream-client = "0.5"
+chrono = "0.4.44"
 
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
