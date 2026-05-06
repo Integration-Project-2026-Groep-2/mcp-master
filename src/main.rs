@@ -16,7 +16,6 @@ use chrono::{NaiveTime, Timelike, Utc};
 const MAX_ITERATIONS: usize = 10;
 const MAX_TOKENS: u32 = 8192;
 
-
 // event times for triggering events. 0.00 | 8.30 | 12.30 | 16.30
 fn should_trigger_analysis() -> bool {
     let now = Utc::now();
@@ -31,7 +30,6 @@ fn should_trigger_analysis() -> bool {
         current_time.hour() == t.hour() && current_time.minute() == t.minute()
     })
 }
-
 
 async fn run_prompt(
     prompt: &str,
@@ -48,7 +46,7 @@ async fn run_prompt(
         MAX_ITERATIONS,
         MAX_TOKENS,
     )
-        .await
+    .await
 }
 
 pub async fn handle_prompt(
@@ -63,8 +61,6 @@ pub async fn handle_prompt(
     Ok(())
 }
 
-
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -72,7 +68,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "info,mcp_master=debug".into()),
+                .unwrap_or_else(|_| "info,mcp_master=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -99,7 +95,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // NOTE(nasr): configuration stuff
     let llm = AnthropicClient::from_env()?;
     let teams_config = tcom::TeamsConfig::from_env()?;
 
@@ -111,10 +106,8 @@ async fn main() -> Result<()> {
         if prompt.trim().is_empty() {
             anyhow::bail!("no prompt provided (pass as argv[1] or via stdin)");
         }
-
         handle_prompt(&prompt, &teams_config, &llm, &pool, &tool_specs).await?;
     } else if server_mode {
-
         tracing::info!("starting server mode on :8080");
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
@@ -127,11 +120,28 @@ async fn main() -> Result<()> {
                     let mut buf = vec![0u8; 4096];
                     match reader.read(&mut buf).await {
                         Ok(n) => {
-                            let prompt = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                            // notee(nasr): remove header junk from message
+                            let raw = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                            let prompt = raw
+                                .split("\r\n\r\n")
+                                .nth(1)
+                                .unwrap_or(&raw)
+                                .trim()
+                                .to_string();
+
                             tracing::info!(prompt, "received prompt");
+
                             match run_prompt(&prompt, &llm, &pool, &tool_specs).await {
                                 Ok(answer) => {
-                                    let _ = writer.write_all(answer.as_bytes()).await;
+                                    if let Err(e) = tcom::publish_to_teams(&teams_config, &answer).await {
+                                        tracing::error!("publish to teams error: {e:#}");
+                                    }
+                                    let http_response = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        answer.len(),
+                                        answer
+                                    );
+                                    let _ = writer.write_all(http_response.as_bytes()).await;
                                 }
                                 Err(e) => tracing::error!("run_prompt error: {e:#}"),
                             }
@@ -156,7 +166,6 @@ async fn main() -> Result<()> {
 
         tracing::info!("starting Teams poll loop");
 
-        // Seed cursor
         tracing::info!("seeding cursor...");
         let seed_url = format!(
             "https://graph.microsoft.com/v1.0/teams/{}/channels/{}/messages?$top=1",
@@ -167,9 +176,7 @@ async fn main() -> Result<()> {
                 let status = res.status();
                 tracing::info!(%status, "seed response received");
                 match res.json::<serde_json::Value>().await {
-                    Ok(body) => {
-                        tracing::info!(body = %body, "seed body");
-                    }
+                    Ok(body) => tracing::info!(body = %body, "seed body"),
                     Err(e) => tracing::error!("failed to parse seed response: {e:#}"),
                 }
             }
@@ -182,11 +189,8 @@ async fn main() -> Result<()> {
                     for msg in messages {
                         let content = msg["body"]["content"].as_str().unwrap_or("");
                         tracing::info!(content, "incoming Teams message");
-
                         println!("{content}");
                     }
-
-
                 }
                 Err(e) => tracing::error!("poll error: {e:#}"),
             }
@@ -198,10 +202,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-
-/// Resolve MCP endpoints from env. Prefers the multi-server format
-/// `MCP_SERVERS=label@url,label@url,...`; falls back to legacy single-server
-/// `MCP_BASE_URL` + `MCP_PORT` when the multi-server var is absent or empty.
 fn resolve_endpoints() -> Vec<(String, String)> {
     if let Ok(value) = std::env::var("MCP_SERVERS") {
         let parsed = mcp::parse_endpoints(&value);
@@ -219,8 +219,6 @@ fn resolve_endpoints() -> Vec<(String, String)> {
     vec![("default".into(), format!("{base}:{port}/mcp"))]
 }
 
-/// Prompt comes from argv[1] preferred (one-shot), falling back to stdin
-/// for pipe-friendly usage. Empty string is rejected by the caller.
 fn read_prompt(args: &[String]) -> Result<String> {
     if let Some(arg) = args.iter().skip(1).find(|a| !a.starts_with("--")) {
         return Ok(arg.clone());
