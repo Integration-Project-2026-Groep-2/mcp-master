@@ -23,5 +23,22 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Anthropic Messages API transport. rustls + json only, no native TLS,
+# matches rmcp's TLS choice and keeps the binary distroless-ready.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Async fn in trait objects (`&dyn LlmClient`) on stable Rust without
+# Send/Sync friction. Desugars to `Box<dyn Future + Send>`.
+async-trait = "0.1"
+
+# Load `.env` (and `.env.local` if present) into the process environment
+# at startup. Production reads ANTHROPIC_API_KEY straight from env; this
+# just makes local dev one-shot (`cargo run`) without `source`-gymnastics.
+dotenvy = "0.15"
+
 # rabbitmq-stream-client speaks the Streams protocol, different wire format).
 rabbitmq-stream-client = "0.5"
+
+[dev-dependencies]
+# Async HTTP mock for unit-testing the Anthropic client without network.
+wiremock = "0.6"
