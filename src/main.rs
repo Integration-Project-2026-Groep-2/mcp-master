@@ -36,13 +36,16 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let base_url = std::env::var("MCP_BASE_URL").unwrap_or_else(|_| "http://localhost".to_string());
-    let port = std::env::var("MCP_PORT").unwrap_or_else(|_| "7002".to_string());
+    let endpoints = resolve_endpoints();
+    if endpoints.is_empty() {
+        anyhow::bail!(
+            "no MCP endpoints configured — set MCP_SERVERS=label@url,... \
+             or legacy MCP_BASE_URL+MCP_PORT"
+        );
+    }
 
-    let svc = mcp::connect(&base_url, &port).await?;
-
-    let tools = svc.list_tools(Default::default()).await?;
-    let tool_specs: Vec<ToolSpec> = tools.tools.iter().map(mcp::tool_to_spec).collect();
+    let pool = mcp::McpPool::connect(endpoints).await?;
+    let tool_specs: Vec<ToolSpec> = pool.tool_specs();
     tracing::info!(count = tool_specs.len(), "loaded tools");
 
     let args: Vec<String> = std::env::args().collect();
@@ -54,8 +57,7 @@ async fn main() -> Result<()> {
         for spec in &tool_specs {
             println!("{}\t{}", spec.name, spec.description);
         }
-        let mcp_client = mcp::McpClient::new(svc);
-        mcp_client.shutdown().await?;
+        pool.shutdown().await?;
         return Ok(());
     }
 
@@ -68,13 +70,11 @@ async fn main() -> Result<()> {
         anyhow::bail!("no prompt provided (pass as argv[1] or via stdin)");
     }
 
-    let mcp_client = mcp::McpClient::new(svc);
-
     let answer = orchestrator::run(
         prompt,
         SYSTEM_PROMPT,
         &llm,
-        &mcp_client,
+        &pool,
         &tool_specs,
         MAX_ITERATIONS,
         MAX_TOKENS,
@@ -83,8 +83,29 @@ async fn main() -> Result<()> {
 
     println!("{answer}");
 
-    mcp_client.shutdown().await?;
+    pool.shutdown().await?;
     Ok(())
+}
+
+/// Resolve MCP endpoints from env. Prefers the multi-server format
+/// `MCP_SERVERS=label@url,label@url,...`; falls back to legacy single-server
+/// `MCP_BASE_URL` + `MCP_PORT` when the multi-server var is absent or empty.
+fn resolve_endpoints() -> Vec<(String, String)> {
+    if let Ok(value) = std::env::var("MCP_SERVERS") {
+        let parsed = mcp::parse_endpoints(&value);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+        tracing::warn!(
+            "MCP_SERVERS is set but parsed to zero valid entries — \
+             falling back to legacy single-server vars"
+        );
+    }
+
+    // Legacy fallback. Default port 7002 preserved from prior behaviour.
+    let base = std::env::var("MCP_BASE_URL").unwrap_or_else(|_| "http://localhost".into());
+    let port = std::env::var("MCP_PORT").unwrap_or_else(|_| "7002".into());
+    vec![("default".into(), format!("{base}:{port}/mcp"))]
 }
 
 /// Prompt comes from argv[1] preferred (one-shot), falling back to stdin
