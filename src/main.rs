@@ -1,46 +1,102 @@
-use rmcp::{
-    ServiceExt,
-    transport::StreamableHttpClientTransport,
-};
+mod llm;
+mod mcp;
+mod orchestrator;
 
-use url::Url;
-use std::error::Error;
-use std::env;
+use std::io::Read;
+
+use anyhow::{Context, Result};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::llm::ToolSpec;
+use crate::llm::anthropic::AnthropicClient;
+
+/// Maximum tool-call iterations per user prompt — runaway-prevention.
+const MAX_ITERATIONS: usize = 10;
+
+/// Per-call token cap. Cheaper than the model's hard limit and protects
+/// the budget from prompt-bloat. With extended thinking enabled, must
+/// leave room for the reasoning budget plus the visible output.
+const MAX_TOKENS: u32 = 8192;
+
+const SYSTEM_PROMPT: &str = "You are the master agent for the Desideriushogeschool ShiftFestival AI team. \
+Answer the user's question by calling the appropriate MCP tools when relevant. \
+Reply in the same language as the user.";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
+    // Load .env (if present) into the process environment. Silent-OK when
+    // missing — production sets these via the container env directly.
+    let _ = dotenvy::dotenv();
 
-    let base_url = env::var("MCP_BASE_URL").expect("MCP_BASE_URL must be set");
-    let port = env::var("MCP_PORT").unwrap_or_else(|_| "5555".to_string());
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,mcp_master=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    let controlroom_url = format!("{}:{}/mcp", base_url, port);
+    let base_url = std::env::var("MCP_BASE_URL").unwrap_or_else(|_| "http://localhost".to_string());
+    let port = std::env::var("MCP_PORT").unwrap_or_else(|_| "7002".to_string());
 
-    let server_url = Url::parse(&controlroom_url)?;
-    let transport = StreamableHttpClientTransport::from_uri(server_url.as_str());
+    let svc = mcp::connect(&base_url, &port).await?;
 
-    let client = ().serve(transport).await?;
+    let tools = svc.list_tools(Default::default()).await?;
+    let tool_specs: Vec<ToolSpec> = tools.tools.iter().map(mcp::tool_to_spec).collect();
+    tracing::info!(count = tool_specs.len(), "loaded tools");
 
-    let tools = client.list_tools(None).await?;
-    for t in &tools.tools {
-        println!("- {}", t.name);
+    let args: Vec<String> = std::env::args().collect();
+
+    // --list-tools: debug shortcut to verify the MCP layer without burning
+    // Anthropic credits. Keep this small — promote to clap if a third flag
+    // ever appears.
+    if args.iter().any(|a| a == "--list-tools") {
+        for spec in &tool_specs {
+            println!("{}\t{}", spec.name, spec.description);
+        }
+        let mcp_client = mcp::McpClient::new(svc);
+        mcp_client.shutdown().await?;
+        return Ok(());
     }
 
-    if tools.tools.iter().any(|t| t.name == "heartbeat_status") {
-        use serde_json::json;
-        let mut map = serde_json::Map::new();
-        map.insert("service".to_string(), json!(""));
+    // Anthropic is only required for the agent path, not for --list-tools,
+    // so we read the key only after the early-return.
+    let llm = AnthropicClient::from_env()?;
 
-        let result = client
-            .call_tool(rmcp::model::CallToolRequestParams {
-                meta: None,
-                task: None,
-                name: "heartbeat_status".into(),
-                arguments: Some(map),
-            })
-            .await?;
-
-        println!("Tool result: {:?}", result);
+    let prompt = read_prompt(&args)?;
+    if prompt.trim().is_empty() {
+        anyhow::bail!("no prompt provided (pass as argv[1] or via stdin)");
     }
 
+    let mcp_client = mcp::McpClient::new(svc);
+
+    let answer = orchestrator::run(
+        prompt,
+        SYSTEM_PROMPT,
+        &llm,
+        &mcp_client,
+        &tool_specs,
+        MAX_ITERATIONS,
+        MAX_TOKENS,
+    )
+    .await?;
+
+    println!("{answer}");
+
+    mcp_client.shutdown().await?;
     Ok(())
+}
+
+/// Prompt comes from argv[1] preferred (one-shot), falling back to stdin
+/// for pipe-friendly usage. Empty string is rejected by the caller.
+fn read_prompt(args: &[String]) -> Result<String> {
+    if let Some(arg) = args.iter().skip(1).find(|a| !a.starts_with("--")) {
+        return Ok(arg.clone());
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .lock()
+        .read_to_string(&mut buf)
+        .context("reading prompt from stdin")?;
+    Ok(buf)
 }
