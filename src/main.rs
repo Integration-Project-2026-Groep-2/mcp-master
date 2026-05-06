@@ -6,6 +6,7 @@ mod tcom;
 
 use std::io::Read;
 use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use crate::{llm::anthropic::AnthropicClient, prompts::ANALYZE_CONTROLROOM_PROMPT};
 use crate::llm::ToolSpec;
@@ -112,20 +113,41 @@ async fn main() -> Result<()> {
         }
 
         handle_prompt(&prompt, &teams_config, &llm, &pool, &tool_specs).await?;
-    }  else if server_mode {
+    } else if server_mode {
 
-        // TODO(nasr): listen to 8080 for a future chat bot
+        tracing::info!("starting server mode on :8080");
+
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 
         loop {
-
-            if should_trigger_analysis()  {
-                if let Err(e) = handle_prompt(ANALYZE_CONTROLROOM_PROMPT, &teams_config, &llm, &pool, &tool_specs).await {
-                    tracing::error!("handle_prompt error: {e:#}");
+            tokio::select! {
+                Ok((stream, addr)) = listener.accept() => {
+                    tracing::info!(%addr, "incoming connection");
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut buf = vec![0u8; 4096];
+                    match reader.read(&mut buf).await {
+                        Ok(n) => {
+                            let prompt = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                            tracing::info!(prompt, "received prompt");
+                            match run_prompt(&prompt, &llm, &pool, &tool_specs).await {
+                                Ok(answer) => {
+                                    let _ = writer.write_all(answer.as_bytes()).await;
+                                }
+                                Err(e) => tracing::error!("run_prompt error: {e:#}"),
+                            }
+                        }
+                        Err(e) => tracing::error!("read error: {e:#}"),
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    if should_trigger_analysis() {
+                        if let Err(e) = handle_prompt(ANALYZE_CONTROLROOM_PROMPT, &teams_config, &llm, &pool, &tool_specs).await {
+                            tracing::error!("handle_prompt error: {e:#}");
+                        }
+                    }
                 }
             }
-
         }
-
     } else {
         let teams_config = TeamsConfig::from_env()?;
         let client = reqwest::Client::builder()
