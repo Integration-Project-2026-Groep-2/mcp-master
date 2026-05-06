@@ -1,4 +1,4 @@
-FROM rust:latest AS builder
+FROM rust:1.95-bookworm AS builder
 
 RUN USER=root cargo new --bin mcp-master
 WORKDIR /mcp-master
@@ -13,6 +13,11 @@ COPY ./src ./src
 RUN cargo build --release
 
 FROM debian:bookworm-slim
+
+RUN apt-get update \
+        && apt-get install -y --no-install-recommends ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
 
 ARG APP=/app
 ARG APP_USER=nasr

@@ -1,6 +1,4 @@
 /target
-
-# Local credentials (CLAUDE.md § 9 — never commit secrets).
 .env
 .env.local
 
