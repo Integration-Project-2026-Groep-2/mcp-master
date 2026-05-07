@@ -146,18 +146,22 @@ async fn chat(
         let body = Json(serde_json::json!({ "error": e }));
         (StatusCode::BAD_REQUEST, body).into_response()
     })?;
-    // Phase 1: still call single-prompt orchestrator path with the latest
-    // user turn. Phase 3 will switch this to run_with_messages so seeded
-    // history is honoured.
+    // Extract the latest user prompt for tracing + the chat_completed event
+    // payload before `messages` is moved into the orchestrator.
     let prompt = match messages.last().map(|m| &m.content[..]) {
         Some([ContentBlock::Text { text }]) => text.clone(),
         _ => String::new(),
     };
-    tracing::info!(prompt = %prompt, "/chat received");
+    let conversation_length = messages.len();
+    tracing::info!(
+        prompt = %prompt,
+        conversation_length,
+        "/chat received"
+    );
 
     let started = std::time::Instant::now();
-    let answer = orchestrator::run(
-        prompt.clone(),
+    let answer = orchestrator::run_with_messages(
+        messages,
         SETUP_PROMPT,
         &state.llm,
         &state.pool,
@@ -175,6 +179,7 @@ async fn chat(
             "answer": answer,
             "answer_length": answer.len(),
             "duration_ms": duration_ms,
+            "conversation_length": conversation_length,
         });
         if let Err(e) = publisher.publish_event("chat_completed", payload).await {
             tracing::warn!("failed to publish chat_completed event: {e:#}");
