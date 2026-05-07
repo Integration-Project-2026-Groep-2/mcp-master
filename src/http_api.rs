@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -11,7 +11,7 @@ use axum::{
 use chrono::{NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::{
     llm::{ContentBlock, Message, Role, ToolSpec, anthropic::AnthropicClient},
@@ -24,6 +24,16 @@ use crate::{
 
 const MAX_ITERATIONS: usize = 10;
 const MAX_TOKENS: u32 = 8192;
+
+// DoS guards. Total request body capped at the axum layer; in addition the
+// per-turn caps in `ChatRequest::into_messages` reject pathological shapes
+// (1000-turn arrays, single 64KB content blocks) that fit within the body
+// budget but would still amplify Anthropic input tokens 10x via the
+// orchestrator tool-loop.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_TURNS: usize = 40;
+const MAX_CONTENT_BYTES_PER_TURN: usize = 8192;
+const REQUEST_TIMEOUT_SECONDS: u64 = 120;
 
 pub struct AppState {
     pub llm: AnthropicClient,
@@ -77,6 +87,9 @@ impl ChatRequest {
                 if trimmed.is_empty() {
                     return Err("prompt is empty");
                 }
+                if trimmed.len() > MAX_CONTENT_BYTES_PER_TURN {
+                    return Err("prompt exceeds maximum length");
+                }
                 Ok(vec![Message {
                     role: Role::User,
                     content: vec![ContentBlock::Text {
@@ -87,6 +100,15 @@ impl ChatRequest {
             (None, Some(turns)) => {
                 if turns.is_empty() {
                     return Err("messages array is empty");
+                }
+                if turns.len() > MAX_TURNS {
+                    return Err("messages array exceeds maximum length");
+                }
+                if turns
+                    .iter()
+                    .any(|t| t.content.len() > MAX_CONTENT_BYTES_PER_TURN)
+                {
+                    return Err("message content exceeds maximum length per turn");
                 }
                 if !matches!(turns.last().unwrap().role, ChatRole::User) {
                     return Err("last message must have role=user");
@@ -330,6 +352,11 @@ pub async fn serve(
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS),
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
@@ -448,6 +475,46 @@ mod tests {
     fn reject_empty_or_whitespace_prompt() {
         let err = parse(r#"{"prompt":"   "}"#).into_messages().unwrap_err();
         assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reject_oversized_messages_array() {
+        let mut json = String::from(r#"{"messages":["#);
+        for i in 0..(MAX_TURNS + 1) {
+            if i > 0 {
+                json.push(',');
+            }
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            json.push_str(&format!(r#"{{"role":"{role}","content":"t"}}"#));
+        }
+        json.push_str("]}");
+        let err = parse(&json).into_messages().unwrap_err();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_oversized_content_per_turn() {
+        let big = "x".repeat(MAX_CONTENT_BYTES_PER_TURN + 1);
+        let json = format!(
+            r#"{{"messages":[{{"role":"user","content":{}}}]}}"#,
+            serde_json::Value::String(big)
+        );
+        let err = parse(&json).into_messages().unwrap_err();
+        assert!(
+            err.contains("exceeds maximum length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_oversized_legacy_prompt() {
+        let big = "y".repeat(MAX_CONTENT_BYTES_PER_TURN + 1);
+        let json = format!(r#"{{"prompt":{}}}"#, serde_json::Value::String(big));
+        let err = parse(&json).into_messages().unwrap_err();
+        assert!(err.contains("exceeds maximum length"), "got: {err}");
     }
 
     #[tokio::test]
