@@ -6,6 +6,7 @@
 
 use anyhow::bail;
 use async_trait::async_trait;
+use futures_util::future::try_join_all;
 use serde_json::Value;
 
 use crate::llm::{ContentBlock, LlmClient, Message, Role, StopReason, ToolSpec};
@@ -101,23 +102,33 @@ pub async fn run_with_messages(
                     content: response.content.clone(),
                 });
 
-                // Dispatch every tool_use block, gather all tool_results into
-                // a single user turn (Anthropic convention: N tool_use in one
-                // assistant turn → N tool_result in the next user turn).
-                let mut results: Vec<ContentBlock> = Vec::new();
-                for block in response.content {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
-                        let result = mcp.call(&name, input).await?;
-                        results.push(ContentBlock::ToolResult {
-                            tool_use_id: id,
-                            content: result,
-                            is_error: false,
-                        });
-                    }
-                }
-                if results.is_empty() {
+                // Collect tool_use blocks first, then dispatch ALL in parallel
+                // via `try_join_all`. For multi-team queries (CRM + Controlroom
+                // in one round), latency drops from sum(t_i) to max(t_i) —
+                // material on Salesforce cold-paths that take seconds each.
+                // Order is preserved (try_join_all maintains input order) so
+                // tool_use_id ↔ tool_result pairing stays correct.
+                let tool_calls: Vec<(String, String, Value)> = response
+                    .content
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+                        _ => None,
+                    })
+                    .collect();
+                if tool_calls.is_empty() {
                     bail!("stop_reason=tool_use but no tool_use blocks found");
                 }
+
+                let tool_futs = tool_calls.into_iter().map(|(id, name, input)| async move {
+                    let result = mcp.call(&name, input).await?;
+                    Ok::<ContentBlock, anyhow::Error>(ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content: result,
+                        is_error: false,
+                    })
+                });
+                let results: Vec<ContentBlock> = try_join_all(tool_futs).await?;
                 messages.push(Message {
                     role: Role::User,
                     content: results,
@@ -249,6 +260,66 @@ mod tests {
                 assert!(!is_error);
             }
             other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_dispatches_multiple_tools_in_one_round_in_parallel() {
+        // Single assistant turn with TWO tool_use blocks → orchestrator must
+        // dispatch both, gather their results into a single user turn (per
+        // Anthropic's N→N convention), then iterate.
+        let llm = MockLlmClient::new(vec![
+            ChatResponse {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "toolu_a".to_string(),
+                        name: "heartbeat_status".to_string(),
+                        input: json!({}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "toolu_b".to_string(),
+                        name: "error_analysis".to_string(),
+                        input: json!({}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+            },
+            ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "Status green; zero errors.".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+            },
+        ]);
+        let exec = TestExecutor::new()
+            .with_response("heartbeat_status", "[]")
+            .await
+            .with_response("error_analysis", "{}")
+            .await;
+
+        let answer = run("status?".to_string(), "system", &llm, &exec, &[], 10, 4096)
+            .await
+            .expect("run should succeed");
+        assert_eq!(answer, "Status green; zero errors.");
+
+        // The second LLM call's last message must be a single user turn
+        // containing BOTH tool_result blocks in input order (toolu_a, toolu_b).
+        let calls = llm.calls().await;
+        assert_eq!(calls.len(), 2);
+        let user_turn = calls[1].messages.last().expect("messages non-empty");
+        assert!(matches!(user_turn.role, Role::User));
+        assert_eq!(
+            user_turn.content.len(),
+            2,
+            "both tool_results bundled in one user turn"
+        );
+        match &user_turn.content[0] {
+            ContentBlock::ToolResult { tool_use_id, .. } => assert_eq!(tool_use_id, "toolu_a"),
+            other => panic!("expected ToolResult[0], got {other:?}"),
+        }
+        match &user_turn.content[1] {
+            ContentBlock::ToolResult { tool_use_id, .. } => assert_eq!(tool_use_id, "toolu_b"),
+            other => panic!("expected ToolResult[1], got {other:?}"),
         }
     }
 
