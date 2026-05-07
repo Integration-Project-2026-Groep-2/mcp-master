@@ -1,8 +1,7 @@
-pub const ANALYZE_CONTROLROOM_PROMPT : &str = "
+pub const ANALYZE_CONTROLROOM_PROMPT: &str = "
 return a summary of the average heartbeats, statuschecks and logs. \
 when querying controlroom keep optimize for the most efficient elastic queries, \
 based on the results you get from this return a well defined summary";
-
 
 pub const SETUP_PROMPT: &str = "
 Role:
@@ -82,4 +81,3 @@ Treat Microsoft Teams as a constrained text renderer:
 - Prioritize predictability over richness.
 - Ensure output is always safely renderable in chat environments.
 ";
-

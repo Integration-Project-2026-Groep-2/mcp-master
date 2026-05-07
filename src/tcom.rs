@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 
-
-
 pub struct TeamsConfig {
     pub team_id: String,
     pub channel_id: String,
@@ -59,13 +57,14 @@ pub async fn poll_messages(
         "https://graph.microsoft.com/v1.0/teams/{}/channels/{}/messages",
         teams_config.team_id, teams_config.channel_id
     );
-    let res = client.get(&url).bearer_auth(&teams_config.access_token).send().await?;
+    let res = client
+        .get(&url)
+        .bearer_auth(&teams_config.access_token)
+        .send()
+        .await?;
     let body: serde_json::Value = res.json().await?;
 
-    let messages = body["value"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let messages = body["value"].as_array().cloned().unwrap_or_default();
 
     Ok(messages)
 }

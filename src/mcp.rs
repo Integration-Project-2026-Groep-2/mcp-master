@@ -6,6 +6,7 @@
 //! - [`parse_endpoints`]: parse the `MCP_SERVERS` env-var value.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ use serde_json::Value;
 
 use crate::llm::ToolSpec;
 use crate::orchestrator::McpExecutor;
+use crate::rabbitmq::publisher::Publisher;
 
 /// Open a Streamable-HTTP MCP session against the given URL.
 ///
@@ -165,6 +167,10 @@ pub struct McpPool {
     /// Aggregate `ToolSpec`s across all connected servers. Cached so the
     /// orchestrator can borrow without re-querying.
     tool_specs: Vec<ToolSpec>,
+
+    /// Optional event-sink for `tool_called` events on `ai.events`. Set via
+    /// `attach_publisher`; absent means no events fired (skip-warn pattern).
+    publisher: Option<Arc<Publisher>>,
 }
 
 impl McpPool {
@@ -218,6 +224,7 @@ impl McpPool {
             sessions: connected,
             tool_to_session_idx,
             tool_specs,
+            publisher: None,
         })
     }
 
@@ -225,6 +232,12 @@ impl McpPool {
     /// the orchestrator as the agent's tool surface.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tool_specs.clone()
+    }
+
+    /// Wire up an AMQP publisher so each `tool_called` event lands on
+    /// `ai.events`. Call before the pool is shared via `Arc<AppState>`.
+    pub fn attach_publisher(&mut self, publisher: Arc<Publisher>) {
+        self.publisher = Some(publisher);
     }
 
     /// Send DELETE-session to every connected server. Best-effort: a
@@ -254,9 +267,27 @@ impl McpExecutor for McpPool {
             .with_context(|| format!("no MCP server provides tool '{name}'"))?;
         let (label, svc) = &self.sessions[idx];
         tracing::debug!(tool = %name, server = %label, "dispatching MCP tool call");
-        let res = svc
+
+        let started = std::time::Instant::now();
+        let outcome = svc
             .call_tool(CallToolRequestParams::new(name.to_string()).with_arguments(map))
-            .await
+            .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let success = outcome.is_ok();
+
+        if let Some(publisher) = &self.publisher {
+            let payload = serde_json::json!({
+                "tool": name,
+                "server": label,
+                "success": success,
+                "duration_ms": duration_ms,
+            });
+            if let Err(e) = publisher.publish_event("tool_called", payload).await {
+                tracing::warn!("failed to publish tool_called event: {e:#}");
+            }
+        }
+
+        let res = outcome
             .with_context(|| format!("MCP tools/call failed for '{name}' on server '{label}'"))?;
         Ok(extract_tool_result_text(&res))
     }
