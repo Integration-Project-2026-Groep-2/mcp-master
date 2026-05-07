@@ -56,6 +56,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # logging. Only used for log-side scrubbing — lapin still gets the raw URL.
 url = "2"
 
+# JSON-Schema validation of LLM-generated tool args before they hit the
+# downstream MCP server. Defense-in-depth — CRM-MCP and Controlroom-MCP do
+# their own validation, but a coaxed model can produce args that satisfy
+# the wire shape (object) yet violate `minimum`/`maximum`/`enum`/etc.
+jsonschema = { version = "0.30", default-features = false }
+
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
 wiremock = "0.6"
