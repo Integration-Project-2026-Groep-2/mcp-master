@@ -62,6 +62,10 @@ url = "2"
 # the wire shape (object) yet violate `minimum`/`maximum`/`enum`/etc.
 jsonschema = { version = "0.30", default-features = false }
 
+# Jitter for the Anthropic retry-backoff (avoid synchronized retry storms
+# when multiple instances all hit a 429 at the same wallclock).
+rand = "0.8"
+
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
 wiremock = "0.6"

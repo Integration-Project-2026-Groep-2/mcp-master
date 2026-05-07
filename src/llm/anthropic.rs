@@ -20,6 +20,11 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// less than `max_tokens` per Anthropic; visible output gets the remainder.
 const DEFAULT_THINKING_BUDGET: u32 = 2048;
 
+/// Max number of retry attempts on 429/5xx/transient network errors.
+/// Total attempts = MAX_RETRIES + 1 (initial). 4xx auth errors are NEVER
+/// retried — they're deterministic and re-trying just wastes Anthropic quota.
+const MAX_RETRIES: u32 = 3;
+
 /// HTTP client for the Anthropic Messages API.
 pub struct AnthropicClient {
     http: reqwest::Client,
@@ -83,30 +88,81 @@ impl LlmClient for AnthropicClient {
             messages: to_wire_messages(messages),
         };
 
-        let resp = self
-            .http
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&req)
-            .send()
-            .await
-            .context("anthropic POST /v1/messages failed")?;
+        // Retry loop: up to MAX_RETRIES + 1 attempts total. Retries on 5xx,
+        // 429, and transient network errors (timeout, connect reset). All
+        // 4xx other than 429 are surfaced immediately — they're determ-
+        // inistic (auth, malformed input) and retrying is pure waste.
+        let mut attempt: u32 = 0;
+        loop {
+            if attempt > 0 {
+                let delay = backoff_with_jitter(attempt);
+                tracing::warn!(
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    "anthropic retry"
+                );
+                tokio::time::sleep(delay).await;
+            }
 
-        // Capture body on non-2xx — `error_for_status()` discards it, but
-        // Anthropic puts useful error info inside the body JSON.
-        let status = resp.status();
-        if !status.is_success() {
+            let send_result = self
+                .http
+                .post(format!("{}/v1/messages", self.base_url))
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&req)
+                .send()
+                .await;
+
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    let transient = e.is_timeout() || e.is_connect();
+                    if attempt < MAX_RETRIES && transient {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(
+                        anyhow::Error::from(e).context("anthropic POST /v1/messages failed")
+                    );
+                }
+            };
+
+            let status = resp.status();
+            if status.is_success() {
+                let parsed: AnthropicResponse = resp
+                    .json()
+                    .await
+                    .context("decoding Anthropic response JSON")?;
+                return Ok(from_wire_response(parsed));
+            }
+
+            let retryable =
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            // Capture body on non-2xx — `error_for_status()` discards it, but
+            // Anthropic puts useful error info inside the body JSON.
             let body = resp.text().await.unwrap_or_default();
+
+            if attempt < MAX_RETRIES && retryable {
+                tracing::warn!(%status, body = %body, "anthropic retryable status — backing off");
+                attempt += 1;
+                continue;
+            }
+
             bail!("anthropic non-2xx: {status} {body}");
         }
-
-        let parsed: AnthropicResponse = resp
-            .json()
-            .await
-            .context("decoding Anthropic response JSON")?;
-        Ok(from_wire_response(parsed))
     }
+}
+
+/// Exponential backoff with 0–500 ms jitter. Attempts 1/2/3 → ~1s/2s/4s
+/// plus jitter to avoid retry-storms across instances.
+fn backoff_with_jitter(attempt: u32) -> std::time::Duration {
+    debug_assert!(
+        attempt >= 1,
+        "attempt must be 1-based when computing backoff"
+    );
+    let base_ms: u64 = 1000_u64 << (attempt.saturating_sub(1));
+    let jitter_ms: u64 = rand::random::<u64>() % 500;
+    std::time::Duration::from_millis(base_ms + jitter_ms)
 }
 
 // ---------- Wire types (private) -----------------------------------------
@@ -400,6 +456,51 @@ mod tests {
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn chat_retries_on_429_then_succeeds() {
+        let server = MockServer::start().await;
+        // First request: 429
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Subsequent requests: 200
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{ "type": "text", "text": "ok after retry" }],
+                "stop_reason": "end_turn"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = AnthropicClient::new("k".into()).with_base_url(server.uri());
+        let resp = client.chat("sys", &[], &[], 4096).await.unwrap();
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+        match &resp.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "ok after retry"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_retry_on_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
+            .expect(1) // Hard assert: must receive exactly 1 request, no retries
+            .mount(&server)
+            .await;
+
+        let client = AnthropicClient::new("bad".into()).with_base_url(server.uri());
+        let err = client.chat("sys", &[], &[], 4096).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("401"), "error should mention status: {msg}");
     }
 
     #[tokio::test]
