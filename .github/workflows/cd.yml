@@ -42,7 +42,8 @@ jobs:
       - name: Deploy to Dev
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.DEV_HOST }}
-          username: ${{ secrets.DEV_USER }}
-          key: ${{ secrets.DEV_SSH_KEY }}
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          password: ${{ secrets.VM_PASSWORD }}
+          port: ${{ secrets.VM_PORT }}
           script: ${{ vars.SERVICE_NAME }}
