@@ -1,35 +1,20 @@
+mod http_api;
 mod llm;
 mod mcp;
 mod orchestrator;
 mod prompts;
 mod tcom;
 
-use std::io::Read;
 use anyhow::{Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::io::Read;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use crate::{llm::anthropic::AnthropicClient, prompts::ANALYZE_CONTROLROOM_PROMPT};
+
 use crate::llm::ToolSpec;
+use crate::llm::anthropic::AnthropicClient;
 use crate::tcom::TeamsConfig;
-use chrono::{NaiveTime, Timelike, Utc};
 
 const MAX_ITERATIONS: usize = 10;
 const MAX_TOKENS: u32 = 8192;
-
-// event times for triggering events. 0.00 | 8.30 | 12.30 | 16.30
-fn should_trigger_analysis() -> bool {
-    let now = Utc::now();
-    let triggers = [
-        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-        NaiveTime::from_hms_opt(8, 30, 0).unwrap(),
-        NaiveTime::from_hms_opt(12, 30, 0).unwrap(),
-        NaiveTime::from_hms_opt(16, 30, 0).unwrap(),
-    ];
-    let current_time = now.time();
-    triggers.iter().any(|&t| {
-        current_time.hour() == t.hour() && current_time.minute() == t.minute()
-    })
-}
 
 async fn run_prompt(
     prompt: &str,
@@ -96,7 +81,13 @@ async fn main() -> Result<()> {
     }
 
     let llm = AnthropicClient::from_env()?;
-    let teams_config = tcom::TeamsConfig::from_env()?;
+    let teams_config = match tcom::TeamsConfig::from_env() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::info!("Teams config absent: {e:#} — Teams-publish disabled");
+            None
+        }
+    };
 
     let terminal_mode = args.iter().any(|a| a == "--terminal-mode");
     let server_mode = args.iter().any(|a| a == "--server-mode");
@@ -106,60 +97,17 @@ async fn main() -> Result<()> {
         if prompt.trim().is_empty() {
             anyhow::bail!("no prompt provided (pass as argv[1] or via stdin)");
         }
-        handle_prompt(&prompt, &teams_config, &llm, &pool, &tool_specs).await?;
+        let teams_config = teams_config
+            .as_ref()
+            .context("--terminal-mode requires TEAMS_ID, CHANNEL_ID, TEAMS_TOKEN")?;
+        handle_prompt(&prompt, teams_config, &llm, &pool, &tool_specs).await?;
     } else if server_mode {
-        tracing::info!("starting server mode on :8080");
-
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-
-        loop {
-            tokio::select! {
-                Ok((stream, addr)) = listener.accept() => {
-                    tracing::info!(%addr, "incoming connection");
-                    let (mut reader, mut writer) = stream.into_split();
-                    let mut buf = vec![0u8; 4096];
-                    match reader.read(&mut buf).await {
-                        Ok(n) => {
-                            // notee(nasr): remove header junk from message
-                            let raw = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-                            let prompt = raw
-                                .split("\r\n\r\n")
-                                .nth(1)
-                                .unwrap_or(&raw)
-                                .trim()
-                                .to_string();
-
-                            tracing::info!(prompt, "received prompt");
-
-                            match run_prompt(&prompt, &llm, &pool, &tool_specs).await {
-                                Ok(answer) => {
-                                    if let Err(e) = tcom::publish_to_teams(&teams_config, &answer).await {
-                                        tracing::error!("publish to teams error: {e:#}");
-                                    }
-                                    let http_response = format!(
-                                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                        answer.len(),
-                                        answer
-                                    );
-                                    let _ = writer.write_all(http_response.as_bytes()).await;
-                                }
-                                Err(e) => tracing::error!("run_prompt error: {e:#}"),
-                            }
-                        }
-                        Err(e) => tracing::error!("read error: {e:#}"),
-                    }
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    if should_trigger_analysis() {
-                        if let Err(e) = handle_prompt(ANALYZE_CONTROLROOM_PROMPT, &teams_config, &llm, &pool, &tool_specs).await {
-                            tracing::error!("handle_prompt error: {e:#}");
-                        }
-                    }
-                }
-            }
-        }
+        tracing::info!("starting axum HTTP API on :8080");
+        http_api::serve(pool, llm, teams_config, tool_specs).await?;
+        return Ok(());
     } else {
-        let teams_config = TeamsConfig::from_env()?;
+        let teams_config = teams_config
+            .context("default Teams polling-mode requires TEAMS_ID, CHANNEL_ID, TEAMS_TOKEN")?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
@@ -171,7 +119,12 @@ async fn main() -> Result<()> {
             "https://graph.microsoft.com/v1.0/teams/{}/channels/{}/messages?$top=1",
             teams_config.team_id, teams_config.channel_id
         );
-        match client.get(&seed_url).bearer_auth(&teams_config.access_token).send().await {
+        match client
+            .get(&seed_url)
+            .bearer_auth(&teams_config.access_token)
+            .send()
+            .await
+        {
             Ok(res) => {
                 let status = res.status();
                 tracing::info!(%status, "seed response received");
