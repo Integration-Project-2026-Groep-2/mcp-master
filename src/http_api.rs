@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -223,6 +223,50 @@ async fn chat(
     Ok(Json(ChatResponse { answer }))
 }
 
+/// Build the CORS layer from `CHAT_ALLOWED_ORIGINS` (comma-separated origins).
+/// Unset or empty → permissive fallback with WARN log (dev-only). Set →
+/// strict allow-list of exact origins. A malformed origin invalidates the
+/// whole list and falls back to permissive with a louder WARN, so a typo
+/// doesn't quietly lock out the Frontend.
+fn build_cors_layer() -> CorsLayer {
+    let raw = std::env::var("CHAT_ALLOWED_ORIGINS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let Some(csv) = raw else {
+        tracing::warn!(
+            "CHAT_ALLOWED_ORIGINS unset — using permissive CORS (dev-only, NOT for production)"
+        );
+        return CorsLayer::permissive();
+    };
+
+    let parsed: Result<Vec<HeaderValue>, _> = csv
+        .split(',')
+        .map(|o| o.trim())
+        .filter(|o| !o.is_empty())
+        .map(|o| o.parse::<HeaderValue>())
+        .collect();
+
+    match parsed {
+        Ok(origins) if !origins.is_empty() => {
+            tracing::info!(count = origins.len(), "CORS locked to allow-list");
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([CONTENT_TYPE])
+        }
+        Ok(_) => {
+            tracing::warn!(
+                "CHAT_ALLOWED_ORIGINS contained no usable origins — falling back to permissive"
+            );
+            CorsLayer::permissive()
+        }
+        Err(e) => {
+            tracing::warn!("CHAT_ALLOWED_ORIGINS parse failed: {e:#} — falling back to permissive");
+            CorsLayer::permissive()
+        }
+    }
+}
+
 fn should_trigger_analysis_now() -> bool {
     let now = Utc::now();
     let triggers = [
@@ -357,7 +401,7 @@ pub async fn serve(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS),
         ))
-        .layer(CorsLayer::permissive())
+        .layer(build_cors_layer())
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
