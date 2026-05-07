@@ -310,7 +310,13 @@ async fn run_scheduled_trigger(
     teams_config: Option<Arc<TeamsConfig>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut last_fired_minute: Option<(u32, u32)> = None;
+    // Seed the latch with the current minute so a container restart that
+    // happens DURING a trigger minute (e.g. a CD redeploy at 08:30:15) does
+    // not re-fire the same scheduled summary. Without this, the first
+    // ticker.tick() returns immediately and `should_trigger_analysis_now()`
+    // would dispatch a duplicate Teams + RabbitMQ summary.
+    let now = Utc::now();
+    let mut last_fired_minute: Option<(u32, u32)> = Some((now.hour(), now.minute()));
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
     ticker.tick().await;
 
