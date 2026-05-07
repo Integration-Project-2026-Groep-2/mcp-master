@@ -187,8 +187,13 @@ async fn chat(
         _ => String::new(),
     };
     let conversation_length = messages.len();
+    // Don't log the prompt body — it routinely contains GDPR-flagged CRM data
+    // (names, emails, BTW numbers) and occasional accidental secrets pasted by
+    // users. The correlation_id on AppError is the debug breadcrumb when
+    // something goes wrong; the full prompt+answer still rides on the
+    // RabbitMQ `chat_completed` audit-event for downstream analytics.
     tracing::info!(
-        prompt = %prompt,
+        prompt_length = prompt.len(),
         conversation_length,
         "/chat received"
     );
