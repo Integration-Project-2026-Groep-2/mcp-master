@@ -202,14 +202,41 @@ impl McpPool {
             bail!("no MCP servers could be reached — agent has no tools to dispatch");
         }
 
-        // tools/list per server; we own `connected`, iterate by ref.
+        // tools/list per server. Same skip-WARN posture as `open_session`:
+        // a single server that handshook OK but errors on `tools/list` is
+        // dropped from the pool rather than crashing the whole agent. Bail
+        // only if NO server returned a usable tool-list.
         let mut server_tools: Vec<(String, Vec<Tool>)> = Vec::with_capacity(connected.len());
-        for (label, svc) in &connected {
-            let result = svc
-                .list_tools(Default::default())
-                .await
-                .with_context(|| format!("list_tools failed for server '{label}'"))?;
-            server_tools.push((label.clone(), result.tools.clone()));
+        let mut keep_indices: Vec<usize> = Vec::with_capacity(connected.len());
+        for (i, (label, svc)) in connected.iter().enumerate() {
+            match svc.list_tools(Default::default()).await {
+                Ok(result) => {
+                    server_tools.push((label.clone(), result.tools.clone()));
+                    keep_indices.push(i);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %label,
+                        error = ?e,
+                        "list_tools failed — dropping server from pool"
+                    );
+                }
+            }
+        }
+        // Drop the servers that failed list_tools. Walk indices in reverse
+        // so each `swap_remove` doesn't disturb earlier ones.
+        let dropped_total = connected.len() - keep_indices.len();
+        if dropped_total > 0 {
+            let keep: std::collections::HashSet<usize> = keep_indices.iter().copied().collect();
+            connected = connected
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| keep.contains(i))
+                .map(|(_, s)| s)
+                .collect();
+        }
+        if connected.is_empty() {
+            bail!("all MCP servers failed tools/list — agent has no tools to dispatch");
         }
 
         let (tool_specs, tool_to_session_idx) = build_routing_table(&server_tools)?;
