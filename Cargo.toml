@@ -36,12 +36,16 @@ async-trait = "0.1"
 # just makes local dev one-shot (`cargo run`) without `source`-gymnastics.
 dotenvy = "0.15"
 
-# rabbitmq-stream-client speaks the Streams protocol, different wire format).
-rabbitmq-stream-client = "0.5"
+# AMQP client for ai.events pub/sub. Talks to the broker URL in
+# RABBITMQ_URL (port 5672), not the Streams protocol on 5552.
+lapin = "2"
 chrono = "0.4.44"
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Stream-trait combinators (StreamExt::next) for lapin's Consumer.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.

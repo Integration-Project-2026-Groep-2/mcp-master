@@ -18,6 +18,7 @@ use crate::{
     mcp::McpPool,
     orchestrator,
     prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
+    rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     tcom::{TeamsConfig, publish_to_teams},
 };
 
@@ -28,6 +29,7 @@ pub struct AppState {
     pub llm: AnthropicClient,
     pub pool: McpPool,
     pub tool_specs: Vec<ToolSpec>,
+    pub publisher: Option<Publisher>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,7 +133,7 @@ async fn run_scheduled_trigger(
                 if should_trigger_analysis_now() && last_fired_minute != Some(key) {
                     last_fired_minute = Some(key);
                     tracing::info!(?key, "scheduled trigger firing");
-                    if let Err(e) = handle_scheduled(&state, teams_config.as_deref()).await {
+                    if let Err(e) = handle_scheduled(&state, teams_config.as_deref(), key).await {
                         tracing::error!("scheduled trigger error: {e:#}");
                     }
                 }
@@ -140,7 +142,11 @@ async fn run_scheduled_trigger(
     }
 }
 
-async fn handle_scheduled(state: &AppState, teams: Option<&TeamsConfig>) -> anyhow::Result<()> {
+async fn handle_scheduled(
+    state: &AppState,
+    teams: Option<&TeamsConfig>,
+    key: (u32, u32),
+) -> anyhow::Result<()> {
     let answer = orchestrator::run(
         ANALYZE_CONTROLROOM_PROMPT.to_string(),
         SETUP_PROMPT,
@@ -156,6 +162,20 @@ async fn handle_scheduled(state: &AppState, teams: Option<&TeamsConfig>) -> anyh
     if let Some(teams) = teams {
         publish_to_teams(teams, &answer).await?;
     }
+
+    if let Some(publisher) = &state.publisher
+        && let Err(e) = publisher
+            .publish_event(
+                "daily_summary_generated",
+                serde_json::json!({
+                    "trigger_time_utc": format!("{:02}:{:02}", key.0, key.1),
+                    "answer_length": answer.len(),
+                }),
+            )
+            .await
+    {
+        tracing::warn!("rabbitmq publish_event failed: {e:#}");
+    }
     Ok(())
 }
 
@@ -164,11 +184,18 @@ pub async fn serve(
     llm: AnthropicClient,
     teams_config: Option<TeamsConfig>,
     tool_specs: Vec<ToolSpec>,
+    rabbitmq: Option<(Publisher, RabbitMqConfig)>,
 ) -> anyhow::Result<()> {
+    let (publisher, consumer_config) = match rabbitmq {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+
     let state = Arc::new(AppState {
         llm,
         pool,
         tool_specs,
+        publisher,
     });
     let teams_config = teams_config.map(Arc::new);
 
@@ -177,8 +204,11 @@ pub async fn serve(
     let trigger_handle = tokio::spawn(run_scheduled_trigger(
         state.clone(),
         teams_config.clone(),
-        shutdown_rx,
+        shutdown_rx.clone(),
     ));
+
+    let consumer_handle =
+        consumer_config.map(|cfg| tokio::spawn(rabbitmq_consumer::run(cfg, shutdown_rx.clone())));
 
     let app = Router::new()
         .route("/chat", post(chat))
@@ -209,6 +239,13 @@ pub async fn serve(
 
     if let Err(e) = trigger_handle.await {
         tracing::warn!("trigger task join error: {e:#}");
+    }
+    if let Some(h) = consumer_handle {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("rabbitmq consumer exited with error: {e:#}"),
+            Err(e) => tracing::warn!("rabbitmq consumer join error: {e:#}"),
+        }
     }
 
     match Arc::try_unwrap(state) {

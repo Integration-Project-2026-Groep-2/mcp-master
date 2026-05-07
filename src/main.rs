@@ -3,6 +3,7 @@ mod llm;
 mod mcp;
 mod orchestrator;
 mod prompts;
+mod rabbitmq;
 mod tcom;
 
 use anyhow::{Context, Result};
@@ -103,7 +104,8 @@ async fn main() -> Result<()> {
         handle_prompt(&prompt, teams_config, &llm, &pool, &tool_specs).await?;
     } else if server_mode {
         tracing::info!("starting axum HTTP API on :8080");
-        http_api::serve(pool, llm, teams_config, tool_specs).await?;
+        let rabbitmq = bootstrap_rabbitmq().await;
+        http_api::serve(pool, llm, teams_config, tool_specs, rabbitmq).await?;
         return Ok(());
     } else {
         let teams_config = teams_config
@@ -170,6 +172,29 @@ fn resolve_endpoints() -> Vec<(String, String)> {
     let base = std::env::var("MCP_BASE_URL").unwrap_or_else(|_| "http://localhost".into());
     let port = std::env::var("MCP_PORT").unwrap_or_else(|_| "7002".into());
     vec![("default".into(), format!("{base}:{port}/mcp"))]
+}
+
+async fn bootstrap_rabbitmq() -> Option<(
+    rabbitmq::publisher::Publisher,
+    rabbitmq::config::RabbitMqConfig,
+)> {
+    let cfg = match rabbitmq::config::RabbitMqConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!("rabbitmq config absent: {e:#} — running without");
+            return None;
+        }
+    };
+    match rabbitmq::publisher::Publisher::connect(&cfg).await {
+        Ok(p) => {
+            tracing::info!(exchange = %cfg.exchange, "rabbitmq publisher connected");
+            Some((p, cfg))
+        }
+        Err(e) => {
+            tracing::warn!("rabbitmq publisher connect failed: {e:#} — running without");
+            None
+        }
+    }
 }
 
 fn read_prompt(args: &[String]) -> Result<String> {
