@@ -3,6 +3,7 @@ name: Build & Deploy Image to Dev
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 env:
   IMAGE: ghcr.io/integration-project-2026-groep-2/mcp-master
