@@ -48,23 +48,3 @@ pub async fn publish_to_teams(config: &TeamsConfig, message: &str) -> Result<()>
         anyhow::bail!("Teams API returned {}: {}", status, error_body);
     }
 }
-
-pub async fn poll_messages(
-    client: &reqwest::Client,
-    teams_config: &TeamsConfig,
-) -> Result<Vec<serde_json::Value>> {
-    let url = format!(
-        "https://graph.microsoft.com/v1.0/teams/{}/channels/{}/messages",
-        teams_config.team_id, teams_config.channel_id
-    );
-    let res = client
-        .get(&url)
-        .bearer_auth(&teams_config.access_token)
-        .send()
-        .await?;
-    let body: serde_json::Value = res.json().await?;
-
-    let messages = body["value"].as_array().cloned().unwrap_or_default();
-
-    Ok(messages)
-}

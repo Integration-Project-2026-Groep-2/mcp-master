@@ -42,10 +42,29 @@ lapin = "2"
 chrono = "0.4.44"
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout"] }
+
+# Correlation IDs in /chat error responses — full anyhow chain stays in logs,
+# only an opaque ID surfaces to clients. Prevents leak of RABBITMQ_URL and
+# similar secrets via `{:#}` formatter.
+uuid = { version = "1", features = ["v4"] }
 
 # Stream-trait combinators (StreamExt::next) for lapin's Consumer.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# URL parsing for redacting userinfo (password) from RABBITMQ_URL before
+# logging. Only used for log-side scrubbing — lapin still gets the raw URL.
+url = "2"
+
+# JSON-Schema validation of LLM-generated tool args before they hit the
+# downstream MCP server. Defense-in-depth — CRM-MCP and Controlroom-MCP do
+# their own validation, but a coaxed model can produce args that satisfy
+# the wire shape (object) yet violate `minimum`/`maximum`/`enum`/etc.
+jsonschema = { version = "0.30", default-features = false }
+
+# Jitter for the Anthropic retry-backoff (avoid synchronized retry storms
+# when multiple instances all hit a 429 at the same wallclock).
+rand = "0.8"
 
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.

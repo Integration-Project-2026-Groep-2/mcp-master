@@ -108,49 +108,18 @@ async fn main() -> Result<()> {
         http_api::serve(pool, llm, teams_config, tool_specs, rabbitmq).await?;
         return Ok(());
     } else {
-        let teams_config = teams_config
-            .context("default Teams polling-mode requires TEAMS_ID, CHANNEL_ID, TEAMS_TOKEN")?;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
-
-        tracing::info!("starting Teams poll loop");
-
-        tracing::info!("seeding cursor...");
-        let seed_url = format!(
-            "https://graph.microsoft.com/v1.0/teams/{}/channels/{}/messages?$top=1",
-            teams_config.team_id, teams_config.channel_id
+        // No execution mode flag. The previous default — a Teams Graph API
+        // polling loop — required write-permissions the AI-team doesn't have
+        // and logged raw response bodies (potentially containing access
+        // tokens). It was a foot-gun: deploys without a flag silently leaked
+        // and never processed prompts. Bail with a clear hint instead.
+        pool.shutdown().await?;
+        anyhow::bail!(
+            "no execution mode set; pass one of: \
+             --server-mode (production HTTP API), \
+             --terminal-mode (one-shot CLI prompt), \
+             --list-tools (debug, prints aggregated MCP tools)"
         );
-        match client
-            .get(&seed_url)
-            .bearer_auth(&teams_config.access_token)
-            .send()
-            .await
-        {
-            Ok(res) => {
-                let status = res.status();
-                tracing::info!(%status, "seed response received");
-                match res.json::<serde_json::Value>().await {
-                    Ok(body) => tracing::info!(body = %body, "seed body"),
-                    Err(e) => tracing::error!("failed to parse seed response: {e:#}"),
-                }
-            }
-            Err(e) => tracing::error!("seed request failed: {e:#}"),
-        }
-
-        loop {
-            match tcom::poll_messages(&client, &teams_config).await {
-                Ok(messages) => {
-                    for msg in messages {
-                        let content = msg["body"]["content"].as_str().unwrap_or("");
-                        tracing::info!(content, "incoming Teams message");
-                        println!("{content}");
-                    }
-                }
-                Err(e) => tracing::error!("poll error: {e:#}"),
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
     }
 
     pool.shutdown().await?;
@@ -187,11 +156,20 @@ async fn bootstrap_rabbitmq() -> Option<(
     };
     match rabbitmq::publisher::Publisher::connect(&cfg).await {
         Ok(p) => {
-            tracing::info!(exchange = %cfg.exchange, "rabbitmq publisher connected");
+            tracing::info!(
+                broker = %cfg.host_for_logging(),
+                exchange = %cfg.exchange,
+                "rabbitmq publisher connected"
+            );
             Some((p, cfg))
         }
         Err(e) => {
-            tracing::warn!("rabbitmq publisher connect failed: {e:#} — running without");
+            // Pass redacted broker as a separate field so the password embedded
+            // in cfg.url cannot leak via the error chain into stdout.
+            tracing::warn!(
+                broker = %cfg.host_for_logging(),
+                "rabbitmq publisher connect failed: {e:#} — running without"
+            );
             None
         }
     }

@@ -202,14 +202,41 @@ impl McpPool {
             bail!("no MCP servers could be reached — agent has no tools to dispatch");
         }
 
-        // tools/list per server; we own `connected`, iterate by ref.
+        // tools/list per server. Same skip-WARN posture as `open_session`:
+        // a single server that handshook OK but errors on `tools/list` is
+        // dropped from the pool rather than crashing the whole agent. Bail
+        // only if NO server returned a usable tool-list.
         let mut server_tools: Vec<(String, Vec<Tool>)> = Vec::with_capacity(connected.len());
-        for (label, svc) in &connected {
-            let result = svc
-                .list_tools(Default::default())
-                .await
-                .with_context(|| format!("list_tools failed for server '{label}'"))?;
-            server_tools.push((label.clone(), result.tools.clone()));
+        let mut keep_indices: Vec<usize> = Vec::with_capacity(connected.len());
+        for (i, (label, svc)) in connected.iter().enumerate() {
+            match svc.list_tools(Default::default()).await {
+                Ok(result) => {
+                    server_tools.push((label.clone(), result.tools.clone()));
+                    keep_indices.push(i);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %label,
+                        error = ?e,
+                        "list_tools failed — dropping server from pool"
+                    );
+                }
+            }
+        }
+        // Drop the servers that failed list_tools. Walk indices in reverse
+        // so each `swap_remove` doesn't disturb earlier ones.
+        let dropped_total = connected.len() - keep_indices.len();
+        if dropped_total > 0 {
+            let keep: std::collections::HashSet<usize> = keep_indices.iter().copied().collect();
+            connected = connected
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| keep.contains(i))
+                .map(|(_, s)| s)
+                .collect();
+        }
+        if connected.is_empty() {
+            bail!("all MCP servers failed tools/list — agent has no tools to dispatch");
         }
 
         let (tool_specs, tool_to_session_idx) = build_routing_table(&server_tools)?;
@@ -254,9 +281,35 @@ impl McpPool {
     }
 }
 
+/// Defence-in-depth validation of LLM-generated tool args against the
+/// cached `input_schema` advertised by the MCP server. Returns Ok if the
+/// tool is unknown (caller's existing 'no MCP server provides tool' check
+/// will fire), or if validation passes. On failure, bails with a message
+/// the orchestrator surfaces back to the LLM.
+fn validate_args_against_schema(
+    specs: &[ToolSpec],
+    name: &str,
+    args: &Value,
+) -> anyhow::Result<()> {
+    let Some(spec) = specs.iter().find(|t| t.name == name) else {
+        return Ok(());
+    };
+    let validator = jsonschema::validator_for(&spec.input_schema)
+        .map_err(|e| anyhow::anyhow!("invalid input_schema for tool '{name}': {e}"))?;
+    if !validator.is_valid(args) {
+        let errs: Vec<String> = validator.iter_errors(args).map(|e| e.to_string()).collect();
+        anyhow::bail!(
+            "tool args for '{name}' violate input_schema: {}",
+            errs.join("; ")
+        );
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl McpExecutor for McpPool {
     async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<String> {
+        validate_args_against_schema(&self.tool_specs, name, &arguments)?;
         let map = arguments
             .as_object()
             .cloned()
@@ -397,6 +450,70 @@ mod tests {
         assert_eq!(idx.get("count_contacts").copied(), Some(0));
         assert_eq!(idx.get("error_analysis").copied(), Some(1));
         assert_eq!(idx.get("heartbeat_status").copied(), Some(1));
+    }
+
+    #[test]
+    fn validate_args_rejects_oversized_limit() {
+        let specs = vec![ToolSpec {
+            name: "search_contact".into(),
+            description: "Fuzzy contact search".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+                },
+                "required": ["query"]
+            }),
+        }];
+        let bad = json!({"query": "x", "limit": 999_999});
+        let err = validate_args_against_schema(&specs, "search_contact", &bad)
+            .expect_err("limit > maximum must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("input_schema"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_args_accepts_valid_args() {
+        let specs = vec![ToolSpec {
+            name: "search_contact".into(),
+            description: "..".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["query"]
+            }),
+        }];
+        validate_args_against_schema(
+            &specs,
+            "search_contact",
+            &json!({"query": "Brend", "limit": 10}),
+        )
+        .expect("valid args pass");
+    }
+
+    #[test]
+    fn validate_args_passes_unknown_tool_through() {
+        let specs: Vec<ToolSpec> = vec![];
+        validate_args_against_schema(&specs, "anything", &json!({}))
+            .expect("unknown tool returns Ok — caller's routing-table check handles it");
+    }
+
+    #[test]
+    fn validate_args_rejects_missing_required_field() {
+        let specs = vec![ToolSpec {
+            name: "get_contact".into(),
+            description: "..".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"contact_id": {"type": "string"}},
+                "required": ["contact_id"]
+            }),
+        }];
+        let err = validate_args_against_schema(&specs, "get_contact", &json!({}))
+            .expect_err("missing required field must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("input_schema"), "got: {msg}");
     }
 
     #[test]
