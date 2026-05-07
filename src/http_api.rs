@@ -124,8 +124,20 @@ where
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        tracing::error!("/chat handler error: {:#}", self.0);
-        let body = Json(serde_json::json!({ "error": format!("{:#}", self.0) }));
+        // Full anyhow context-chain stays in stdout logs (which only ops see).
+        // The HTTP body returns an opaque error + correlation_id so attackers
+        // can't fish for RABBITMQ_URL credentials, env-var names, or internal
+        // file paths via the `{:#}` formatter on the cause-chain.
+        let correlation_id = uuid::Uuid::new_v4();
+        tracing::error!(
+            correlation_id = %correlation_id,
+            "/chat handler error: {:#}",
+            self.0,
+        );
+        let body = Json(serde_json::json!({
+            "error": "internal error",
+            "correlation_id": correlation_id.to_string(),
+        }));
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }
 }
@@ -436,5 +448,39 @@ mod tests {
     fn reject_empty_or_whitespace_prompt() {
         let err = parse(r#"{"prompt":"   "}"#).into_messages().unwrap_err();
         assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn app_error_returns_opaque_response_with_correlation_id() {
+        use axum::body::to_bytes;
+
+        let err = AppError(anyhow::anyhow!(
+            "RABBITMQ_URL=amqp://lapin:supersecret@rabbitmq:5672/ failed: nope"
+        ));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body_str = std::str::from_utf8(&bytes).unwrap();
+
+        assert!(
+            !body_str.contains("supersecret"),
+            "body MUST NOT leak password: {body_str}",
+        );
+        assert!(
+            !body_str.contains("RABBITMQ_URL"),
+            "body MUST NOT leak env-var names: {body_str}",
+        );
+        assert!(
+            !body_str.contains("lapin"),
+            "body MUST NOT leak username: {body_str}",
+        );
+
+        let json: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        assert_eq!(json["error"], "internal error");
+        let id = json["correlation_id"]
+            .as_str()
+            .expect("correlation_id present");
+        assert_eq!(id.len(), 36, "uuid v4 hyphenated length");
     }
 }

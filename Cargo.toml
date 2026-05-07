@@ -44,6 +44,11 @@ chrono = "0.4.44"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
+# Correlation IDs in /chat error responses — full anyhow chain stays in logs,
+# only an opaque ID surfaces to clients. Prevents leak of RABBITMQ_URL and
+# similar secrets via `{:#}` formatter.
+uuid = { version = "1", features = ["v4"] }
+
 # Stream-trait combinators (StreamExt::next) for lapin's Consumer.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
