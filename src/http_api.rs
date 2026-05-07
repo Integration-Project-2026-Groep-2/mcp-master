@@ -29,7 +29,7 @@ pub struct AppState {
     pub llm: AnthropicClient,
     pub pool: McpPool,
     pub tool_specs: Vec<ToolSpec>,
-    pub publisher: Option<Publisher>,
+    pub publisher: Option<Arc<Publisher>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,8 +80,9 @@ async fn chat(
     }
     tracing::info!(prompt = %prompt, "/chat received");
 
+    let started = std::time::Instant::now();
     let answer = orchestrator::run(
-        prompt,
+        prompt.clone(),
         SETUP_PROMPT,
         &state.llm,
         &state.pool,
@@ -91,6 +92,19 @@ async fn chat(
     )
     .await
     .map_err(|e| AppError(e).into_response())?;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    if let Some(publisher) = &state.publisher {
+        let payload = serde_json::json!({
+            "prompt": prompt,
+            "answer": answer,
+            "answer_length": answer.len(),
+            "duration_ms": duration_ms,
+        });
+        if let Err(e) = publisher.publish_event("chat_completed", payload).await {
+            tracing::warn!("failed to publish chat_completed event: {e:#}");
+        }
+    }
 
     Ok(Json(ChatResponse { answer }))
 }
@@ -169,6 +183,7 @@ async fn handle_scheduled(
                 "daily_summary_generated",
                 serde_json::json!({
                     "trigger_time_utc": format!("{:02}:{:02}", key.0, key.1),
+                    "answer": answer,
                     "answer_length": answer.len(),
                 }),
             )
@@ -186,16 +201,24 @@ pub async fn serve(
     tool_specs: Vec<ToolSpec>,
     rabbitmq: Option<(Publisher, RabbitMqConfig)>,
 ) -> anyhow::Result<()> {
-    let (publisher, consumer_config) = match rabbitmq {
-        Some((p, c)) => (Some(p), Some(c)),
+    let (publisher_arc, consumer_config) = match rabbitmq {
+        Some((p, c)) => (Some(Arc::new(p)), Some(c)),
         None => (None, None),
     };
+
+    // Attach publisher to the pool so every MCP tool-call fires a
+    // `tool_called` event on `ai.events`. Must happen before the pool is
+    // wrapped in `Arc<AppState>` (mutation requires &mut).
+    let mut pool = pool;
+    if let Some(p) = &publisher_arc {
+        pool.attach_publisher(p.clone());
+    }
 
     let state = Arc::new(AppState {
         llm,
         pool,
         tool_specs,
-        publisher,
+        publisher: publisher_arc,
     });
     let teams_config = teams_config.map(Arc::new);
 
