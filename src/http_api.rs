@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
-    llm::{ToolSpec, anthropic::AnthropicClient},
+    llm::{ContentBlock, Message, Role, ToolSpec, anthropic::AnthropicClient},
     mcp::McpPool,
     orchestrator,
     prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
@@ -32,9 +32,78 @@ pub struct AppState {
     pub publisher: Option<Arc<Publisher>>,
 }
 
+/// Wire-level role for one chat turn. Strict-lowercase to match Anthropic's
+/// convention and the JS-side string literals in jarvis_chat.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+/// One conversation turn as the client sends it. `content` is plain string —
+/// thinking/tool_use blocks from previous rounds are intentionally not echoed
+/// by clients; mcp-master generates fresh ones in this call.
+#[derive(Debug, Deserialize)]
+pub struct ChatTurn {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+/// Body shape for `POST /chat`. Accepts two mutually-exclusive shapes:
+/// - Legacy single-shot: `{"prompt": "..."}` — used by Teams scheduled trigger
+/// - Multi-turn:        `{"messages": [{"role": ..., "content": ...}, ...]}`
+///   — used by jarvis_chat client-side history flow
+///
+/// Validation lives in `into_messages()`, not in `serde` derive, so the error
+/// path stays a single 400 with an explanatory body instead of serde's
+/// auto-generated tagged-enum errors.
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
-    pub prompt: String,
+    pub prompt: Option<String>,
+    pub messages: Option<Vec<ChatTurn>>,
+}
+
+impl ChatRequest {
+    /// Validate body shape and convert to internal `Vec<Message>`. Returns
+    /// the seed conversation that the orchestrator runs the tool-loop on top
+    /// of. Last turn must be `Role::User` — that's the question we answer.
+    pub fn into_messages(self) -> Result<Vec<Message>, &'static str> {
+        match (self.prompt, self.messages) {
+            (Some(_), Some(_)) => Err("provide either 'prompt' or 'messages', not both"),
+            (None, None) => Err("missing 'prompt' or 'messages'"),
+            (Some(p), None) => {
+                let trimmed = p.trim();
+                if trimmed.is_empty() {
+                    return Err("prompt is empty");
+                }
+                Ok(vec![Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: trimmed.to_string(),
+                    }],
+                }])
+            }
+            (None, Some(turns)) => {
+                if turns.is_empty() {
+                    return Err("messages array is empty");
+                }
+                if !matches!(turns.last().unwrap().role, ChatRole::User) {
+                    return Err("last message must have role=user");
+                }
+                Ok(turns
+                    .into_iter()
+                    .map(|t| Message {
+                        role: match t.role {
+                            ChatRole::User => Role::User,
+                            ChatRole::Assistant => Role::Assistant,
+                        },
+                        content: vec![ContentBlock::Text { text: t.content }],
+                    })
+                    .collect())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -73,11 +142,17 @@ async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, Response> {
-    let prompt = req.prompt.trim().to_string();
-    if prompt.is_empty() {
-        let body = Json(serde_json::json!({ "error": "prompt is empty" }));
-        return Err((StatusCode::BAD_REQUEST, body).into_response());
-    }
+    let messages = req.into_messages().map_err(|e| {
+        let body = Json(serde_json::json!({ "error": e }));
+        (StatusCode::BAD_REQUEST, body).into_response()
+    })?;
+    // Phase 1: still call single-prompt orchestrator path with the latest
+    // user turn. Phase 3 will switch this to run_with_messages so seeded
+    // history is honoured.
+    let prompt = match messages.last().map(|m| &m.content[..]) {
+        Some([ContentBlock::Text { text }]) => text.clone(),
+        _ => String::new(),
+    };
     tracing::info!(prompt = %prompt, "/chat received");
 
     let started = std::time::Instant::now();
@@ -284,4 +359,77 @@ pub async fn serve(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> ChatRequest {
+        serde_json::from_str(json).expect("ChatRequest should deserialize")
+    }
+
+    #[test]
+    fn parse_legacy_prompt_shape() {
+        let msgs = parse(r#"{"prompt":"hi"}"#).into_messages().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].role, Role::User));
+        match &msgs[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "hi"),
+            other => panic!("expected Text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_messages_shape_three_turns() {
+        let json = r#"{"messages":[
+            {"role":"user","content":"q1"},
+            {"role":"assistant","content":"a1"},
+            {"role":"user","content":"q2"}
+        ]}"#;
+        let msgs = parse(json).into_messages().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(msgs[0].role, Role::User));
+        assert!(matches!(msgs[1].role, Role::Assistant));
+        assert!(matches!(msgs[2].role, Role::User));
+        match &msgs[2].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "q2"),
+            other => panic!("expected Text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_both_fields_present() {
+        let req = parse(r#"{"prompt":"hi","messages":[{"role":"user","content":"x"}]}"#);
+        let err = req.into_messages().unwrap_err();
+        assert!(err.contains("either"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reject_neither_field() {
+        let err = parse(r#"{}"#).into_messages().unwrap_err();
+        assert!(err.contains("missing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reject_empty_messages_array() {
+        let err = parse(r#"{"messages":[]}"#).into_messages().unwrap_err();
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reject_assistant_as_last_turn() {
+        let json = r#"{"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":"a"}
+        ]}"#;
+        let err = parse(json).into_messages().unwrap_err();
+        assert!(err.contains("last message"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reject_empty_or_whitespace_prompt() {
+        let err = parse(r#"{"prompt":"   "}"#).into_messages().unwrap_err();
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
 }
