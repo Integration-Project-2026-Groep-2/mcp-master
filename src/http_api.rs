@@ -457,10 +457,17 @@ pub async fn serve(
         tracing::warn!("trigger task join error: {e:#}");
     }
     if let Some(h) = consumer_handle {
-        match h.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("rabbitmq consumer exited with error: {e:#}"),
-            Err(e) => tracing::warn!("rabbitmq consumer join error: {e:#}"),
+        // The consumer task uses `tokio::select!` against `shutdown_rx`, but
+        // `consumer.next()` may not be cancellation-clean against all lapin
+        // versions / broker states. Cap the drain time so a misbehaving
+        // consumer can't keep the process alive past Ctrl+C.
+        match tokio::time::timeout(std::time::Duration::from_secs(2), h).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::warn!("rabbitmq consumer exited with error: {e:#}"),
+            Ok(Err(e)) => tracing::warn!("rabbitmq consumer join error: {e:#}"),
+            Err(_) => tracing::warn!(
+                "rabbitmq consumer didn't drain in 2s — task left detached, runtime drop will reclaim"
+            ),
         }
     }
 
