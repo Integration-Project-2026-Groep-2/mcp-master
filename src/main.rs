@@ -187,11 +187,20 @@ async fn bootstrap_rabbitmq() -> Option<(
     };
     match rabbitmq::publisher::Publisher::connect(&cfg).await {
         Ok(p) => {
-            tracing::info!(exchange = %cfg.exchange, "rabbitmq publisher connected");
+            tracing::info!(
+                broker = %cfg.host_for_logging(),
+                exchange = %cfg.exchange,
+                "rabbitmq publisher connected"
+            );
             Some((p, cfg))
         }
         Err(e) => {
-            tracing::warn!("rabbitmq publisher connect failed: {e:#} — running without");
+            // Pass redacted broker as a separate field so the password embedded
+            // in cfg.url cannot leak via the error chain into stdout.
+            tracing::warn!(
+                broker = %cfg.host_for_logging(),
+                "rabbitmq publisher connect failed: {e:#} — running without"
+            );
             None
         }
     }

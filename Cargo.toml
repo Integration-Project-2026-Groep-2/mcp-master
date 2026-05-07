@@ -52,6 +52,10 @@ uuid = { version = "1", features = ["v4"] }
 # Stream-trait combinators (StreamExt::next) for lapin's Consumer.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# URL parsing for redacting userinfo (password) from RABBITMQ_URL before
+# logging. Only used for log-side scrubbing — lapin still gets the raw URL.
+url = "2"
+
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
 wiremock = "0.6"
