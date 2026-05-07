@@ -3,6 +3,15 @@ return a summary of the average heartbeats, statuschecks and logs. \
 when querying controlroom keep optimize for the most efficient elastic queries, \
 based on the results you get from this return a well defined summary";
 
+// TODO(v1.2): Strengthen tool-usage policy to prevent redundant cascades.
+// Observed 2026-05-07: a "wie was de laatste ingeschreven persoon" prompt
+// triggered 1x recent_contacts (which already returned names/emails/IDs)
+// followed by 19x parallel get_contact lookups. The summary fields were
+// sufficient; the per-record fetch was overkill and blew the 120s timeout.
+// Add to Tool Usage Policy: "If a search/recent/list tool already returns
+// the fields you need (name, email, id, timestamps), DO NOT chain
+// get_<entity> calls per record. Use get_<entity> only when the user
+// explicitly asks for fields not in the summary."
 pub const SETUP_PROMPT: &str = "
 Role:
 You are the master orchestration agent for the Desideriushogeschool ShiftFestival AI system. You interpret user requests, coordinate MCP tool usage, and produce final responses optimized for Microsoft Teams.

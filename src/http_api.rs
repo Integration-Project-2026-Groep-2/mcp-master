@@ -33,7 +33,7 @@ const MAX_TOKENS: u32 = 8192;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_TURNS: usize = 40;
 const MAX_CONTENT_BYTES_PER_TURN: usize = 8192;
-const REQUEST_TIMEOUT_SECONDS: u64 = 120;
+const REQUEST_TIMEOUT_SECONDS: u64 = 240;
 
 pub struct AppState {
     pub llm: AnthropicClient,

@@ -8,8 +8,9 @@ pub struct RabbitMqConfig {
 
 impl RabbitMqConfig {
     pub fn from_env() -> Result<Self> {
+        let raw = std::env::var("RABBITMQ_URL").context("RABBITMQ_URL not set")?;
         Ok(Self {
-            url: std::env::var("RABBITMQ_URL").context("RABBITMQ_URL not set")?,
+            url: normalize_amqp_url(&raw),
             exchange: std::env::var("RABBITMQ_EXCHANGE").unwrap_or_else(|_| "ai.events".into()),
         })
     }
@@ -28,6 +29,45 @@ impl RabbitMqConfig {
             Err(_) => "<invalid URL>".to_string(),
         }
     }
+}
+
+/// Normalize trailing single `/` to spec-conforming `/%2F` so strict-spec
+/// AMQP libraries (e.g. lapin via amq-protocol) connect to the default
+/// vhost `/` instead of failing with empty-vhost lookup. Matches the
+/// permissive behavior of pika/Python — but explicit at parse time so
+/// lapin's `url.path().get(1..)` yields `"%2F"` → vhost `/` after decode.
+///
+/// Per AMQP-URI spec (rabbitmq.com/docs/uri-spec):
+/// - `amqp://h/`   → vhost `""` (empty)         — broken for default vhost
+/// - `amqp://h//`  → vhost `/` (multi-segment)  — non-conforming but works
+/// - `amqp://h/%2F`→ vhost `/`                  — spec-conforming
+/// - `amqp://h`    → vhost absent → lapin defaults to `/`
+fn normalize_amqp_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    if trimmed.ends_with("//") || trimmed.to_ascii_lowercase().ends_with("/%2f") {
+        return trimmed.to_string();
+    }
+
+    let Some(scheme_end) = trimmed.find("://").map(|i| i + 3) else {
+        return trimmed.to_string();
+    };
+    let Some(rel_path_start) = trimmed[scheme_end..].find('/') else {
+        return trimmed.to_string();
+    };
+    let path_start = scheme_end + rel_path_start;
+    let path = &trimmed[path_start..];
+
+    if path == "/" {
+        tracing::warn!(
+            "RABBITMQ_URL ends in single '/' (empty vhost per AMQP-URI spec); \
+             auto-normalizing to '/%2F' for default vhost. \
+             Fix at source: use '//' or '/%2F'."
+        );
+        return format!("{trimmed}%2F");
+    }
+
+    trimmed.to_string()
 }
 
 #[cfg(test)]
@@ -68,5 +108,61 @@ mod tests {
             exchange: "x".to_string(),
         };
         assert_eq!(cfg.host_for_logging(), "<invalid URL>");
+    }
+
+    #[test]
+    fn normalize_single_slash_to_percent_encoded() {
+        assert_eq!(
+            normalize_amqp_url("amqp://lapin:pw@rabbitmq:5672/"),
+            "amqp://lapin:pw@rabbitmq:5672/%2F"
+        );
+    }
+
+    #[test]
+    fn normalize_double_slash_unchanged() {
+        let url = "amqp://lapin:pw@rabbitmq:5672//";
+        assert_eq!(normalize_amqp_url(url), url);
+    }
+
+    #[test]
+    fn normalize_percent_encoded_unchanged() {
+        let url = "amqp://lapin:pw@rabbitmq:5672/%2F";
+        assert_eq!(normalize_amqp_url(url), url);
+        let lowercase = "amqp://lapin:pw@rabbitmq:5672/%2f";
+        assert_eq!(normalize_amqp_url(lowercase), lowercase);
+    }
+
+    #[test]
+    fn normalize_no_path_unchanged() {
+        let url = "amqp://lapin:pw@rabbitmq:5672";
+        assert_eq!(normalize_amqp_url(url), url);
+    }
+
+    #[test]
+    fn normalize_named_vhost_unchanged() {
+        let url = "amqp://lapin:pw@rabbitmq:5672/myhost";
+        assert_eq!(normalize_amqp_url(url), url);
+    }
+
+    #[test]
+    fn normalize_amqps_single_slash() {
+        assert_eq!(
+            normalize_amqp_url("amqps://lapin:pw@rabbitmq:5671/"),
+            "amqps://lapin:pw@rabbitmq:5671/%2F"
+        );
+    }
+
+    #[test]
+    fn normalize_trims_whitespace() {
+        assert_eq!(
+            normalize_amqp_url("  amqp://lapin:pw@rabbitmq:5672/  "),
+            "amqp://lapin:pw@rabbitmq:5672/%2F"
+        );
+    }
+
+    #[test]
+    fn normalize_no_scheme_unchanged() {
+        let url = "not a url";
+        assert_eq!(normalize_amqp_url(url), url);
     }
 }
