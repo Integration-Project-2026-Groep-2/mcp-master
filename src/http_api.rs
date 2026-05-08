@@ -418,6 +418,55 @@ async fn chat_approve(
     .into_response()
 }
 
+/// Body for `POST /chat/reject`. Optional `reason` rides on the audit-log
+/// envelope (and the rendered answer) so users see why their proposal was
+/// rejected on retry.
+#[derive(Debug, Deserialize)]
+pub struct RejectBody {
+    pub action_id: uuid::Uuid,
+    pub reason: Option<String>,
+}
+
+/// Reject a previously-proposed write-tool action.
+///
+/// Mirror of `chat_approve` minus the dispatch — `flow.reject` runs the
+/// same atomic CAS as `confirm`, but no MCP tool-call follows. The returned
+/// `ChatResponse` shape matches `/chat` so Drupal `jarvis_chat` renders it
+/// like any other turn (assistant bubble with the rejection notice).
+async fn chat_reject(
+    scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RejectBody>,
+) -> Response {
+    if scope != crate::gateway::auth::AuthScope::ReadAndAct {
+        return scope_required_response();
+    }
+    let user_id = match crate::gateway::auth::current_user_id(&headers) {
+        Some(id) => id,
+        None => return scope_required_response(),
+    };
+
+    let action = match state
+        .approval_flow
+        .reject(body.action_id, &user_id, body.reason.clone())
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => return approval_error_response(e),
+    };
+
+    let reason_text = body.reason.unwrap_or_else(|| "no reason given".to_string());
+    Json(ChatResponse {
+        answer: format!("Action rejected: {reason_text}"),
+        tool_trace: Vec::new(),
+        tokens: TokenUsage::default(),
+        iterations: 0,
+        correlation_id: action.correlation_id,
+    })
+    .into_response()
+}
+
 /// Read `CHAT_BEARER_TOKEN` from env. Whitespace-only or unset → `None`,
 /// so the bearer layer can be conditionally applied with a skip-warn.
 fn auth_token_from_env() -> Option<String> {
@@ -689,16 +738,21 @@ pub async fn serve(
 
     let mut chat_route = post(chat);
     let mut approve_route = post(chat_approve);
+    let mut reject_route = post(chat_reject);
     if let Some(ref token) = bearer_token {
-        tracing::info!("CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve");
+        tracing::info!(
+            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject"
+        );
         chat_route =
             chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
         approve_route =
             approve_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        reject_route =
+            reject_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
     } else {
         tracing::warn!(
-            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve accept unauthenticated requests \
-             (dev-only, NOT for production)"
+            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject accept unauthenticated \
+             requests (dev-only, NOT for production)"
         );
     }
     // Bearer is outer (added first); ConcurrencyLimit is inner (added later).
@@ -707,11 +761,13 @@ pub async fn serve(
     // service clones; the non-global variant builds a fresh semaphore per
     // Layer::layer() call → no actual capping.
     chat_route = chat_route.route_layer(chat_concurrency.clone());
-    approve_route = approve_route.route_layer(chat_concurrency);
+    approve_route = approve_route.route_layer(chat_concurrency.clone());
+    reject_route = reject_route.route_layer(chat_concurrency);
 
     let app = Router::new()
         .route("/chat", chat_route)
         .route("/chat/approve", approve_route)
+        .route("/chat/reject", reject_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
@@ -1282,6 +1338,23 @@ mod tests {
     async fn scope_required_returns_403() {
         let response = scope_required_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn reject_body_deserializes_with_reason() {
+        let body: RejectBody = serde_json::from_str(
+            r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000","reason":"vendor mismatch"}"#,
+        )
+        .unwrap();
+        assert_eq!(body.reason.as_deref(), Some("vendor mismatch"));
+    }
+
+    #[test]
+    fn reject_body_deserializes_without_reason() {
+        let body: RejectBody =
+            serde_json::from_str(r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000"}"#)
+                .unwrap();
+        assert!(body.reason.is_none());
     }
 
     #[test]
