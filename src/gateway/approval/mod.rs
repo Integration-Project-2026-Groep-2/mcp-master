@@ -7,10 +7,13 @@
 //! PR-2 provides these as standalone library modules; PR-3 integrates with
 //! the orchestrator and PR-4 wires them into `AppState` + `serve()`.
 
+pub mod flow;
 pub mod state;
 pub mod types;
 
-#[allow(unused_imports)] // wired into flow + http_api in subsequent commits
+#[allow(unused_imports)] // wired into orchestrator + http_api in PR-3/PR-4
+pub use flow::ApprovalFlow;
+#[allow(unused_imports)]
 pub use state::{ApprovalStore, run_cleanup_task};
 #[allow(unused_imports)]
 pub use types::{ApprovalError, ApprovalStatus, PendingAction, PendingActionDraft};

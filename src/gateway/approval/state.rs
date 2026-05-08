@@ -83,6 +83,16 @@ impl ApprovalStore {
         outcome.unwrap_or(Err(ApprovalError::NotFound(id)))
     }
 
+    /// Persist execution metadata after a successful Approved → Executed
+    /// transition. Separate from `try_transition` because the result + duration
+    /// are only known *after* the dispatched tool returns.
+    pub fn set_execution_metadata(&self, id: Uuid, result: String, duration_ms: u64) {
+        if let Some(mut entry) = self.entries.get_mut(&id) {
+            entry.executed_result = Some(result);
+            entry.executed_duration_ms = Some(duration_ms);
+        }
+    }
+
     /// Sweep expired-and-still-Proposed entries. Returns the removed actions
     /// so the caller can fire `action_expired` audit events.
     pub fn cleanup_expired(&self, now: DateTime<Utc>) -> Vec<PendingAction> {
