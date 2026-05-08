@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
@@ -11,7 +11,10 @@ use axum::{
 use chrono::{NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer,
+    validate_request::ValidateRequestHeaderLayer,
+};
 
 use crate::{
     llm::{ContentBlock, Message, Role, ToolSpec, anthropic::AnthropicClient},
@@ -34,6 +37,12 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_TURNS: usize = 40;
 const MAX_CONTENT_BYTES_PER_TURN: usize = 8192;
 const REQUEST_TIMEOUT_SECONDS: u64 = 240;
+
+// Anthropic Tier 2 standaard is 50 req/min op /v1/messages. Onze gemiddelde
+// /chat is ~10s end-to-end → 8 parallel × 10s = 48 req/min — net binnen budget.
+// Burst boven 8 → tower's interne queue buffert; TimeoutLayer firet als de
+// queue te lang blijft staan.
+const MAX_CONCURRENT_CHAT: usize = 8;
 
 pub struct AppState {
     pub llm: AnthropicClient,
@@ -247,23 +256,83 @@ async fn chat(
     Ok(Json(ChatResponse { answer }))
 }
 
+/// Read `CHAT_BEARER_TOKEN` from env. Whitespace-only or unset → `None`,
+/// so the bearer layer can be conditionally applied with a skip-warn.
+fn auth_token_from_env() -> Option<String> {
+    std::env::var("CHAT_BEARER_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Validates `Authorization: Bearer <token>` against a fixed expected value.
+/// Own impl rather than tower-http's deprecated `bearer()` helper, which
+/// emits a "too basic" warning that breaks `clippy -D warnings`. For our
+/// use-case (single shared secret) the bytewise compare is exactly what's
+/// needed; per-user tokens / JWT live behind a future v2 auth design.
+#[derive(Clone)]
+struct BearerAuth {
+    expected_header: String,
+}
+
+impl BearerAuth {
+    fn new(token: &str) -> Self {
+        Self {
+            expected_header: format!("Bearer {token}"),
+        }
+    }
+}
+
+impl<B> tower_http::validate_request::ValidateRequest<B> for BearerAuth {
+    type ResponseBody = axum::body::Body;
+
+    fn validate(
+        &mut self,
+        request: &mut axum::http::Request<B>,
+    ) -> Result<(), axum::http::Response<Self::ResponseBody>> {
+        let header = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        if header == Some(self.expected_header.as_str()) {
+            Ok(())
+        } else {
+            Err(axum::http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(axum::body::Body::empty())
+                .expect("static UNAUTHORIZED response builds"))
+        }
+    }
+}
+
 /// Build the CORS layer from `CHAT_ALLOWED_ORIGINS` (comma-separated origins).
-/// Unset or empty → permissive fallback with WARN log (dev-only). Set →
-/// strict allow-list of exact origins. A malformed origin invalidates the
-/// whole list and falls back to permissive with a louder WARN, so a typo
-/// doesn't quietly lock out the Frontend.
-fn build_cors_layer() -> CorsLayer {
+/// `CHAT_CORS_STRICT=true` upgrades misconfig from "fallback to permissive
+/// with WARN" to "fail startup". Production sets it; dev leaves it off so
+/// `cargo run` still works without an allow-list.
+fn build_cors_layer() -> Result<CorsLayer> {
+    let strict = std::env::var("CHAT_CORS_STRICT")
+        .ok()
+        .map(|s| s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let raw = std::env::var("CHAT_ALLOWED_ORIGINS")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let Some(csv) = raw else {
+    parse_cors_allow_list(strict, raw.as_deref())
+}
+
+/// Pure decision-table for CORS layer construction. Tests can drive every
+/// branch without touching process env.
+fn parse_cors_allow_list(strict: bool, csv: Option<&str>) -> Result<CorsLayer> {
+    let Some(csv) = csv else {
+        if strict {
+            bail!("CHAT_CORS_STRICT=true requires CHAT_ALLOWED_ORIGINS to be set");
+        }
         tracing::warn!(
             "CHAT_ALLOWED_ORIGINS unset — using permissive CORS (dev-only, NOT for production)"
         );
-        return CorsLayer::permissive();
+        return Ok(CorsLayer::permissive());
     };
 
-    let parsed: Result<Vec<HeaderValue>, _> = csv
+    let parsed: std::result::Result<Vec<HeaderValue>, _> = csv
         .split(',')
         .map(|o| o.trim())
         .filter(|o| !o.is_empty())
@@ -273,20 +342,26 @@ fn build_cors_layer() -> CorsLayer {
     match parsed {
         Ok(origins) if !origins.is_empty() => {
             tracing::info!(count = origins.len(), "CORS locked to allow-list");
-            CorsLayer::new()
+            Ok(CorsLayer::new()
                 .allow_origin(origins)
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers([CONTENT_TYPE])
+                .allow_headers([CONTENT_TYPE]))
+        }
+        Ok(_) if strict => {
+            bail!("CHAT_ALLOWED_ORIGINS contained no usable origins under CHAT_CORS_STRICT=true")
         }
         Ok(_) => {
             tracing::warn!(
                 "CHAT_ALLOWED_ORIGINS contained no usable origins — falling back to permissive"
             );
-            CorsLayer::permissive()
+            Ok(CorsLayer::permissive())
+        }
+        Err(e) if strict => {
+            bail!("CHAT_ALLOWED_ORIGINS parse failed under CHAT_CORS_STRICT=true: {e:#}")
         }
         Err(e) => {
             tracing::warn!("CHAT_ALLOWED_ORIGINS parse failed: {e:#} — falling back to permissive");
-            CorsLayer::permissive()
+            Ok(CorsLayer::permissive())
         }
     }
 }
@@ -421,8 +496,29 @@ pub async fn serve(
     let consumer_handle =
         consumer_config.map(|cfg| tokio::spawn(rabbitmq_consumer::run(cfg, shutdown_rx.clone())));
 
+    let bearer_token = auth_token_from_env();
+    let mut chat_route = post(chat);
+    if let Some(ref token) = bearer_token {
+        tracing::info!("CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat");
+        chat_route =
+            chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+    } else {
+        tracing::warn!(
+            "CHAT_BEARER_TOKEN unset — /chat accepts unauthenticated requests \
+             (dev-only, NOT for production)"
+        );
+    }
+    // Bearer is outer (added first); ConcurrencyLimit is inner (added later).
+    // Unauthenticated requests are rejected before consuming a slot.
+    // GlobalConcurrencyLimit shares one Arc<Semaphore> across all per-request
+    // service clones; the non-global variant builds a fresh semaphore per
+    // Layer::layer() call → no actual capping.
+    chat_route = chat_route.route_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+        MAX_CONCURRENT_CHAT,
+    ));
+
     let app = Router::new()
-        .route("/chat", post(chat))
+        .route("/chat", chat_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
@@ -431,7 +527,7 @@ pub async fn serve(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS),
         ))
-        .layer(build_cors_layer())
+        .layer(build_cors_layer()?)
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
@@ -660,5 +756,208 @@ mod tests {
             .as_str()
             .expect("correlation_id present");
         assert_eq!(id.len(), 36, "uuid v4 hyphenated length");
+    }
+
+    // Sets/clears CHAT_BEARER_TOKEN, must be `#[serial]` to avoid races with
+    // any other test reading process env. Edition 2024 requires `unsafe` for
+    // env-mutation; only the test helpers in this file use it.
+    fn with_bearer_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("CHAT_BEARER_TOKEN", v),
+                None => std::env::remove_var("CHAT_BEARER_TOKEN"),
+            }
+        }
+        f();
+        unsafe {
+            std::env::remove_var("CHAT_BEARER_TOKEN");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_token_from_env_returns_some_when_set() {
+        with_bearer_env(Some("abc"), || {
+            assert_eq!(auth_token_from_env().as_deref(), Some("abc"));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_token_from_env_returns_none_when_empty_or_whitespace() {
+        with_bearer_env(Some("   "), || {
+            assert_eq!(auth_token_from_env(), None);
+        });
+        with_bearer_env(Some(""), || {
+            assert_eq!(auth_token_from_env(), None);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_token_from_env_returns_none_when_unset() {
+        with_bearer_env(None, || {
+            assert_eq!(auth_token_from_env(), None);
+        });
+    }
+
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
+    fn bearer_test_app(token: &str) -> Router {
+        Router::new()
+            .route("/test", post(ok_handler))
+            .route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)))
+    }
+
+    #[tokio::test]
+    async fn bearer_layer_accepts_correct_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = bearer_test_app("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("Authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_layer_rejects_missing_header() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = bearer_test_app("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_layer_rejects_wrong_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = bearer_test_app("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("Authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn cors_lax_no_allowlist_falls_back_to_permissive() {
+        assert!(parse_cors_allow_list(false, None).is_ok());
+    }
+
+    #[test]
+    fn cors_strict_no_allowlist_bails() {
+        let err = parse_cors_allow_list(true, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("requires CHAT_ALLOWED_ORIGINS"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    #[test]
+    fn cors_strict_with_valid_allowlist_returns_layer() {
+        assert!(parse_cors_allow_list(true, Some("https://shift.my.be")).is_ok());
+    }
+
+    #[test]
+    fn cors_strict_parse_fail_bails() {
+        // Internal \n survives trim() but fails HeaderValue parse
+        // (control bytes < 0x20 are rejected).
+        let err = parse_cors_allow_list(true, Some("foo\nbar")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parse failed"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn cors_lax_parse_fail_falls_back_to_permissive() {
+        assert!(parse_cors_allow_list(false, Some("foo\nbar")).is_ok());
+    }
+
+    #[test]
+    fn cors_strict_empty_after_trim_bails() {
+        let err = parse_cors_allow_list(true, Some(", , ,  ")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no usable origins"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn concurrency_layer_caps_in_flight_at_max() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        PEAK.store(0, Ordering::SeqCst);
+
+        async fn slow_handler() -> &'static str {
+            let cur = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(cur, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            "ok"
+        }
+
+        let app: Router = Router::new()
+            .route("/test", post(slow_handler))
+            .route_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+                MAX_CONCURRENT_CHAT,
+            ));
+
+        let mut joinset = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let app_clone = app.clone();
+            joinset.spawn(async move {
+                use axum::body::Body;
+                use axum::http::Request;
+                use tower::ServiceExt;
+
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/test")
+                    .body(Body::empty())
+                    .unwrap();
+                app_clone.oneshot(req).await.unwrap()
+            });
+        }
+
+        while let Some(res) = joinset.join_next().await {
+            assert_eq!(res.unwrap().status(), StatusCode::OK);
+        }
+
+        let observed = PEAK.load(Ordering::SeqCst);
+        assert!(
+            observed <= MAX_CONCURRENT_CHAT,
+            "peak in-flight={observed} exceeded MAX_CONCURRENT_CHAT={MAX_CONCURRENT_CHAT}"
+        );
+        assert!(
+            observed >= 2,
+            "peak should exercise parallelism (>=2), got {observed}"
+        );
     }
 }
