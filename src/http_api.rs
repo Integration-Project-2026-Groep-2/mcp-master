@@ -240,6 +240,7 @@ async fn metrics() -> (StatusCode, &'static str) {
 async fn chat(
     scope: crate::gateway::auth::AuthScope,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, Response> {
     // Generated at handler entry so success-path responses, AMQP audit
@@ -276,14 +277,15 @@ async fn chat(
             crate::agent::modes::ActionableMode::new(state.approval_flow.clone()),
         ),
     };
+    // Thread the JWT sub claim through so a write-tool proposal stores the
+    // proposer's user_id on the PendingAction. flow.confirm rejects an
+    // approve-call whose user_id doesn't match — empty stored vs non-empty
+    // caller would 403 every approve. Empty fallback is fine for the
+    // legacy-bearer / skip-warn read-only paths (no approval-flow downstream).
+    let user_id = crate::gateway::auth::current_user_id(&headers).unwrap_or_default();
     let ctx = crate::agent::modes::DispatchContext {
         correlation_id: correlation_id.clone(),
-        // user_id propagation lands in R2.5 — it requires threading the JWT
-        // sub claim through the AuthScope extractor (currently the extractor
-        // returns the scope only). For PR-4 the audit envelope shows an
-        // empty user_id when scope=read+act; downstream consumers can still
-        // correlate via correlation_id + action_id.
-        user_id: String::new(),
+        user_id,
         scope,
     };
 
