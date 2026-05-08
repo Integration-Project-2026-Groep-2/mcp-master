@@ -4,6 +4,7 @@ mod mcp;
 mod orchestrator;
 mod prompts;
 mod rabbitmq;
+mod retry;
 mod tcom;
 
 use anyhow::{Context, Result};

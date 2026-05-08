@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{ChatResponse, ContentBlock, LlmClient, Message, Role, StopReason, ToolSpec};
+use crate::retry::backoff_with_jitter;
 
 /// Default Anthropic API host. Tests override via `with_base_url`.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -151,18 +152,6 @@ impl LlmClient for AnthropicClient {
             bail!("anthropic non-2xx: {status} {body}");
         }
     }
-}
-
-/// Exponential backoff with 0–500 ms jitter. Attempts 1/2/3 → ~1s/2s/4s
-/// plus jitter to avoid retry-storms across instances.
-fn backoff_with_jitter(attempt: u32) -> std::time::Duration {
-    debug_assert!(
-        attempt >= 1,
-        "attempt must be 1-based when computing backoff"
-    );
-    let base_ms: u64 = 1000_u64 << (attempt.saturating_sub(1));
-    let jitter_ms: u64 = rand::random::<u64>() % 500;
-    std::time::Duration::from_millis(base_ms + jitter_ms)
 }
 
 // ---------- Wire types (private) -----------------------------------------
