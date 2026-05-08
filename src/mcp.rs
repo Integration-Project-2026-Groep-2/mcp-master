@@ -380,6 +380,12 @@ fn validate_args_against_schema(
 
 #[async_trait]
 impl McpExecutor for McpPool {
+    fn server_label_for(&self, tool_name: &str) -> Option<String> {
+        self.tool_to_session_idx
+            .get(tool_name)
+            .map(|&idx| self.sessions[idx].label.clone())
+    }
+
     async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<(String, ToolCallTrace)> {
         validate_args_against_schema(&self.tool_specs, name, &arguments)?;
         let map = arguments

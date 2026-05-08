@@ -53,6 +53,16 @@ pub struct RunOutcome {
 #[async_trait]
 pub trait McpExecutor: Send + Sync {
     async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<(String, ToolCallTrace)>;
+
+    /// Resolve the MCP-server label that owns `tool_name`, if any.
+    ///
+    /// Used by `ActionableMode::dispatch_write_tool` to populate
+    /// `PendingActionDraft.server_label` so the audit envelope can name the
+    /// downstream server without dereferencing executor internals.
+    /// Default returns `None` so test fakes that don't care can skip.
+    fn server_label_for(&self, _tool_name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Run one conversation turn against the LLM, dispatching tools via `mcp`.
