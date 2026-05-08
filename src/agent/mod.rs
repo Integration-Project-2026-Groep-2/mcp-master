@@ -4,5 +4,6 @@
 //! agentic-gateway architecture documented in `.claude/rules/R2_PLANNING_AGENTIC_GATEWAY.md`.
 
 pub mod llm;
+pub mod modes;
 pub mod orchestrator;
 pub mod prompts;
