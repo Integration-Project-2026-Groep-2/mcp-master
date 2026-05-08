@@ -1,4 +1,5 @@
 mod agent;
+mod gateway;
 mod http_api;
 mod mcp;
 mod rabbitmq;
