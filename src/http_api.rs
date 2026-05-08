@@ -1001,6 +1001,7 @@ mod tests {
                 ok: true,
                 error: None,
                 args: None,
+                status: None,
             }],
             tokens: TokenUsage {
                 input: 100,

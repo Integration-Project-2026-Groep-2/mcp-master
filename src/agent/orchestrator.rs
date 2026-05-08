@@ -25,6 +25,12 @@ pub struct ToolCallTrace {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
+    /// Lifecycle marker for the v1.4 audit feed when the tool didn't
+    /// actually execute. `Some("pending")` for an action awaiting approval;
+    /// `Some("blocked_read_only")` for a write-tool denied by ReadOnlyMode.
+    /// `None` for normal dispatched calls (skip-if-none keeps the wire shape).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Outcome of one full tool-loop run.
@@ -60,6 +66,7 @@ pub trait McpExecutor: Send + Sync {
     /// `PendingActionDraft.server_label` so the audit envelope can name the
     /// downstream server without dereferencing executor internals.
     /// Default returns `None` so test fakes that don't care can skip.
+    #[allow(dead_code)] // wired into orchestrator dispatch in commit 3
     fn server_label_for(&self, _tool_name: &str) -> Option<String> {
         None
     }
@@ -280,6 +287,7 @@ mod tests {
                     ok: false,
                     error: Some(err.clone()),
                     args: None,
+                    status: None,
                 };
                 return Ok((err, trace));
             }
@@ -294,6 +302,7 @@ mod tests {
                 ok: true,
                 error: None,
                 args: None,
+                status: None,
             };
             Ok((result, trace))
         }
@@ -733,6 +742,7 @@ mod tests {
             ok: true,
             error: None,
             args: None,
+            status: None,
         };
         let v = serde_json::to_value(&trace).unwrap();
         // skip_serializing_if keeps None fields out of the wire JSON so
