@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
@@ -299,22 +299,34 @@ impl<B> tower_http::validate_request::ValidateRequest<B> for BearerAuth {
 }
 
 /// Build the CORS layer from `CHAT_ALLOWED_ORIGINS` (comma-separated origins).
-/// Unset or empty → permissive fallback with WARN log (dev-only). Set →
-/// strict allow-list of exact origins. A malformed origin invalidates the
-/// whole list and falls back to permissive with a louder WARN, so a typo
-/// doesn't quietly lock out the Frontend.
-fn build_cors_layer() -> CorsLayer {
+/// `CHAT_CORS_STRICT=true` upgrades misconfig from "fallback to permissive
+/// with WARN" to "fail startup". Production sets it; dev leaves it off so
+/// `cargo run` still works without an allow-list.
+fn build_cors_layer() -> Result<CorsLayer> {
+    let strict = std::env::var("CHAT_CORS_STRICT")
+        .ok()
+        .map(|s| s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let raw = std::env::var("CHAT_ALLOWED_ORIGINS")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let Some(csv) = raw else {
+    parse_cors_allow_list(strict, raw.as_deref())
+}
+
+/// Pure decision-table for CORS layer construction. Tests can drive every
+/// branch without touching process env.
+fn parse_cors_allow_list(strict: bool, csv: Option<&str>) -> Result<CorsLayer> {
+    let Some(csv) = csv else {
+        if strict {
+            bail!("CHAT_CORS_STRICT=true requires CHAT_ALLOWED_ORIGINS to be set");
+        }
         tracing::warn!(
             "CHAT_ALLOWED_ORIGINS unset — using permissive CORS (dev-only, NOT for production)"
         );
-        return CorsLayer::permissive();
+        return Ok(CorsLayer::permissive());
     };
 
-    let parsed: Result<Vec<HeaderValue>, _> = csv
+    let parsed: std::result::Result<Vec<HeaderValue>, _> = csv
         .split(',')
         .map(|o| o.trim())
         .filter(|o| !o.is_empty())
@@ -324,20 +336,26 @@ fn build_cors_layer() -> CorsLayer {
     match parsed {
         Ok(origins) if !origins.is_empty() => {
             tracing::info!(count = origins.len(), "CORS locked to allow-list");
-            CorsLayer::new()
+            Ok(CorsLayer::new()
                 .allow_origin(origins)
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers([CONTENT_TYPE])
+                .allow_headers([CONTENT_TYPE]))
+        }
+        Ok(_) if strict => {
+            bail!("CHAT_ALLOWED_ORIGINS contained no usable origins under CHAT_CORS_STRICT=true")
         }
         Ok(_) => {
             tracing::warn!(
                 "CHAT_ALLOWED_ORIGINS contained no usable origins — falling back to permissive"
             );
-            CorsLayer::permissive()
+            Ok(CorsLayer::permissive())
+        }
+        Err(e) if strict => {
+            bail!("CHAT_ALLOWED_ORIGINS parse failed under CHAT_CORS_STRICT=true: {e:#}")
         }
         Err(e) => {
             tracing::warn!("CHAT_ALLOWED_ORIGINS parse failed: {e:#} — falling back to permissive");
-            CorsLayer::permissive()
+            Ok(CorsLayer::permissive())
         }
     }
 }
@@ -495,7 +513,7 @@ pub async fn serve(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS),
         ))
-        .layer(build_cors_layer())
+        .layer(build_cors_layer()?)
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
@@ -830,5 +848,46 @@ mod tests {
 
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn cors_lax_no_allowlist_falls_back_to_permissive() {
+        assert!(parse_cors_allow_list(false, None).is_ok());
+    }
+
+    #[test]
+    fn cors_strict_no_allowlist_bails() {
+        let err = parse_cors_allow_list(true, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("requires CHAT_ALLOWED_ORIGINS"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    #[test]
+    fn cors_strict_with_valid_allowlist_returns_layer() {
+        assert!(parse_cors_allow_list(true, Some("https://shift.my.be")).is_ok());
+    }
+
+    #[test]
+    fn cors_strict_parse_fail_bails() {
+        // Internal \n survives trim() but fails HeaderValue parse
+        // (control bytes < 0x20 are rejected).
+        let err = parse_cors_allow_list(true, Some("foo\nbar")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parse failed"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn cors_lax_parse_fail_falls_back_to_permissive() {
+        assert!(parse_cors_allow_list(false, Some("foo\nbar")).is_ok());
+    }
+
+    #[test]
+    fn cors_strict_empty_after_trim_bails() {
+        let err = parse_cors_allow_list(true, Some(", , ,  ")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no usable origins"), "unexpected error: {msg}");
     }
 }
