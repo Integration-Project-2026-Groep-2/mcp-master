@@ -56,8 +56,11 @@ pub async fn open_session(url: &str) -> anyhow::Result<RunningService<RoleClient
 /// FastMCP-side `annotations.requires_approval=true` field is silently dropped
 /// during deserialization. Inverting `read_only_hint` is reliable because all
 /// 6 CRM-MCP write-tools publish `readOnlyHint=false` and all 7 read-tools
-/// publish `readOnlyHint=true`. Tools without annotations default to read-only
-/// (safer).
+/// publish `readOnlyHint=true`. Tools **without** any annotation default to
+/// `requires_approval=true` (fail-closed): the read-vs-write gate is the only
+/// thing standing between an actionable user and an unreviewed dispatch, so
+/// an absent hint must not silently downgrade a write-tool to a read-tool.
+/// Server authors must declare intent explicitly via `readOnlyHint`.
 //
 // TODO(R3): switch to `tool.meta.get("requires_approval")` once CRM-MCP
 // publishes via the spec-aligned `_meta` channel (rmcp preserves `Tool.meta`).
@@ -67,7 +70,7 @@ pub fn tool_to_spec(tool: &Tool) -> ToolSpec {
         .as_ref()
         .and_then(|a| a.read_only_hint)
         .map(|read_only| !read_only)
-        .unwrap_or(false);
+        .unwrap_or(true);
     ToolSpec {
         name: tool.name.to_string(),
         description: tool.description.as_deref().unwrap_or("").to_string(),
@@ -380,6 +383,12 @@ fn validate_args_against_schema(
 
 #[async_trait]
 impl McpExecutor for McpPool {
+    fn server_label_for(&self, tool_name: &str) -> Option<String> {
+        self.tool_to_session_idx
+            .get(tool_name)
+            .map(|&idx| self.sessions[idx].label.clone())
+    }
+
     async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<(String, ToolCallTrace)> {
         validate_args_against_schema(&self.tool_specs, name, &arguments)?;
         let map = arguments
@@ -429,6 +438,8 @@ impl McpExecutor for McpPool {
                     ok: true,
                     error: None,
                     args: args_for_trace,
+                    status: None,
+                    action_id: None,
                 };
                 Ok((text, trace))
             }
@@ -443,6 +454,8 @@ impl McpExecutor for McpPool {
                     ok: false,
                     error: Some(short.clone()),
                     args: args_for_trace,
+                    status: None,
+                    action_id: None,
                 };
                 // Surface to LLM via is_error=true ToolResult (built by
                 // orchestrator from trace.ok). Conversation continues so
@@ -578,15 +591,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_to_spec_defaults_requires_approval_false_when_no_annotations() {
-        // Tools without annotations (legacy MCP servers) treated as read-only:
-        // safer default that won't accidentally require approval for read-tools.
+    fn tool_to_spec_defaults_requires_approval_true_when_no_annotations() {
+        // Fail-closed: tools without annotations are treated as write-tools
+        // and forced through the approval-flow. An absent hint must not
+        // silently downgrade a write-tool to a read-tool — server authors
+        // must declare intent explicitly via readOnlyHint.
         let mut t = Tool::default();
         t.name = "legacy_tool".into();
         t.input_schema = Arc::new(serde_json::Map::new());
         t.annotations = None;
         let spec = tool_to_spec(&t);
-        assert!(!spec.requires_approval);
+        assert!(spec.requires_approval);
     }
 
     #[test]

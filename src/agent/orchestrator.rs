@@ -11,6 +11,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::agent::llm::{ContentBlock, LlmClient, Message, Role, StopReason, TokenUsage, ToolSpec};
+use crate::agent::modes::{
+    AgentMode, DispatchContext, ReadOnlyMode, build_blocked_read_only_result,
+};
 
 /// Per-call trace built by `McpExecutor::call` impls. `ok=false` carries the
 /// error message; `args` is `None` unless the executor opts in to recording
@@ -25,6 +28,17 @@ pub struct ToolCallTrace {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
+    /// Lifecycle marker for the v1.4 audit feed when the tool didn't
+    /// actually execute. `Some("pending")` for an action awaiting approval;
+    /// `Some("blocked_read_only")` for a write-tool denied by ReadOnlyMode.
+    /// `None` for normal dispatched calls (skip-if-none keeps the wire shape).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// PendingAction id for write-tools intercepted by ActionableMode.
+    /// Drupal `jarvis_chat` reads this to render the approval-card without
+    /// parsing it from the marker text. `None` for everything else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
 }
 
 /// Outcome of one full tool-loop run.
@@ -53,6 +67,16 @@ pub struct RunOutcome {
 #[async_trait]
 pub trait McpExecutor: Send + Sync {
     async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<(String, ToolCallTrace)>;
+
+    /// Resolve the MCP-server label that owns `tool_name`, if any.
+    ///
+    /// Used by `ActionableMode::dispatch_write_tool` to populate
+    /// `PendingActionDraft.server_label` so the audit envelope can name the
+    /// downstream server without dereferencing executor internals.
+    /// Default returns `None` so test fakes that don't care can skip.
+    fn server_label_for(&self, _tool_name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Run one conversation turn against the LLM, dispatching tools via `mcp`.
@@ -105,6 +129,48 @@ pub async fn run(
 ///
 /// Caller-provided `max_iterations` (typically 10) caps runaway tool loops.
 pub async fn run_with_messages(
+    messages: Vec<Message>,
+    system_prompt: &str,
+    llm: &dyn LlmClient,
+    mcp: &dyn McpExecutor,
+    tool_specs: &[ToolSpec],
+    max_iterations: usize,
+    max_tokens: u32,
+) -> anyhow::Result<RunOutcome> {
+    // Backwards-compat shim — legacy callers (Teams scheduled trigger,
+    // --terminal-mode, current /chat handler) get ReadOnly behaviour.
+    // PR-4 routes /chat through `run_with_messages_in_mode` with the
+    // JWT-derived AgentMode + DispatchContext.
+    let mode = AgentMode::ReadOnly(ReadOnlyMode);
+    let ctx = DispatchContext::default();
+    run_with_messages_in_mode(
+        messages,
+        system_prompt,
+        llm,
+        mcp,
+        tool_specs,
+        max_iterations,
+        max_tokens,
+        &mode,
+        &ctx,
+    )
+    .await
+}
+
+/// Mode-aware tool-loop. Identical to `run_with_messages` except every
+/// tool dispatch routes through the [`AgentMode`]:
+/// - `ReadOnly` + read-tool → executor passthrough
+/// - `ReadOnly` + write-tool → synthetic blocked-read-only result
+/// - `Actionable` + read-tool → executor passthrough
+/// - `Actionable` + write-tool → `ApprovalFlow::propose` + synthetic
+///   `ACTION_PROPOSED:` marker
+///
+/// Compile-time gate: the (`ReadOnly`, write) arm calls
+/// `build_blocked_read_only_result` directly because `ReadOnlyMode` has
+/// no `dispatch_write_tool` method. The match's exhaustiveness over
+/// `(AgentMode, bool)` makes the gate visible at the call-site.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_messages_in_mode(
     mut messages: Vec<Message>,
     system_prompt: &str,
     llm: &dyn LlmClient,
@@ -112,6 +178,8 @@ pub async fn run_with_messages(
     tool_specs: &[ToolSpec],
     max_iterations: usize,
     max_tokens: u32,
+    mode: &AgentMode,
+    ctx: &DispatchContext,
 ) -> anyhow::Result<RunOutcome> {
     let mut tool_trace: Vec<ToolCallTrace> = Vec::new();
     let mut tokens = TokenUsage::default();
@@ -177,7 +245,28 @@ pub async fn run_with_messages(
                 }
 
                 let tool_futs = tool_calls.into_iter().map(|(id, name, input)| async move {
-                    let (result, trace) = mcp.call(&name, input).await?;
+                    let requires_approval = tool_specs
+                        .iter()
+                        .find(|s| s.name == name)
+                        .map(|s| s.requires_approval)
+                        .unwrap_or(false);
+                    let (result, trace) = match (mode, requires_approval) {
+                        (AgentMode::ReadOnly(_), true) => {
+                            let server_label = mcp
+                                .server_label_for(&name)
+                                .unwrap_or_else(|| "<unknown>".into());
+                            build_blocked_read_only_result(&name, &server_label)
+                        }
+                        (AgentMode::ReadOnly(m), false) => {
+                            m.dispatch_read_tool(mcp, &name, input).await?
+                        }
+                        (AgentMode::Actionable(m), false) => {
+                            m.dispatch_read_tool(mcp, &name, input).await?
+                        }
+                        (AgentMode::Actionable(m), true) => {
+                            m.dispatch_write_tool(mcp, ctx, &name, input).await?
+                        }
+                    };
                     let block = ContentBlock::ToolResult {
                         tool_use_id: id,
                         content: result,
@@ -270,6 +359,8 @@ mod tests {
                     ok: false,
                     error: Some(err.clone()),
                     args: None,
+                    status: None,
+                    action_id: None,
                 };
                 return Ok((err, trace));
             }
@@ -284,6 +375,8 @@ mod tests {
                 ok: true,
                 error: None,
                 args: None,
+                status: None,
+                action_id: None,
             };
             Ok((result, trace))
         }
@@ -723,12 +816,19 @@ mod tests {
             ok: true,
             error: None,
             args: None,
+            status: None,
+            action_id: None,
         };
         let v = serde_json::to_value(&trace).unwrap();
         // skip_serializing_if keeps None fields out of the wire JSON so
         // clients don't see noisy `error: null` / `args: null` keys.
         assert!(v.get("error").is_none(), "error: null should be omitted");
         assert!(v.get("args").is_none(), "args: null should be omitted");
+        assert!(v.get("status").is_none(), "status: null should be omitted");
+        assert!(
+            v.get("action_id").is_none(),
+            "action_id: null should be omitted",
+        );
         assert_eq!(v["ok"], true);
         assert_eq!(v["ms"], 42);
     }
@@ -770,5 +870,288 @@ mod tests {
             .expect("run should succeed");
 
         assert_eq!(outcome.iterations, 3);
+    }
+
+    // ---- PR-3: mode-aware dispatch tests ----
+
+    use crate::agent::modes::{ActionableMode, AgentMode, DispatchContext, ReadOnlyMode};
+    use crate::gateway::approval::flow::ApprovalFlow;
+    use crate::gateway::approval::state::ApprovalStore;
+    use crate::gateway::audit::AuditPublisher;
+    use std::sync::Arc;
+
+    fn write_tool_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: "writes things".into(),
+            input_schema: json!({"type": "object"}),
+            requires_approval: true,
+        }
+    }
+
+    fn read_tool_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: "reads things".into(),
+            input_schema: json!({"type": "object"}),
+            requires_approval: false,
+        }
+    }
+
+    fn make_actionable_with_store() -> (AgentMode, Arc<ApprovalStore>) {
+        let store = Arc::new(ApprovalStore::new(std::time::Duration::from_secs(900)));
+        let audit = Arc::new(AuditPublisher::new(None));
+        let flow = Arc::new(ApprovalFlow::new(
+            store.clone(),
+            audit,
+            std::time::Duration::from_secs(900),
+        ));
+        (AgentMode::Actionable(ActionableMode::new(flow)), store)
+    }
+
+    fn dispatch_ctx() -> DispatchContext {
+        DispatchContext {
+            correlation_id: "cid-test".into(),
+            user_id: "alice".into(),
+            scope: crate::gateway::auth::AuthScope::ReadAndAct,
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_read_only_mode_blocks_write_tool() {
+        let llm = MockLlmClient::new(vec![
+            ChatResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_w1".into(),
+                    name: "create_company".into(),
+                    input: json!({"name": "Acme"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            },
+            ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "I cannot perform that action with your current scope.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = DispatchContext::default();
+        let specs = vec![write_tool_spec("create_company")];
+
+        let outcome = run_with_messages_in_mode(
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "create Acme please".into(),
+                }],
+            }],
+            "system",
+            &llm,
+            &exec,
+            &specs,
+            10,
+            4096,
+            &mode,
+            &ctx,
+        )
+        .await
+        .expect("run ok");
+
+        // The tool_result block sent back to the LLM must be is_error=true
+        // with the TOOL_BLOCKED_READ_ONLY marker.
+        let calls = llm.calls().await;
+        let second = &calls[1];
+        match &second.messages[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(*is_error);
+                assert!(content.contains("TOOL_BLOCKED_READ_ONLY"));
+                assert!(content.contains("create_company"));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        // Trace surfaces the discriminator so the v1.4 audit feed can
+        // filter blocked attempts.
+        assert_eq!(outcome.tool_trace.len(), 1);
+        assert_eq!(
+            outcome.tool_trace[0].status.as_deref(),
+            Some("blocked_read_only"),
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_actionable_mode_proposes_write_tool() {
+        let llm = MockLlmClient::new(vec![
+            ChatResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_w1".into(),
+                    name: "create_company".into(),
+                    input: json!({"name": "Acme"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            },
+            ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "I have proposed creating Acme; please approve.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let exec = TestExecutor::new(); // never called — proposal short-circuits
+        let (mode, store) = make_actionable_with_store();
+        let ctx = dispatch_ctx();
+        let specs = vec![write_tool_spec("create_company")];
+
+        let outcome = run_with_messages_in_mode(
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "create Acme please".into(),
+                }],
+            }],
+            "system",
+            &llm,
+            &exec,
+            &specs,
+            10,
+            4096,
+            &mode,
+            &ctx,
+        )
+        .await
+        .expect("run ok");
+
+        // tool_result sent to the LLM contains the ACTION_PROPOSED marker.
+        let calls = llm.calls().await;
+        let second = &calls[1];
+        let action_id = match &second.messages[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert!(content.starts_with("ACTION_PROPOSED:"));
+                let action_id_str = content
+                    .split("action_id=")
+                    .nth(1)
+                    .and_then(|s| s.split(';').next())
+                    .expect("marker contains action_id");
+                action_id_str.parse::<uuid::Uuid>().expect("uuid parses")
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+
+        // Store has the proposed action with matching identity.
+        let stored = store.get(action_id).expect("action stored");
+        assert_eq!(stored.tool_name, "create_company");
+        assert_eq!(stored.user_id, "alice");
+        assert_eq!(stored.correlation_id, "cid-test");
+        assert_eq!(outcome.tool_trace[0].status.as_deref(), Some("pending"),);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_dispatches_read_tools_through_either_mode() {
+        // Sanity — read-tools shouldn't change behaviour just because we
+        // run under Actionable mode. Both modes pass through to executor.
+        let exec = TestExecutor::new()
+            .with_response("count_contacts", "44")
+            .await;
+
+        for mode in [
+            AgentMode::ReadOnly(ReadOnlyMode),
+            make_actionable_with_store().0,
+        ] {
+            let llm = MockLlmClient::new(vec![
+                ChatResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "toolu_r1".into(),
+                        name: "count_contacts".into(),
+                        input: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: None,
+                },
+                ChatResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "There are 44.".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                },
+            ]);
+            let specs = vec![read_tool_spec("count_contacts")];
+            let outcome = run_with_messages_in_mode(
+                vec![Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "how many?".into(),
+                    }],
+                }],
+                "system",
+                &llm,
+                &exec,
+                &specs,
+                10,
+                4096,
+                &mode,
+                &dispatch_ctx(),
+            )
+            .await
+            .expect("run ok");
+            assert_eq!(outcome.answer, "There are 44.");
+            // No status discriminator on read-tool dispatches.
+            assert!(outcome.tool_trace[0].status.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_messages_default_shim_uses_read_only() {
+        // The legacy run_with_messages shim defaults to ReadOnlyMode, which
+        // means a write-tool request from the LLM gets blocked even when
+        // the executor would otherwise succeed.
+        let llm = MockLlmClient::new(vec![
+            ChatResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_w1".into(),
+                    name: "delete_company".into(),
+                    input: json!({"crm_id": "abc"}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            },
+            ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "ok blocked".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let exec = TestExecutor::new();
+        let specs = vec![write_tool_spec("delete_company")];
+        let outcome = run_with_messages(
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "delete it".into(),
+                }],
+            }],
+            "system",
+            &llm,
+            &exec,
+            &specs,
+            10,
+            4096,
+        )
+        .await
+        .expect("run ok");
+        assert_eq!(
+            outcome.tool_trace[0].status.as_deref(),
+            Some("blocked_read_only"),
+            "legacy shim must default to ReadOnly behaviour",
+        );
     }
 }

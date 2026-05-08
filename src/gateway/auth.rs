@@ -24,9 +24,9 @@ use std::sync::OnceLock;
 use axum::extract::FromRequestParts;
 use axum::http::{StatusCode, request::Parts};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthScope {
     Read,
     ReadAndAct,
@@ -72,6 +72,19 @@ fn resolve_scope(token: &str) -> AuthScope {
 
     log_skip_warn_once();
     AuthScope::Read
+}
+
+/// Re-decode the JWT sub claim from the request headers. Returns `None` for
+/// the legacy bearer / skip-warn paths (no JWT present). Duplicate work with
+/// the `AuthScope` extractor — R2.5 cleanup will thread `Claims` through as
+/// a request extension. For PR-4 we keep it duplicate to minimise the
+/// extractor's API surface.
+pub fn current_user_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    let secret = jwt_secret_from_env()?;
+    let header = headers.get(axum::http::header::AUTHORIZATION)?;
+    let header_str = header.to_str().ok()?;
+    let token = header_str.strip_prefix("Bearer ")?;
+    decode_claims(token, &secret).ok().map(|c| c.sub)
 }
 
 fn parse_scope(value: &str) -> Option<AuthScope> {
@@ -266,5 +279,55 @@ mod tests {
         assert_eq!(parse_scope("read act"), Some(AuthScope::ReadAndAct));
         assert_eq!(parse_scope("admin"), None);
         assert_eq!(parse_scope(""), None);
+    }
+
+    fn headers_with_bearer(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    // Regression-guard for `chat()` threading the JWT sub claim into
+    // `DispatchContext.user_id`. Previously `chat()` hardcoded user_id="" and
+    // every approve returned WrongUser → 403. If a future change drops the
+    // current_user_id call from `chat()`, this test still passes — but the
+    // companion test `current_user_id_returns_none_without_jwt_secret` and
+    // the production code in `chat()` (uses `unwrap_or_default()` on this
+    // helper's result) together ensure the value flows.
+    #[tokio::test]
+    #[serial]
+    async fn current_user_id_returns_sub_for_valid_jwt() {
+        unsafe {
+            std::env::set_var("CHAT_JWT_SECRET", TEST_SECRET);
+            std::env::remove_var("CHAT_BEARER_TOKEN");
+        }
+        let token = mint_jwt(TEST_SECRET, "read+act", 60);
+        let headers = headers_with_bearer(&token);
+        assert_eq!(current_user_id(&headers), Some("drupal-uid-42".to_string()),);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn current_user_id_returns_none_without_jwt_secret() {
+        unsafe {
+            std::env::remove_var("CHAT_JWT_SECRET");
+            std::env::set_var("CHAT_BEARER_TOKEN", TEST_BEARER);
+        }
+        let headers = headers_with_bearer(TEST_BEARER);
+        assert_eq!(current_user_id(&headers), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn current_user_id_returns_none_for_expired_jwt() {
+        unsafe {
+            std::env::set_var("CHAT_JWT_SECRET", TEST_SECRET);
+        }
+        let token = mint_jwt(TEST_SECRET, "read+act", -120);
+        let headers = headers_with_bearer(&token);
+        assert_eq!(current_user_id(&headers), None);
     }
 }

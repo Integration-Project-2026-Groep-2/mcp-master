@@ -18,8 +18,9 @@ use tower_http::{
 
 use crate::{
     agent::llm::{ContentBlock, Message, Role, TokenUsage, ToolSpec, anthropic::AnthropicClient},
-    agent::orchestrator::{self, ToolCallTrace},
+    agent::orchestrator::{self, McpExecutor, ToolCallTrace},
     agent::prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
+    gateway::approval::types::ApprovalError,
     mcp::McpPool,
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     teams::{TeamsConfig, publish_to_teams},
@@ -49,6 +50,30 @@ pub struct AppState {
     pub pool: McpPool,
     pub tool_specs: Vec<ToolSpec>,
     pub publisher: Option<Arc<Publisher>>,
+    /// Wired into chat() in commit 2 (mode dispatch) and chat_approve/reject
+    /// in commits 3+4. Held as Arc so the cleanup task holds Arc<ApprovalStore>
+    /// (not Arc<AppState>) — keeps `Arc::try_unwrap` clean at shutdown.
+    #[allow(dead_code)]
+    pub approval_flow: Arc<crate::gateway::approval::flow::ApprovalFlow>,
+}
+
+/// Read `CHAT_APPROVAL_TTL_SECONDS` env-var; fall back to 900s (15min) on
+/// missing or unparseable values. Skip-warn matches `auth_token_from_env`.
+fn approval_ttl() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 900;
+    match std::env::var("CHAT_APPROVAL_TTL_SECONDS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+            _ => {
+                tracing::warn!(
+                    raw = %raw,
+                    "CHAT_APPROVAL_TTL_SECONDS unparseable — falling back to {DEFAULT_SECS}s"
+                );
+                std::time::Duration::from_secs(DEFAULT_SECS)
+            }
+        },
+        Err(_) => std::time::Duration::from_secs(DEFAULT_SECS),
+    }
 }
 
 /// Wire-level role for one chat turn. Strict-lowercase to match Anthropic's
@@ -213,7 +238,9 @@ async fn metrics() -> (StatusCode, &'static str) {
 }
 
 async fn chat(
+    scope: crate::gateway::auth::AuthScope,
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, Response> {
     // Generated at handler entry so success-path responses, AMQP audit
@@ -238,11 +265,32 @@ async fn chat(
         correlation_id = %correlation_id,
         prompt_length = prompt.len(),
         conversation_length,
+        scope = ?scope,
         "/chat received"
     );
 
+    let mode = match scope {
+        crate::gateway::auth::AuthScope::Read => {
+            crate::agent::modes::AgentMode::ReadOnly(crate::agent::modes::ReadOnlyMode)
+        }
+        crate::gateway::auth::AuthScope::ReadAndAct => crate::agent::modes::AgentMode::Actionable(
+            crate::agent::modes::ActionableMode::new(state.approval_flow.clone()),
+        ),
+    };
+    // Thread the JWT sub claim through so a write-tool proposal stores the
+    // proposer's user_id on the PendingAction. flow.confirm rejects an
+    // approve-call whose user_id doesn't match — empty stored vs non-empty
+    // caller would 403 every approve. Empty fallback is fine for the
+    // legacy-bearer / skip-warn read-only paths (no approval-flow downstream).
+    let user_id = crate::gateway::auth::current_user_id(&headers).unwrap_or_default();
+    let ctx = crate::agent::modes::DispatchContext {
+        correlation_id: correlation_id.clone(),
+        user_id,
+        scope,
+    };
+
     let started = std::time::Instant::now();
-    let outcome = orchestrator::run_with_messages(
+    let outcome = orchestrator::run_with_messages_in_mode(
         messages,
         SETUP_PROMPT,
         &state.llm,
@@ -250,6 +298,8 @@ async fn chat(
         &state.tool_specs,
         MAX_ITERATIONS,
         MAX_TOKENS,
+        &mode,
+        &ctx,
     )
     .await
     .map_err(|e| AppError(e).into_response())?;
@@ -279,6 +329,144 @@ async fn chat(
         iterations: outcome.iterations,
         correlation_id,
     }))
+}
+
+/// Body for `POST /chat/approve`. The `action_id` was returned in the
+/// original `/chat` response's `tool_trace[i].action_id`; the client echoes
+/// it back here to authorise dispatch of the proposed write-tool.
+#[derive(Debug, Deserialize)]
+pub struct ApproveBody {
+    pub action_id: uuid::Uuid,
+}
+
+/// Map approval state-machine errors to HTTP statuses.
+///
+/// - `NotFound` → 404 (action id never existed or was swept by TTL cleanup)
+/// - `AlreadyDecided` → 409 (idempotent retry of confirm/reject)
+/// - `WrongUser` → 403 (action-id hijack attempt across users)
+/// - `Expired` → 410 (TTL elapsed before user clicked Approve)
+///
+/// Bodies stay short — the action_id alone is enough breadcrumb; the
+/// `ApprovalError` Display impls can surface PII (proposer/caller IDs).
+fn approval_error_response(e: ApprovalError) -> Response {
+    let (status, message) = match &e {
+        ApprovalError::NotFound(_) => (StatusCode::NOT_FOUND, "action not found"),
+        ApprovalError::AlreadyDecided(_) => (StatusCode::CONFLICT, "action already decided"),
+        ApprovalError::WrongUser { .. } => (StatusCode::FORBIDDEN, "user mismatch"),
+        ApprovalError::Expired(_) => (StatusCode::GONE, "action expired"),
+    };
+    let body = Json(serde_json::json!({ "error": message }));
+    (status, body).into_response()
+}
+
+fn scope_required_response() -> Response {
+    let body = Json(serde_json::json!({ "error": "scope read+act required" }));
+    (StatusCode::FORBIDDEN, body).into_response()
+}
+
+/// Approve a previously-proposed write-tool action and dispatch it.
+///
+/// Flow: scope-gate → re-decode JWT for `sub` claim → `flow.confirm` (atomic
+/// CAS via DashMap entry-lock) → dispatch via `state.pool.call` → mark
+/// executed. `mark_executed` is best-effort: if the AMQP broker is down the
+/// SF write already succeeded, and operators replay via correlation_id.
+async fn chat_approve(
+    scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ApproveBody>,
+) -> Response {
+    if scope != crate::gateway::auth::AuthScope::ReadAndAct {
+        return scope_required_response();
+    }
+    let user_id = match crate::gateway::auth::current_user_id(&headers) {
+        Some(id) => id,
+        None => return scope_required_response(),
+    };
+
+    let action = match state.approval_flow.confirm(body.action_id, &user_id).await {
+        Ok(a) => a,
+        Err(e) => return approval_error_response(e),
+    };
+
+    let started = std::time::Instant::now();
+    let (result, mut trace) = match state
+        .pool
+        .call(&action.tool_name, action.tool_args.clone())
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => return AppError(e).into_response(),
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    trace.status = Some("executed".into());
+    trace.action_id = Some(action.action_id.to_string());
+
+    if let Err(e) = state
+        .approval_flow
+        .mark_executed(action.action_id, &result, duration_ms)
+        .await
+    {
+        tracing::warn!(action_id = %body.action_id, "mark_executed failed: {e:#}");
+    }
+
+    Json(ChatResponse {
+        answer: result,
+        tool_trace: vec![trace],
+        tokens: TokenUsage::default(),
+        iterations: 0,
+        correlation_id: action.correlation_id,
+    })
+    .into_response()
+}
+
+/// Body for `POST /chat/reject`. Optional `reason` rides on the audit-log
+/// envelope (and the rendered answer) so users see why their proposal was
+/// rejected on retry.
+#[derive(Debug, Deserialize)]
+pub struct RejectBody {
+    pub action_id: uuid::Uuid,
+    pub reason: Option<String>,
+}
+
+/// Reject a previously-proposed write-tool action.
+///
+/// Mirror of `chat_approve` minus the dispatch — `flow.reject` runs the
+/// same atomic CAS as `confirm`, but no MCP tool-call follows. The returned
+/// `ChatResponse` shape matches `/chat` so Drupal `jarvis_chat` renders it
+/// like any other turn (assistant bubble with the rejection notice).
+async fn chat_reject(
+    scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RejectBody>,
+) -> Response {
+    if scope != crate::gateway::auth::AuthScope::ReadAndAct {
+        return scope_required_response();
+    }
+    let user_id = match crate::gateway::auth::current_user_id(&headers) {
+        Some(id) => id,
+        None => return scope_required_response(),
+    };
+
+    let action = match state
+        .approval_flow
+        .reject(body.action_id, &user_id, body.reason.clone())
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => return approval_error_response(e),
+    };
+
+    let reason_text = body.reason.unwrap_or_else(|| "no reason given".to_string());
+    Json(ChatResponse {
+        answer: format!("Action rejected: {reason_text}"),
+        tool_trace: Vec::new(),
+        tokens: TokenUsage::default(),
+        iterations: 0,
+        correlation_id: action.correlation_id,
+    })
+    .into_response()
 }
 
 /// Read `CHAT_BEARER_TOKEN` from env. Whitespace-only or unset → `None`,
@@ -503,11 +691,27 @@ pub async fn serve(
         pool.attach_publisher(p.clone());
     }
 
+    // Approval-flow primitives (PR-2). Cleanup task holds Arc<ApprovalStore>
+    // — NOT Arc<AppState> — so the shutdown's Arc::try_unwrap on state
+    // stays clean.
+    let approval_store = Arc::new(crate::gateway::approval::state::ApprovalStore::new(
+        approval_ttl(),
+    ));
+    let approval_audit = Arc::new(crate::gateway::audit::AuditPublisher::new(
+        publisher_arc.clone(),
+    ));
+    let approval_flow = Arc::new(crate::gateway::approval::flow::ApprovalFlow::new(
+        approval_store.clone(),
+        approval_audit.clone(),
+        approval_ttl(),
+    ));
+
     let state = Arc::new(AppState {
         llm,
         pool,
         tool_specs,
         publisher: publisher_arc,
+        approval_flow: approval_flow.clone(),
     });
     let teams_config = teams_config.map(Arc::new);
 
@@ -519,19 +723,38 @@ pub async fn serve(
         shutdown_rx.clone(),
     ));
 
+    let cleanup_handle = tokio::spawn(crate::gateway::approval::state::run_cleanup_task(
+        approval_store.clone(),
+        approval_audit.clone(),
+        shutdown_rx.clone(),
+    ));
+
     let consumer_handle =
         consumer_config.map(|cfg| tokio::spawn(rabbitmq_consumer::run(cfg, shutdown_rx.clone())));
 
     let bearer_token = auth_token_from_env();
+    // One concurrency layer shared across /chat + /chat/approve so both
+    // routes draw from the same 8-slot pool. Plan §11.4: "8 concurrent
+    // approvals + chats together is plenty for a single eventbeheerder."
+    let chat_concurrency = tower::limit::GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_CHAT);
+
     let mut chat_route = post(chat);
+    let mut approve_route = post(chat_approve);
+    let mut reject_route = post(chat_reject);
     if let Some(ref token) = bearer_token {
-        tracing::info!("CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat");
+        tracing::info!(
+            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject"
+        );
         chat_route =
             chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        approve_route =
+            approve_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        reject_route =
+            reject_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
     } else {
         tracing::warn!(
-            "CHAT_BEARER_TOKEN unset — /chat accepts unauthenticated requests \
-             (dev-only, NOT for production)"
+            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject accept unauthenticated \
+             requests (dev-only, NOT for production)"
         );
     }
     // Bearer is outer (added first); ConcurrencyLimit is inner (added later).
@@ -539,12 +762,14 @@ pub async fn serve(
     // GlobalConcurrencyLimit shares one Arc<Semaphore> across all per-request
     // service clones; the non-global variant builds a fresh semaphore per
     // Layer::layer() call → no actual capping.
-    chat_route = chat_route.route_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
-        MAX_CONCURRENT_CHAT,
-    ));
+    chat_route = chat_route.route_layer(chat_concurrency.clone());
+    approve_route = approve_route.route_layer(chat_concurrency.clone());
+    reject_route = reject_route.route_layer(chat_concurrency);
 
     let app = Router::new()
         .route("/chat", chat_route)
+        .route("/chat/approve", approve_route)
+        .route("/chat/reject", reject_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
@@ -577,6 +802,16 @@ pub async fn serve(
 
     if let Err(e) = trigger_handle.await {
         tracing::warn!("trigger task join error: {e:#}");
+    }
+    // The cleanup task uses tokio::select! over shutdown_rx + interval —
+    // the watch::Receiver flip is observable within the tick interval, so
+    // a 2s drain budget is enough.
+    match tokio::time::timeout(std::time::Duration::from_secs(2), cleanup_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("approval cleanup task join error: {e:#}"),
+        Err(_) => tracing::warn!(
+            "approval cleanup task didn't drain in 2s — task detached, runtime drop will reclaim"
+        ),
     }
     if let Some(h) = consumer_handle {
         // The consumer task uses `tokio::select!` against `shutdown_rx`, but
@@ -827,6 +1062,52 @@ mod tests {
         });
     }
 
+    fn with_approval_ttl_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let prev = std::env::var("CHAT_APPROVAL_TTL_SECONDS").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("CHAT_APPROVAL_TTL_SECONDS", v),
+                None => std::env::remove_var("CHAT_APPROVAL_TTL_SECONDS"),
+            }
+        }
+        let r = f();
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("CHAT_APPROVAL_TTL_SECONDS", p),
+                None => std::env::remove_var("CHAT_APPROVAL_TTL_SECONDS"),
+            }
+        }
+        r
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn approval_ttl_defaults_to_900_seconds() {
+        with_approval_ttl_env(None, || {
+            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn approval_ttl_parses_env_override() {
+        with_approval_ttl_env(Some("60"), || {
+            assert_eq!(approval_ttl(), std::time::Duration::from_secs(60));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn approval_ttl_falls_back_on_garbage_value() {
+        with_approval_ttl_env(Some("not-a-number"), || {
+            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
+        });
+        with_approval_ttl_env(Some("0"), || {
+            // zero is a sentinel for "unparseable" — fallback applies
+            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
+        });
+    }
+
     async fn ok_handler() -> &'static str {
         "ok"
     }
@@ -988,6 +1269,97 @@ mod tests {
     }
 
     #[test]
+    fn approve_body_deserializes_action_id() {
+        let body: ApproveBody =
+            serde_json::from_str(r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000"}"#)
+                .unwrap();
+        assert_eq!(
+            body.action_id.to_string(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn approve_body_rejects_non_uuid_action_id() {
+        let err = serde_json::from_str::<ApproveBody>(r#"{"action_id":"not-a-uuid"}"#)
+            .expect_err("bad uuid must reject");
+        assert!(err.to_string().to_lowercase().contains("uuid"));
+    }
+
+    #[tokio::test]
+    async fn approval_error_response_maps_status_codes() {
+        use crate::gateway::approval::types::{ApprovalError, ApprovalStatus};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        assert_eq!(
+            approval_error_response(ApprovalError::NotFound(Uuid::new_v4())).status(),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            approval_error_response(ApprovalError::AlreadyDecided(ApprovalStatus::Approved))
+                .status(),
+            StatusCode::CONFLICT,
+        );
+        assert_eq!(
+            approval_error_response(ApprovalError::WrongUser {
+                proposer: "alice".into(),
+                caller: "mallory".into(),
+            })
+            .status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            approval_error_response(ApprovalError::Expired(Utc::now())).status(),
+            StatusCode::GONE,
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_error_body_does_not_leak_proposer_id() {
+        use axum::body::to_bytes;
+
+        let response = approval_error_response(ApprovalError::WrongUser {
+            proposer: "drupal-uid-42".into(),
+            caller: "drupal-uid-99".into(),
+        });
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !body.contains("drupal-uid-42"),
+            "must not leak proposer id: {body}"
+        );
+        assert!(
+            !body.contains("drupal-uid-99"),
+            "must not leak caller id: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_required_returns_403() {
+        let response = scope_required_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn reject_body_deserializes_with_reason() {
+        let body: RejectBody = serde_json::from_str(
+            r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000","reason":"vendor mismatch"}"#,
+        )
+        .unwrap();
+        assert_eq!(body.reason.as_deref(), Some("vendor mismatch"));
+    }
+
+    #[test]
+    fn reject_body_deserializes_without_reason() {
+        let body: RejectBody =
+            serde_json::from_str(r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000"}"#)
+                .unwrap();
+        assert!(body.reason.is_none());
+    }
+
+    #[test]
     fn chat_response_serializes_with_v1_4_fields() {
         // Pin the wire shape Drupal/jarvis_chat sees on success: answer +
         // additive tool_trace/tokens/iterations/correlation_id. Drupal's
@@ -1001,6 +1373,8 @@ mod tests {
                 ok: true,
                 error: None,
                 args: None,
+                status: None,
+                action_id: None,
             }],
             tokens: TokenUsage {
                 input: 100,
