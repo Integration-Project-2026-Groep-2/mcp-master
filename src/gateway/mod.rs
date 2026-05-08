@@ -6,4 +6,5 @@
 //! Auth lands first; approval store + state-machine + audit publisher follow
 //! in PR-2.
 
+pub mod approval;
 pub mod auth;

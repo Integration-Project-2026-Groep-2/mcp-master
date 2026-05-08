@@ -24,9 +24,9 @@ use std::sync::OnceLock;
 use axum::extract::FromRequestParts;
 use axum::http::{StatusCode, request::Parts};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthScope {
     Read,
     ReadAndAct,

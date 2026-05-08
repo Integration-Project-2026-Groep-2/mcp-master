@@ -48,7 +48,7 @@ tower = { version = "0.5", default-features = false, features = ["util", "limit"
 # Correlation IDs in /chat error responses — full anyhow chain stays in logs,
 # only an opaque ID surfaces to clients. Prevents leak of RABBITMQ_URL and
 # similar secrets via `{:#}` formatter.
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Stream-trait combinators (StreamExt::next) for lapin's Consumer.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -70,6 +70,9 @@ rand = "0.8"
 # JWT decode for AuthScope extractor. HS256 only (default features); no
 # `ring`/`openssl` pulled in.
 jsonwebtoken = { version = "9", default-features = false }
+
+# Typed errors with `#[derive(Error)]` for the approval state-machine.
+thiserror = "1"
 
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
