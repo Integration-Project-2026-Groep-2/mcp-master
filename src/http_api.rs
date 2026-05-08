@@ -49,6 +49,30 @@ pub struct AppState {
     pub pool: McpPool,
     pub tool_specs: Vec<ToolSpec>,
     pub publisher: Option<Arc<Publisher>>,
+    /// Wired into chat() in commit 2 (mode dispatch) and chat_approve/reject
+    /// in commits 3+4. Held as Arc so the cleanup task holds Arc<ApprovalStore>
+    /// (not Arc<AppState>) — keeps `Arc::try_unwrap` clean at shutdown.
+    #[allow(dead_code)]
+    pub approval_flow: Arc<crate::gateway::approval::flow::ApprovalFlow>,
+}
+
+/// Read `CHAT_APPROVAL_TTL_SECONDS` env-var; fall back to 900s (15min) on
+/// missing or unparseable values. Skip-warn matches `auth_token_from_env`.
+fn approval_ttl() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 900;
+    match std::env::var("CHAT_APPROVAL_TTL_SECONDS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+            _ => {
+                tracing::warn!(
+                    raw = %raw,
+                    "CHAT_APPROVAL_TTL_SECONDS unparseable — falling back to {DEFAULT_SECS}s"
+                );
+                std::time::Duration::from_secs(DEFAULT_SECS)
+            }
+        },
+        Err(_) => std::time::Duration::from_secs(DEFAULT_SECS),
+    }
 }
 
 /// Wire-level role for one chat turn. Strict-lowercase to match Anthropic's
@@ -503,11 +527,27 @@ pub async fn serve(
         pool.attach_publisher(p.clone());
     }
 
+    // Approval-flow primitives (PR-2). Cleanup task holds Arc<ApprovalStore>
+    // — NOT Arc<AppState> — so the shutdown's Arc::try_unwrap on state
+    // stays clean.
+    let approval_store = Arc::new(crate::gateway::approval::state::ApprovalStore::new(
+        approval_ttl(),
+    ));
+    let approval_audit = Arc::new(crate::gateway::audit::AuditPublisher::new(
+        publisher_arc.clone(),
+    ));
+    let approval_flow = Arc::new(crate::gateway::approval::flow::ApprovalFlow::new(
+        approval_store.clone(),
+        approval_audit.clone(),
+        approval_ttl(),
+    ));
+
     let state = Arc::new(AppState {
         llm,
         pool,
         tool_specs,
         publisher: publisher_arc,
+        approval_flow: approval_flow.clone(),
     });
     let teams_config = teams_config.map(Arc::new);
 
@@ -516,6 +556,12 @@ pub async fn serve(
     let trigger_handle = tokio::spawn(run_scheduled_trigger(
         state.clone(),
         teams_config.clone(),
+        shutdown_rx.clone(),
+    ));
+
+    let cleanup_handle = tokio::spawn(crate::gateway::approval::state::run_cleanup_task(
+        approval_store.clone(),
+        approval_audit.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -577,6 +623,16 @@ pub async fn serve(
 
     if let Err(e) = trigger_handle.await {
         tracing::warn!("trigger task join error: {e:#}");
+    }
+    // The cleanup task uses tokio::select! over shutdown_rx + interval —
+    // the watch::Receiver flip is observable within the tick interval, so
+    // a 2s drain budget is enough.
+    match tokio::time::timeout(std::time::Duration::from_secs(2), cleanup_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("approval cleanup task join error: {e:#}"),
+        Err(_) => tracing::warn!(
+            "approval cleanup task didn't drain in 2s — task detached, runtime drop will reclaim"
+        ),
     }
     if let Some(h) = consumer_handle {
         // The consumer task uses `tokio::select!` against `shutdown_rx`, but
@@ -824,6 +880,52 @@ mod tests {
     fn auth_token_from_env_returns_none_when_unset() {
         with_bearer_env(None, || {
             assert_eq!(auth_token_from_env(), None);
+        });
+    }
+
+    fn with_approval_ttl_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let prev = std::env::var("CHAT_APPROVAL_TTL_SECONDS").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("CHAT_APPROVAL_TTL_SECONDS", v),
+                None => std::env::remove_var("CHAT_APPROVAL_TTL_SECONDS"),
+            }
+        }
+        let r = f();
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("CHAT_APPROVAL_TTL_SECONDS", p),
+                None => std::env::remove_var("CHAT_APPROVAL_TTL_SECONDS"),
+            }
+        }
+        r
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn approval_ttl_defaults_to_900_seconds() {
+        with_approval_ttl_env(None, || {
+            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn approval_ttl_parses_env_override() {
+        with_approval_ttl_env(Some("60"), || {
+            assert_eq!(approval_ttl(), std::time::Duration::from_secs(60));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn approval_ttl_falls_back_on_garbage_value() {
+        with_approval_ttl_env(Some("not-a-number"), || {
+            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
+        });
+        with_approval_ttl_env(Some("0"), || {
+            // zero is a sentinel for "unparseable" — fallback applies
+            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
         });
     }
 
