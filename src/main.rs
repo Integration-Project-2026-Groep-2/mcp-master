@@ -1,8 +1,6 @@
 mod agent;
 mod http_api;
-mod llm;
 mod mcp;
-mod prompts;
 mod rabbitmq;
 mod retry;
 mod teams;
@@ -11,8 +9,8 @@ use anyhow::{Context, Result};
 use std::io::Read;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::llm::ToolSpec;
-use crate::llm::anthropic::AnthropicClient;
+use crate::agent::llm::ToolSpec;
+use crate::agent::llm::anthropic::AnthropicClient;
 use crate::teams::TeamsConfig;
 
 const MAX_ITERATIONS: usize = 10;
@@ -26,7 +24,7 @@ async fn run_prompt(
 ) -> Result<String> {
     let outcome = agent::orchestrator::run(
         prompt.to_string(),
-        prompts::SETUP_PROMPT,
+        agent::prompts::SETUP_PROMPT,
         llm,
         pool,
         tool_specs,

@@ -10,7 +10,7 @@ use futures_util::future::try_join_all;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::llm::{ContentBlock, LlmClient, Message, Role, StopReason, TokenUsage, ToolSpec};
+use crate::agent::llm::{ContentBlock, LlmClient, Message, Role, StopReason, TokenUsage, ToolSpec};
 
 /// Per-call trace built by `McpExecutor::call` impls. `ok=false` carries the
 /// error message; `args` is `None` unless the executor opts in to recording
@@ -216,8 +216,8 @@ fn collect_text(content: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ChatResponse;
-    use crate::llm::tests::MockLlmClient;
+    use crate::agent::llm::ChatResponse;
+    use crate::agent::llm::tests::MockLlmClient;
     use serde_json::json;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
