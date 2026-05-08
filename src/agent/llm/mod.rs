@@ -57,11 +57,17 @@ pub enum ContentBlock {
 
 /// Tool schema as advertised to the LLM. `description` is mandatory because
 /// the model's tool selection accuracy depends heavily on it.
+///
+/// `requires_approval` is mcp-master-internal metadata; it is **not** sent to
+/// the LLM (verified in `anthropic::tests::to_wire_tools_drops_requires_approval`).
+/// The orchestrator (PR-3) reads it to decide whether to dispatch directly
+/// (false) or route through the approval store (true).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub requires_approval: bool,
 }
 
 /// Result of one `chat()` round-trip.
