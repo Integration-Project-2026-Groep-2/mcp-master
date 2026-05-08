@@ -74,6 +74,19 @@ fn resolve_scope(token: &str) -> AuthScope {
     AuthScope::Read
 }
 
+/// Re-decode the JWT sub claim from the request headers. Returns `None` for
+/// the legacy bearer / skip-warn paths (no JWT present). Duplicate work with
+/// the `AuthScope` extractor — R2.5 cleanup will thread `Claims` through as
+/// a request extension. For PR-4 we keep it duplicate to minimise the
+/// extractor's API surface.
+pub fn current_user_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    let secret = jwt_secret_from_env()?;
+    let header = headers.get(axum::http::header::AUTHORIZATION)?;
+    let header_str = header.to_str().ok()?;
+    let token = header_str.strip_prefix("Bearer ")?;
+    decode_claims(token, &secret).ok().map(|c| c.sub)
+}
+
 fn parse_scope(value: &str) -> Option<AuthScope> {
     match value.trim() {
         "read" => Some(AuthScope::Read),

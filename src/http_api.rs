@@ -18,8 +18,9 @@ use tower_http::{
 
 use crate::{
     agent::llm::{ContentBlock, Message, Role, TokenUsage, ToolSpec, anthropic::AnthropicClient},
-    agent::orchestrator::{self, ToolCallTrace},
+    agent::orchestrator::{self, McpExecutor, ToolCallTrace},
     agent::prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
+    gateway::approval::types::ApprovalError,
     mcp::McpPool,
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     teams::{TeamsConfig, publish_to_teams},
@@ -328,6 +329,95 @@ async fn chat(
     }))
 }
 
+/// Body for `POST /chat/approve`. The `action_id` was returned in the
+/// original `/chat` response's `tool_trace[i].action_id`; the client echoes
+/// it back here to authorise dispatch of the proposed write-tool.
+#[derive(Debug, Deserialize)]
+pub struct ApproveBody {
+    pub action_id: uuid::Uuid,
+}
+
+/// Map approval state-machine errors to HTTP statuses.
+///
+/// - `NotFound` → 404 (action id never existed or was swept by TTL cleanup)
+/// - `AlreadyDecided` → 409 (idempotent retry of confirm/reject)
+/// - `WrongUser` → 403 (action-id hijack attempt across users)
+/// - `Expired` → 410 (TTL elapsed before user clicked Approve)
+///
+/// Bodies stay short — the action_id alone is enough breadcrumb; the
+/// `ApprovalError` Display impls can surface PII (proposer/caller IDs).
+fn approval_error_response(e: ApprovalError) -> Response {
+    let (status, message) = match &e {
+        ApprovalError::NotFound(_) => (StatusCode::NOT_FOUND, "action not found"),
+        ApprovalError::AlreadyDecided(_) => (StatusCode::CONFLICT, "action already decided"),
+        ApprovalError::WrongUser { .. } => (StatusCode::FORBIDDEN, "user mismatch"),
+        ApprovalError::Expired(_) => (StatusCode::GONE, "action expired"),
+    };
+    let body = Json(serde_json::json!({ "error": message }));
+    (status, body).into_response()
+}
+
+fn scope_required_response() -> Response {
+    let body = Json(serde_json::json!({ "error": "scope read+act required" }));
+    (StatusCode::FORBIDDEN, body).into_response()
+}
+
+/// Approve a previously-proposed write-tool action and dispatch it.
+///
+/// Flow: scope-gate → re-decode JWT for `sub` claim → `flow.confirm` (atomic
+/// CAS via DashMap entry-lock) → dispatch via `state.pool.call` → mark
+/// executed. `mark_executed` is best-effort: if the AMQP broker is down the
+/// SF write already succeeded, and operators replay via correlation_id.
+async fn chat_approve(
+    scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ApproveBody>,
+) -> Response {
+    if scope != crate::gateway::auth::AuthScope::ReadAndAct {
+        return scope_required_response();
+    }
+    let user_id = match crate::gateway::auth::current_user_id(&headers) {
+        Some(id) => id,
+        None => return scope_required_response(),
+    };
+
+    let action = match state.approval_flow.confirm(body.action_id, &user_id).await {
+        Ok(a) => a,
+        Err(e) => return approval_error_response(e),
+    };
+
+    let started = std::time::Instant::now();
+    let (result, mut trace) = match state
+        .pool
+        .call(&action.tool_name, action.tool_args.clone())
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => return AppError(e).into_response(),
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    trace.status = Some("executed".into());
+    trace.action_id = Some(action.action_id.to_string());
+
+    if let Err(e) = state
+        .approval_flow
+        .mark_executed(action.action_id, &result, duration_ms)
+        .await
+    {
+        tracing::warn!(action_id = %body.action_id, "mark_executed failed: {e:#}");
+    }
+
+    Json(ChatResponse {
+        answer: result,
+        tool_trace: vec![trace],
+        tokens: TokenUsage::default(),
+        iterations: 0,
+        correlation_id: action.correlation_id,
+    })
+    .into_response()
+}
+
 /// Read `CHAT_BEARER_TOKEN` from env. Whitespace-only or unset → `None`,
 /// so the bearer layer can be conditionally applied with a skip-warn.
 fn auth_token_from_env() -> Option<String> {
@@ -592,14 +682,22 @@ pub async fn serve(
         consumer_config.map(|cfg| tokio::spawn(rabbitmq_consumer::run(cfg, shutdown_rx.clone())));
 
     let bearer_token = auth_token_from_env();
+    // One concurrency layer shared across /chat + /chat/approve so both
+    // routes draw from the same 8-slot pool. Plan §11.4: "8 concurrent
+    // approvals + chats together is plenty for a single eventbeheerder."
+    let chat_concurrency = tower::limit::GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_CHAT);
+
     let mut chat_route = post(chat);
+    let mut approve_route = post(chat_approve);
     if let Some(ref token) = bearer_token {
-        tracing::info!("CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat");
+        tracing::info!("CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve");
         chat_route =
             chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        approve_route =
+            approve_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
     } else {
         tracing::warn!(
-            "CHAT_BEARER_TOKEN unset — /chat accepts unauthenticated requests \
+            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve accept unauthenticated requests \
              (dev-only, NOT for production)"
         );
     }
@@ -608,12 +706,12 @@ pub async fn serve(
     // GlobalConcurrencyLimit shares one Arc<Semaphore> across all per-request
     // service clones; the non-global variant builds a fresh semaphore per
     // Layer::layer() call → no actual capping.
-    chat_route = chat_route.route_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
-        MAX_CONCURRENT_CHAT,
-    ));
+    chat_route = chat_route.route_layer(chat_concurrency.clone());
+    approve_route = approve_route.route_layer(chat_concurrency);
 
     let app = Router::new()
         .route("/chat", chat_route)
+        .route("/chat/approve", approve_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
@@ -1110,6 +1208,80 @@ mod tests {
             observed >= 2,
             "peak should exercise parallelism (>=2), got {observed}"
         );
+    }
+
+    #[test]
+    fn approve_body_deserializes_action_id() {
+        let body: ApproveBody =
+            serde_json::from_str(r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000"}"#)
+                .unwrap();
+        assert_eq!(
+            body.action_id.to_string(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn approve_body_rejects_non_uuid_action_id() {
+        let err = serde_json::from_str::<ApproveBody>(r#"{"action_id":"not-a-uuid"}"#)
+            .expect_err("bad uuid must reject");
+        assert!(err.to_string().to_lowercase().contains("uuid"));
+    }
+
+    #[tokio::test]
+    async fn approval_error_response_maps_status_codes() {
+        use crate::gateway::approval::types::{ApprovalError, ApprovalStatus};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        assert_eq!(
+            approval_error_response(ApprovalError::NotFound(Uuid::new_v4())).status(),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            approval_error_response(ApprovalError::AlreadyDecided(ApprovalStatus::Approved))
+                .status(),
+            StatusCode::CONFLICT,
+        );
+        assert_eq!(
+            approval_error_response(ApprovalError::WrongUser {
+                proposer: "alice".into(),
+                caller: "mallory".into(),
+            })
+            .status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            approval_error_response(ApprovalError::Expired(Utc::now())).status(),
+            StatusCode::GONE,
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_error_body_does_not_leak_proposer_id() {
+        use axum::body::to_bytes;
+
+        let response = approval_error_response(ApprovalError::WrongUser {
+            proposer: "drupal-uid-42".into(),
+            caller: "drupal-uid-99".into(),
+        });
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !body.contains("drupal-uid-42"),
+            "must not leak proposer id: {body}"
+        );
+        assert!(
+            !body.contains("drupal-uid-99"),
+            "must not leak caller id: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_required_returns_403() {
+        let response = scope_required_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
