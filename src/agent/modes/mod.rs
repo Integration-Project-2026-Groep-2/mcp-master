@@ -14,7 +14,10 @@
 //! user_id, scope) into the proposal so audit envelopes don't need to
 //! reach back into the HTTP layer.
 
-#![allow(dead_code)] // Wired into orchestrator dispatch in commit 3.
+// Module-level allow because PR-4 is the first construction site for
+// `AgentMode::Actionable` + `ActionableMode::new` + the `Mode` trait
+// (the orchestrator only pattern-matches against them in PR-3).
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
