@@ -7,6 +7,7 @@
 use anyhow::bail;
 use async_trait::async_trait;
 use futures_util::future::try_join_all;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::llm::{ContentBlock, LlmClient, Message, Role, StopReason, TokenUsage, ToolSpec};
@@ -14,14 +15,15 @@ use crate::llm::{ContentBlock, LlmClient, Message, Role, StopReason, TokenUsage,
 /// Per-call trace built by `McpExecutor::call` impls. `ok=false` carries the
 /// error message; `args` is `None` unless the executor opts in to recording
 /// them (production gates this on `CHAT_TRACE_INCLUDE_ARGS=true`).
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // server/ms/args wired into HTTP response in v1.4 commit 3.
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolCallTrace {
     pub tool: String,
     pub server: String,
     pub ms: u64,
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
 }
 
@@ -33,7 +35,6 @@ pub struct ToolCallTrace {
 /// `is_error=true` to Anthropic). Fundamental errors (no-such-tool,
 /// schema-mismatch) still bail the whole run with `Err`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // tool_trace/tokens/iterations wired into HTTP response in v1.4 commit 3.
 pub struct RunOutcome {
     pub answer: String,
     pub tool_trace: Vec<ToolCallTrace>,
@@ -711,6 +712,25 @@ mod tests {
             ContentBlock::ToolResult { is_error, .. } => assert!(*is_error),
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_call_trace_skips_none_error_and_args_in_json() {
+        let trace = ToolCallTrace {
+            tool: "x".into(),
+            server: "y".into(),
+            ms: 42,
+            ok: true,
+            error: None,
+            args: None,
+        };
+        let v = serde_json::to_value(&trace).unwrap();
+        // skip_serializing_if keeps None fields out of the wire JSON so
+        // clients don't see noisy `error: null` / `args: null` keys.
+        assert!(v.get("error").is_none(), "error: null should be omitted");
+        assert!(v.get("args").is_none(), "args: null should be omitted");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["ms"], 42);
     }
 
     #[tokio::test]

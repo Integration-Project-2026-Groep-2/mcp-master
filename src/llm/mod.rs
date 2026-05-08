@@ -10,6 +10,7 @@
 
 pub mod anthropic;
 
+use serde::Serialize;
 use serde_json::Value;
 
 /// Conversation turn role. `system` is not modelled here because it is a
@@ -79,11 +80,13 @@ pub struct ChatResponse {
 /// Cache fields are `Option` so providers without prompt-caching (and clients
 /// who don't care) can ignore them without ABI churn. `add()` is used by the
 /// orchestrator to sum across tool-loop iterations.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct TokenUsage {
     pub input: u32,
     pub output: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input: Option<u32>,
 }
 

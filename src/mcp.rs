@@ -720,4 +720,43 @@ mod tests {
         let err = anyhow::anyhow!("CONNECTION RESET BY PEER");
         assert!(is_transport_error(&err));
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn trace_args_enabled_returns_false_when_unset() {
+        // SAFETY: env mutation is gated by #[serial_test::serial] across the
+        // crate; no other test runs concurrently in this thread group.
+        unsafe {
+            std::env::remove_var("CHAT_TRACE_INCLUDE_ARGS");
+        }
+        assert!(!trace_args_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trace_args_enabled_returns_true_when_set_to_true() {
+        unsafe {
+            std::env::set_var("CHAT_TRACE_INCLUDE_ARGS", "true");
+        }
+        assert!(trace_args_enabled());
+        unsafe {
+            std::env::remove_var("CHAT_TRACE_INCLUDE_ARGS");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trace_args_enabled_is_case_insensitive() {
+        unsafe {
+            std::env::set_var("CHAT_TRACE_INCLUDE_ARGS", "TRUE");
+        }
+        assert!(trace_args_enabled());
+        unsafe {
+            std::env::set_var("CHAT_TRACE_INCLUDE_ARGS", "False");
+        }
+        assert!(!trace_args_enabled());
+        unsafe {
+            std::env::remove_var("CHAT_TRACE_INCLUDE_ARGS");
+        }
+    }
 }
