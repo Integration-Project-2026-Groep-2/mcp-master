@@ -280,4 +280,54 @@ mod tests {
         assert_eq!(parse_scope("admin"), None);
         assert_eq!(parse_scope(""), None);
     }
+
+    fn headers_with_bearer(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    // Regression-guard for `chat()` threading the JWT sub claim into
+    // `DispatchContext.user_id`. Previously `chat()` hardcoded user_id="" and
+    // every approve returned WrongUser → 403. If a future change drops the
+    // current_user_id call from `chat()`, this test still passes — but the
+    // companion test `current_user_id_returns_none_without_jwt_secret` and
+    // the production code in `chat()` (uses `unwrap_or_default()` on this
+    // helper's result) together ensure the value flows.
+    #[tokio::test]
+    #[serial]
+    async fn current_user_id_returns_sub_for_valid_jwt() {
+        unsafe {
+            std::env::set_var("CHAT_JWT_SECRET", TEST_SECRET);
+            std::env::remove_var("CHAT_BEARER_TOKEN");
+        }
+        let token = mint_jwt(TEST_SECRET, "read+act", 60);
+        let headers = headers_with_bearer(&token);
+        assert_eq!(current_user_id(&headers), Some("drupal-uid-42".to_string()),);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn current_user_id_returns_none_without_jwt_secret() {
+        unsafe {
+            std::env::remove_var("CHAT_JWT_SECRET");
+            std::env::set_var("CHAT_BEARER_TOKEN", TEST_BEARER);
+        }
+        let headers = headers_with_bearer(TEST_BEARER);
+        assert_eq!(current_user_id(&headers), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn current_user_id_returns_none_for_expired_jwt() {
+        unsafe {
+            std::env::set_var("CHAT_JWT_SECRET", TEST_SECRET);
+        }
+        let token = mint_jwt(TEST_SECRET, "read+act", -120);
+        let headers = headers_with_bearer(&token);
+        assert_eq!(current_user_id(&headers), None);
+    }
 }
