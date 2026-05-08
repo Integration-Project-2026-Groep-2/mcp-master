@@ -67,6 +67,10 @@ jsonschema = { version = "0.30", default-features = false }
 # when multiple instances all hit a 429 at the same wallclock).
 rand = "0.8"
 
+# JWT decode for AuthScope extractor. HS256 only (default features); no
+# `ring`/`openssl` pulled in.
+jsonwebtoken = { version = "9", default-features = false }
+
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
 wiremock = "0.6"
