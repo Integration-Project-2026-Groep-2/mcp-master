@@ -24,7 +24,7 @@ async fn run_prompt(
     pool: &mcp::McpPool,
     tool_specs: &[ToolSpec],
 ) -> Result<String> {
-    orchestrator::run(
+    let outcome = orchestrator::run(
         prompt.to_string(),
         prompts::SETUP_PROMPT,
         llm,
@@ -33,7 +33,8 @@ async fn run_prompt(
         MAX_ITERATIONS,
         MAX_TOKENS,
     )
-    .await
+    .await?;
+    Ok(outcome.answer)
 }
 
 pub async fn handle_prompt(

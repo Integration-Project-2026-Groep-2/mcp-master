@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::llm::ToolSpec;
-use crate::orchestrator::McpExecutor;
+use crate::orchestrator::{McpExecutor, ToolCallTrace};
 use crate::rabbitmq::publisher::Publisher;
 
 /// Open a Streamable-HTTP MCP session against the given URL.
@@ -362,7 +362,7 @@ fn validate_args_against_schema(
 
 #[async_trait]
 impl McpExecutor for McpPool {
-    async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<String> {
+    async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<(String, ToolCallTrace)> {
         validate_args_against_schema(&self.tool_specs, name, &arguments)?;
         let map = arguments
             .as_object()
@@ -373,7 +373,8 @@ impl McpExecutor for McpPool {
             .get(name)
             .with_context(|| format!("no MCP server provides tool '{name}'"))?;
         let session = &self.sessions[idx];
-        tracing::debug!(tool = %name, server = %session.label, "dispatching MCP tool call");
+        let server_label = session.label.clone();
+        tracing::debug!(tool = %name, server = %server_label, "dispatching MCP tool call");
 
         let started = std::time::Instant::now();
         let outcome = call_with_reconnect(session, name, &map).await;
@@ -383,7 +384,7 @@ impl McpExecutor for McpPool {
         if let Some(publisher) = &self.publisher {
             let payload = serde_json::json!({
                 "tool": name,
-                "server": session.label,
+                "server": server_label,
                 "success": success,
                 "duration_ms": duration_ms,
             });
@@ -392,14 +393,53 @@ impl McpExecutor for McpPool {
             }
         }
 
-        let res = outcome.with_context(|| {
-            format!(
-                "MCP tools/call failed for '{name}' on server '{}'",
-                session.label
-            )
-        })?;
-        Ok(extract_tool_result_text(&res))
+        // Args in trace are gated by env-flag — default off so BTW/email-shaped
+        // values stay out of response bodies and AMQP audit events.
+        let args_for_trace = if trace_args_enabled() {
+            Some(arguments.clone())
+        } else {
+            None
+        };
+
+        match outcome {
+            Ok(res) => {
+                let text = extract_tool_result_text(&res);
+                let trace = ToolCallTrace {
+                    tool: name.to_string(),
+                    server: server_label,
+                    ms: duration_ms,
+                    ok: true,
+                    error: None,
+                    args: args_for_trace,
+                };
+                Ok((text, trace))
+            }
+            Err(e) => {
+                // First line only — no anyhow chain leak (would surface
+                // RABBITMQ_URL credentials, file paths, env-var names).
+                let short = format!("{e}").lines().next().unwrap_or("").to_string();
+                let trace = ToolCallTrace {
+                    tool: name.to_string(),
+                    server: server_label,
+                    ms: duration_ms,
+                    ok: false,
+                    error: Some(short.clone()),
+                    args: args_for_trace,
+                };
+                // Surface to LLM via is_error=true ToolResult (built by
+                // orchestrator from trace.ok). Conversation continues so
+                // Anthropic can plan recovery instead of bailing the run.
+                Ok((short, trace))
+            }
+        }
     }
+}
+
+fn trace_args_enabled() -> bool {
+    std::env::var("CHAT_TRACE_INCLUDE_ARGS")
+        .ok()
+        .map(|s| s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Try `tools/call`; on transport-shaped failure, reopen the session
@@ -679,5 +719,44 @@ mod tests {
     fn is_transport_error_is_case_insensitive() {
         let err = anyhow::anyhow!("CONNECTION RESET BY PEER");
         assert!(is_transport_error(&err));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trace_args_enabled_returns_false_when_unset() {
+        // SAFETY: env mutation is gated by #[serial_test::serial] across the
+        // crate; no other test runs concurrently in this thread group.
+        unsafe {
+            std::env::remove_var("CHAT_TRACE_INCLUDE_ARGS");
+        }
+        assert!(!trace_args_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trace_args_enabled_returns_true_when_set_to_true() {
+        unsafe {
+            std::env::set_var("CHAT_TRACE_INCLUDE_ARGS", "true");
+        }
+        assert!(trace_args_enabled());
+        unsafe {
+            std::env::remove_var("CHAT_TRACE_INCLUDE_ARGS");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trace_args_enabled_is_case_insensitive() {
+        unsafe {
+            std::env::set_var("CHAT_TRACE_INCLUDE_ARGS", "TRUE");
+        }
+        assert!(trace_args_enabled());
+        unsafe {
+            std::env::set_var("CHAT_TRACE_INCLUDE_ARGS", "False");
+        }
+        assert!(!trace_args_enabled());
+        unsafe {
+            std::env::remove_var("CHAT_TRACE_INCLUDE_ARGS");
+        }
     }
 }

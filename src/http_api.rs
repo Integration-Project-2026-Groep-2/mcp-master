@@ -17,9 +17,9 @@ use tower_http::{
 };
 
 use crate::{
-    llm::{ContentBlock, Message, Role, ToolSpec, anthropic::AnthropicClient},
+    llm::{ContentBlock, Message, Role, TokenUsage, ToolSpec, anthropic::AnthropicClient},
     mcp::McpPool,
-    orchestrator,
+    orchestrator::{self, ToolCallTrace},
     prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     tcom::{TeamsConfig, publish_to_teams},
@@ -145,9 +145,21 @@ impl ChatRequest {
     }
 }
 
+/// Wire shape for `POST /chat` 2xx responses. Extra fields beyond `answer`
+/// are additive — clients destructuring only `answer` continue working.
+///
+/// `tool_trace` carries one entry per MCP tool dispatched, in dispatch order.
+/// `tokens` aggregates Anthropic usage across the full tool-loop. The
+/// `correlation_id` ties this response to matching `tool_called` and
+/// `chat_completed` events on the AMQP audit feed. Errors stay opaque
+/// (see `AppError::into_response`) — no trace leaks via error responses.
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
     pub answer: String,
+    pub tool_trace: Vec<ToolCallTrace>,
+    pub tokens: TokenUsage,
+    pub iterations: u32,
+    pub correlation_id: String,
 }
 
 /// Substrings that suggest the client tried to forge a structured tool-use
@@ -204,12 +216,15 @@ async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, Response> {
+    // Generated at handler entry so success-path responses, AMQP audit
+    // events, and any tracing spans share the same id. Error-path uses its
+    // own UUID via AppError — consolidation is a v1.5 follow-up.
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+
     let messages = req.into_messages().map_err(|e| {
         let body = Json(serde_json::json!({ "error": e }));
         (StatusCode::BAD_REQUEST, body).into_response()
     })?;
-    // Extract the latest user prompt for tracing + the chat_completed event
-    // payload before `messages` is moved into the orchestrator.
     let prompt = match messages.last().map(|m| &m.content[..]) {
         Some([ContentBlock::Text { text }]) => text.clone(),
         _ => String::new(),
@@ -217,17 +232,17 @@ async fn chat(
     let conversation_length = messages.len();
     // Don't log the prompt body — it routinely contains GDPR-flagged CRM data
     // (names, emails, BTW numbers) and occasional accidental secrets pasted by
-    // users. The correlation_id on AppError is the debug breadcrumb when
-    // something goes wrong; the full prompt+answer still rides on the
-    // RabbitMQ `chat_completed` audit-event for downstream analytics.
+    // users. The full prompt+answer still rides on the RabbitMQ
+    // `chat_completed` audit-event for downstream analytics.
     tracing::info!(
+        correlation_id = %correlation_id,
         prompt_length = prompt.len(),
         conversation_length,
         "/chat received"
     );
 
     let started = std::time::Instant::now();
-    let answer = orchestrator::run_with_messages(
+    let outcome = orchestrator::run_with_messages(
         messages,
         SETUP_PROMPT,
         &state.llm,
@@ -242,18 +257,28 @@ async fn chat(
 
     if let Some(publisher) = &state.publisher {
         let payload = serde_json::json!({
+            "correlation_id": correlation_id,
             "prompt": prompt,
-            "answer": answer,
-            "answer_length": answer.len(),
+            "answer": outcome.answer,
+            "answer_length": outcome.answer.len(),
             "duration_ms": duration_ms,
             "conversation_length": conversation_length,
+            "tool_trace": outcome.tool_trace,
+            "tokens": outcome.tokens,
+            "iterations": outcome.iterations,
         });
         if let Err(e) = publisher.publish_event("chat_completed", payload).await {
             tracing::warn!("failed to publish chat_completed event: {e:#}");
         }
     }
 
-    Ok(Json(ChatResponse { answer }))
+    Ok(Json(ChatResponse {
+        answer: outcome.answer,
+        tool_trace: outcome.tool_trace,
+        tokens: outcome.tokens,
+        iterations: outcome.iterations,
+        correlation_id,
+    }))
 }
 
 /// Read `CHAT_BEARER_TOKEN` from env. Whitespace-only or unset → `None`,
@@ -424,7 +449,7 @@ async fn handle_scheduled(
     teams: Option<&TeamsConfig>,
     key: (u32, u32),
 ) -> anyhow::Result<()> {
-    let answer = orchestrator::run(
+    let outcome = orchestrator::run(
         ANALYZE_CONTROLROOM_PROMPT.to_string(),
         SETUP_PROMPT,
         &state.llm,
@@ -435,6 +460,7 @@ async fn handle_scheduled(
     )
     .await
     .context("scheduled analyze prompt")?;
+    let answer = outcome.answer;
 
     if let Some(teams) = teams {
         publish_to_teams(teams, &answer).await?;
@@ -959,5 +985,45 @@ mod tests {
             observed >= 2,
             "peak should exercise parallelism (>=2), got {observed}"
         );
+    }
+
+    #[test]
+    fn chat_response_serializes_with_v1_4_fields() {
+        // Pin the wire shape Drupal/jarvis_chat sees on success: answer +
+        // additive tool_trace/tokens/iterations/correlation_id. Drupal's
+        // `const { answer } = res.json()` destructure must keep working.
+        let resp = ChatResponse {
+            answer: "ok".into(),
+            tool_trace: vec![ToolCallTrace {
+                tool: "count_contacts".into(),
+                server: "crm".into(),
+                ms: 412,
+                ok: true,
+                error: None,
+                args: None,
+            }],
+            tokens: TokenUsage {
+                input: 100,
+                output: 50,
+                cache_creation_input: None,
+                cache_read_input: None,
+            },
+            iterations: 2,
+            correlation_id: "abc-123".into(),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["answer"], "ok");
+        assert_eq!(v["tool_trace"][0]["tool"], "count_contacts");
+        assert_eq!(v["tool_trace"][0]["server"], "crm");
+        assert_eq!(v["tool_trace"][0]["ms"], 412);
+        assert_eq!(v["tool_trace"][0]["ok"], true);
+        // skip_serializing_if keeps args/error out when None.
+        assert!(v["tool_trace"][0].get("args").is_none());
+        assert!(v["tool_trace"][0].get("error").is_none());
+        assert_eq!(v["tokens"]["input"], 100);
+        assert_eq!(v["tokens"]["output"], 50);
+        assert!(v["tokens"].get("cache_creation_input").is_none());
+        assert_eq!(v["iterations"], 2);
+        assert_eq!(v["correlation_id"], "abc-123");
     }
 }

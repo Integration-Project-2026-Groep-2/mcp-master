@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{ChatResponse, ContentBlock, LlmClient, Message, Role, StopReason, ToolSpec};
+use super::{
+    ChatResponse, ContentBlock, LlmClient, Message, Role, StopReason, TokenUsage, ToolSpec,
+};
 use crate::retry::backoff_with_jitter;
 
 /// Default Anthropic API host. Tests override via `with_base_url`.
@@ -219,6 +221,18 @@ enum AnthropicContent {
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
     stop_reason: String,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 // ---------- Translation helpers ------------------------------------------
@@ -286,6 +300,12 @@ fn from_wire_response(resp: AnthropicResponse) -> ChatResponse {
             "max_tokens" => StopReason::MaxTokens,
             other => StopReason::Other(other.to_string()),
         },
+        usage: resp.usage.map(|u| TokenUsage {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_creation_input: u.cache_creation_input_tokens,
+            cache_read_input: u.cache_read_input_tokens,
+        }),
     }
 }
 
@@ -364,6 +384,7 @@ mod tests {
         let happy = AnthropicResponse {
             content: vec![AnthropicContent::Text { text: "ok".into() }],
             stop_reason: "end_turn".into(),
+            usage: None,
         };
         let mapped = from_wire_response(happy);
         assert_eq!(mapped.stop_reason, StopReason::EndTurn);
@@ -371,18 +392,21 @@ mod tests {
         let tu = AnthropicResponse {
             content: vec![],
             stop_reason: "tool_use".into(),
+            usage: None,
         };
         assert_eq!(from_wire_response(tu).stop_reason, StopReason::ToolUse);
 
         let mt = AnthropicResponse {
             content: vec![],
             stop_reason: "max_tokens".into(),
+            usage: None,
         };
         assert_eq!(from_wire_response(mt).stop_reason, StopReason::MaxTokens);
 
         let unknown = AnthropicResponse {
             content: vec![],
             stop_reason: "pause_turn".into(),
+            usage: None,
         };
         assert_eq!(
             from_wire_response(unknown).stop_reason,
@@ -490,6 +514,52 @@ mod tests {
         let err = client.chat("sys", &[], &[], 4096).await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("401"), "error should mention status: {msg}");
+    }
+
+    #[tokio::test]
+    async fn chat_decodes_usage_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 12,
+                    "cache_read_input_tokens": 8
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = AnthropicClient::new("k".into()).with_base_url(server.uri());
+        let resp = client.chat("sys", &[], &[], 4096).await.unwrap();
+
+        let usage = resp.usage.expect("usage should be Some");
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.output, 50);
+        assert_eq!(usage.cache_creation_input, Some(12));
+        assert_eq!(usage.cache_read_input, Some(8));
+    }
+
+    #[tokio::test]
+    async fn chat_handles_missing_usage_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "stop_reason": "end_turn"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = AnthropicClient::new("k".into()).with_base_url(server.uri());
+        let resp = client.chat("sys", &[], &[], 4096).await.unwrap();
+
+        assert_eq!(resp.usage, None);
     }
 
     #[tokio::test]
