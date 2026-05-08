@@ -154,6 +154,7 @@ impl ActionableMode {
             error: None,
             args: None,
             status: Some("pending".into()),
+            action_id: Some(action_id.to_string()),
         };
         Ok((result, trace))
     }
@@ -190,6 +191,7 @@ pub fn build_blocked_read_only_result(
         error: Some("blocked_read_only".into()),
         args: None,
         status: Some("blocked_read_only".into()),
+        action_id: None,
     };
     (result, trace)
 }
@@ -248,6 +250,7 @@ mod tests {
             error: None,
             args: None,
             status: None,
+            action_id: None,
         };
         StubExecutor {
             canned_response: Mutex::new(Some((text.into(), trace))),

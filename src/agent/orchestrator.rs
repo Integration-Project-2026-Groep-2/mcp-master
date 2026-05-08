@@ -34,6 +34,11 @@ pub struct ToolCallTrace {
     /// `None` for normal dispatched calls (skip-if-none keeps the wire shape).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// PendingAction id for write-tools intercepted by ActionableMode.
+    /// Drupal `jarvis_chat` reads this to render the approval-card without
+    /// parsing it from the marker text. `None` for everything else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
 }
 
 /// Outcome of one full tool-loop run.
@@ -355,6 +360,7 @@ mod tests {
                     error: Some(err.clone()),
                     args: None,
                     status: None,
+                    action_id: None,
                 };
                 return Ok((err, trace));
             }
@@ -370,6 +376,7 @@ mod tests {
                 error: None,
                 args: None,
                 status: None,
+                action_id: None,
             };
             Ok((result, trace))
         }
@@ -810,12 +817,18 @@ mod tests {
             error: None,
             args: None,
             status: None,
+            action_id: None,
         };
         let v = serde_json::to_value(&trace).unwrap();
         // skip_serializing_if keeps None fields out of the wire JSON so
         // clients don't see noisy `error: null` / `args: null` keys.
         assert!(v.get("error").is_none(), "error: null should be omitted");
         assert!(v.get("args").is_none(), "args: null should be omitted");
+        assert!(v.get("status").is_none(), "status: null should be omitted");
+        assert!(
+            v.get("action_id").is_none(),
+            "action_id: null should be omitted",
+        );
         assert_eq!(v["ok"], true);
         assert_eq!(v["ms"], 42);
     }

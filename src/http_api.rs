@@ -237,6 +237,7 @@ async fn metrics() -> (StatusCode, &'static str) {
 }
 
 async fn chat(
+    scope: crate::gateway::auth::AuthScope,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, Response> {
@@ -262,11 +263,31 @@ async fn chat(
         correlation_id = %correlation_id,
         prompt_length = prompt.len(),
         conversation_length,
+        scope = ?scope,
         "/chat received"
     );
 
+    let mode = match scope {
+        crate::gateway::auth::AuthScope::Read => {
+            crate::agent::modes::AgentMode::ReadOnly(crate::agent::modes::ReadOnlyMode)
+        }
+        crate::gateway::auth::AuthScope::ReadAndAct => crate::agent::modes::AgentMode::Actionable(
+            crate::agent::modes::ActionableMode::new(state.approval_flow.clone()),
+        ),
+    };
+    let ctx = crate::agent::modes::DispatchContext {
+        correlation_id: correlation_id.clone(),
+        // user_id propagation lands in R2.5 — it requires threading the JWT
+        // sub claim through the AuthScope extractor (currently the extractor
+        // returns the scope only). For PR-4 the audit envelope shows an
+        // empty user_id when scope=read+act; downstream consumers can still
+        // correlate via correlation_id + action_id.
+        user_id: String::new(),
+        scope,
+    };
+
     let started = std::time::Instant::now();
-    let outcome = orchestrator::run_with_messages(
+    let outcome = orchestrator::run_with_messages_in_mode(
         messages,
         SETUP_PROMPT,
         &state.llm,
@@ -274,6 +295,8 @@ async fn chat(
         &state.tool_specs,
         MAX_ITERATIONS,
         MAX_TOKENS,
+        &mode,
+        &ctx,
     )
     .await
     .map_err(|e| AppError(e).into_response())?;
@@ -1104,6 +1127,7 @@ mod tests {
                 error: None,
                 args: None,
                 status: None,
+                action_id: None,
             }],
             tokens: TokenUsage {
                 input: 100,

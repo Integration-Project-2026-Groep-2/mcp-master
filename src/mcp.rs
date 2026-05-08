@@ -436,6 +436,7 @@ impl McpExecutor for McpPool {
                     error: None,
                     args: args_for_trace,
                     status: None,
+                    action_id: None,
                 };
                 Ok((text, trace))
             }
@@ -451,6 +452,7 @@ impl McpExecutor for McpPool {
                     error: Some(short.clone()),
                     args: args_for_trace,
                     status: None,
+                    action_id: None,
                 };
                 // Surface to LLM via is_error=true ToolResult (built by
                 // orchestrator from trace.ok). Conversation continues so
