@@ -22,8 +22,8 @@ use rmcp::{
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::llm::ToolSpec;
-use crate::orchestrator::{McpExecutor, ToolCallTrace};
+use crate::agent::llm::ToolSpec;
+use crate::agent::orchestrator::{McpExecutor, ToolCallTrace};
 use crate::rabbitmq::publisher::Publisher;
 
 /// Open a Streamable-HTTP MCP session against the given URL.
@@ -50,11 +50,29 @@ pub async fn open_session(url: &str) -> anyhow::Result<RunningService<RoleClient
 ///
 /// `description` is mandatory in our model — empty string if rmcp gave
 /// `None`, because Claude's tool selection accuracy depends on prose.
+///
+/// `requires_approval` is derived from `!annotations.read_only_hint`. rmcp 1.6's
+/// `ToolAnnotations` is closed (no `#[serde(flatten)]` / catch-all), so a
+/// FastMCP-side `annotations.requires_approval=true` field is silently dropped
+/// during deserialization. Inverting `read_only_hint` is reliable because all
+/// 6 CRM-MCP write-tools publish `readOnlyHint=false` and all 7 read-tools
+/// publish `readOnlyHint=true`. Tools without annotations default to read-only
+/// (safer).
+//
+// TODO(R3): switch to `tool.meta.get("requires_approval")` once CRM-MCP
+// publishes via the spec-aligned `_meta` channel (rmcp preserves `Tool.meta`).
 pub fn tool_to_spec(tool: &Tool) -> ToolSpec {
+    let requires_approval = tool
+        .annotations
+        .as_ref()
+        .and_then(|a| a.read_only_hint)
+        .map(|read_only| !read_only)
+        .unwrap_or(false);
     ToolSpec {
         name: tool.name.to_string(),
         description: tool.description.as_deref().unwrap_or("").to_string(),
         input_schema: Value::Object((*tool.input_schema).clone()),
+        requires_approval,
     }
 }
 
@@ -534,6 +552,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_to_spec_extracts_requires_approval_from_read_only_hint_false() {
+        // Write-tool: readOnlyHint=false → requires_approval=true.
+        let mut t = Tool::default();
+        t.name = "create_company".into();
+        t.input_schema = Arc::new(serde_json::Map::new());
+        let mut ann = rmcp::model::ToolAnnotations::default();
+        ann.read_only_hint = Some(false);
+        t.annotations = Some(ann);
+        let spec = tool_to_spec(&t);
+        assert!(spec.requires_approval);
+    }
+
+    #[test]
+    fn tool_to_spec_extracts_requires_approval_from_read_only_hint_true() {
+        // Read-tool: readOnlyHint=true → requires_approval=false.
+        let mut t = Tool::default();
+        t.name = "search_contact".into();
+        t.input_schema = Arc::new(serde_json::Map::new());
+        let mut ann = rmcp::model::ToolAnnotations::default();
+        ann.read_only_hint = Some(true);
+        t.annotations = Some(ann);
+        let spec = tool_to_spec(&t);
+        assert!(!spec.requires_approval);
+    }
+
+    #[test]
+    fn tool_to_spec_defaults_requires_approval_false_when_no_annotations() {
+        // Tools without annotations (legacy MCP servers) treated as read-only:
+        // safer default that won't accidentally require approval for read-tools.
+        let mut t = Tool::default();
+        t.name = "legacy_tool".into();
+        t.input_schema = Arc::new(serde_json::Map::new());
+        t.annotations = None;
+        let spec = tool_to_spec(&t);
+        assert!(!spec.requires_approval);
+    }
+
+    #[test]
     fn parse_endpoints_handles_comma_separated_pairs() {
         let v =
             parse_endpoints("crm@http://localhost:7001/mcp,controlroom@http://localhost:7002/mcp");
@@ -602,6 +658,7 @@ mod tests {
                 },
                 "required": ["query"]
             }),
+            requires_approval: false,
         }];
         let bad = json!({"query": "x", "limit": 999_999});
         let err = validate_args_against_schema(&specs, "search_contact", &bad)
@@ -620,6 +677,7 @@ mod tests {
                 "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
                 "required": ["query"]
             }),
+            requires_approval: false,
         }];
         validate_args_against_schema(
             &specs,
@@ -646,6 +704,7 @@ mod tests {
                 "properties": {"contact_id": {"type": "string"}},
                 "required": ["contact_id"]
             }),
+            requires_approval: false,
         }];
         let err = validate_args_against_schema(&specs, "get_contact", &json!({}))
             .expect_err("missing required field must fail");

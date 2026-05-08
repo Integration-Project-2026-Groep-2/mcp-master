@@ -17,10 +17,10 @@ use tower_http::{
 };
 
 use crate::{
-    llm::{ContentBlock, Message, Role, TokenUsage, ToolSpec, anthropic::AnthropicClient},
+    agent::llm::{ContentBlock, Message, Role, TokenUsage, ToolSpec, anthropic::AnthropicClient},
+    agent::orchestrator::{self, ToolCallTrace},
+    agent::prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     mcp::McpPool,
-    orchestrator::{self, ToolCallTrace},
-    prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     teams::{TeamsConfig, publish_to_teams},
 };

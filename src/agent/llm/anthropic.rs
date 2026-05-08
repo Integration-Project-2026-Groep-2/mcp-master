@@ -341,6 +341,28 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
+    fn to_wire_tools_drops_requires_approval() {
+        // requires_approval is mcp-master-internal metadata; the wire-payload
+        // sent to Anthropic must contain only name/description/input_schema.
+        let specs = vec![ToolSpec {
+            name: "delete_company".into(),
+            description: "Soft-delete an Account.".into(),
+            input_schema: json!({"type": "object"}),
+            requires_approval: true,
+        }];
+        let wire = to_wire_tools(&specs);
+        let value = serde_json::to_value(&wire).unwrap();
+        let obj = value.as_array().unwrap()[0].as_object().unwrap();
+        assert!(obj.contains_key("name"));
+        assert!(obj.contains_key("description"));
+        assert!(obj.contains_key("input_schema"));
+        assert!(
+            !obj.contains_key("requires_approval"),
+            "requires_approval must NOT leak to Anthropic wire-payload",
+        );
+    }
+
+    #[test]
     fn translation_preserves_text_and_tool_use_shapes() {
         let messages = vec![
             Message {
