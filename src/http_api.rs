@@ -38,6 +38,12 @@ const MAX_TURNS: usize = 40;
 const MAX_CONTENT_BYTES_PER_TURN: usize = 8192;
 const REQUEST_TIMEOUT_SECONDS: u64 = 240;
 
+// Anthropic Tier 2 standaard is 50 req/min op /v1/messages. Onze gemiddelde
+// /chat is ~10s end-to-end → 8 parallel × 10s = 48 req/min — net binnen budget.
+// Burst boven 8 → tower's interne queue buffert; TimeoutLayer firet als de
+// queue te lang blijft staan.
+const MAX_CONCURRENT_CHAT: usize = 8;
+
 pub struct AppState {
     pub llm: AnthropicClient,
     pub pool: McpPool,
@@ -502,6 +508,14 @@ pub async fn serve(
              (dev-only, NOT for production)"
         );
     }
+    // Bearer is outer (added first); ConcurrencyLimit is inner (added later).
+    // Unauthenticated requests are rejected before consuming a slot.
+    // GlobalConcurrencyLimit shares one Arc<Semaphore> across all per-request
+    // service clones; the non-global variant builds a fresh semaphore per
+    // Layer::layer() call → no actual capping.
+    chat_route = chat_route.route_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+        MAX_CONCURRENT_CHAT,
+    ));
 
     let app = Router::new()
         .route("/chat", chat_route)
@@ -889,5 +903,61 @@ mod tests {
         let err = parse_cors_allow_list(true, Some(", , ,  ")).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("no usable origins"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn concurrency_layer_caps_in_flight_at_max() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        PEAK.store(0, Ordering::SeqCst);
+
+        async fn slow_handler() -> &'static str {
+            let cur = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(cur, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            "ok"
+        }
+
+        let app: Router = Router::new()
+            .route("/test", post(slow_handler))
+            .route_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+                MAX_CONCURRENT_CHAT,
+            ));
+
+        let mut joinset = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let app_clone = app.clone();
+            joinset.spawn(async move {
+                use axum::body::Body;
+                use axum::http::Request;
+                use tower::ServiceExt;
+
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/test")
+                    .body(Body::empty())
+                    .unwrap();
+                app_clone.oneshot(req).await.unwrap()
+            });
+        }
+
+        while let Some(res) = joinset.join_next().await {
+            assert_eq!(res.unwrap().status(), StatusCode::OK);
+        }
+
+        let observed = PEAK.load(Ordering::SeqCst);
+        assert!(
+            observed <= MAX_CONCURRENT_CHAT,
+            "peak in-flight={observed} exceeded MAX_CONCURRENT_CHAT={MAX_CONCURRENT_CHAT}"
+        );
+        assert!(
+            observed >= 2,
+            "peak should exercise parallelism (>=2), got {observed}"
+        );
     }
 }
