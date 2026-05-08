@@ -74,6 +74,11 @@ jsonwebtoken = { version = "9", default-features = false }
 # Typed errors with `#[derive(Error)]` for the approval state-machine.
 thiserror = "1"
 
+# Lock-free concurrent map for the approval store. Entry-API gives us
+# atomic compare-and-swap via `entry().and_modify()` — needed for the
+# double-confirm race-guard.
+dashmap = "6"
+
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
 wiremock = "0.6"
