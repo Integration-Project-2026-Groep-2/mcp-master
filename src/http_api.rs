@@ -22,7 +22,7 @@ use crate::{
     orchestrator::{self, ToolCallTrace},
     prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
-    tcom::{TeamsConfig, publish_to_teams},
+    teams::{TeamsConfig, publish_to_teams},
 };
 
 const MAX_ITERATIONS: usize = 10;

@@ -5,7 +5,7 @@ mod orchestrator;
 mod prompts;
 mod rabbitmq;
 mod retry;
-mod tcom;
+mod teams;
 
 use anyhow::{Context, Result};
 use std::io::Read;
@@ -13,7 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::llm::ToolSpec;
 use crate::llm::anthropic::AnthropicClient;
-use crate::tcom::TeamsConfig;
+use crate::teams::TeamsConfig;
 
 const MAX_ITERATIONS: usize = 10;
 const MAX_TOKENS: u32 = 8192;
@@ -45,7 +45,7 @@ pub async fn handle_prompt(
     tool_specs: &[ToolSpec],
 ) -> Result<()> {
     let answer = run_prompt(prompt, llm, pool, tool_specs).await?;
-    tcom::publish_to_teams(teams_config, &answer).await?;
+    teams::publish_to_teams(teams_config, &answer).await?;
     Ok(())
 }
 
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     }
 
     let llm = AnthropicClient::from_env()?;
-    let teams_config = match tcom::TeamsConfig::from_env() {
+    let teams_config = match teams::TeamsConfig::from_env() {
         Ok(c) => Some(c),
         Err(e) => {
             tracing::info!("Teams config absent: {e:#} — Teams-publish disabled");
