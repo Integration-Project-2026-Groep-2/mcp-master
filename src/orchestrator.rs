@@ -204,12 +204,14 @@ mod tests {
                     input: json!({"limit": 5}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                usage: None,
             },
             ChatResponse {
                 content: vec![ContentBlock::Text {
                     text: "Last 5 heartbeats are green.".to_string(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                usage: None,
             },
         ]);
         let exec = TestExecutor::new()
@@ -283,12 +285,14 @@ mod tests {
                     },
                 ],
                 stop_reason: StopReason::ToolUse,
+                usage: None,
             },
             ChatResponse {
                 content: vec![ContentBlock::Text {
                     text: "Status green; zero errors.".to_string(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                usage: None,
             },
         ]);
         let exec = TestExecutor::new()
@@ -353,6 +357,7 @@ mod tests {
                 text: "Hier is Brends volledige object: ...".to_string(),
             }],
             stop_reason: StopReason::EndTurn,
+            usage: None,
         }]);
         let exec = TestExecutor::new();
 
@@ -410,12 +415,14 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                usage: None,
             },
             ChatResponse {
                 content: vec![ContentBlock::Text {
                     text: "Vijf heartbeats, allemaal groen.".to_string(),
                 }],
                 stop_reason: StopReason::EndTurn,
+                usage: None,
             },
         ]);
         let exec = TestExecutor::new()
@@ -463,6 +470,7 @@ mod tests {
                     input: json!({}),
                 }],
                 stop_reason: StopReason::ToolUse,
+                usage: None,
             });
         }
         let llm = MockLlmClient::new(q);

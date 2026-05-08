@@ -68,6 +68,42 @@ pub struct ToolSpec {
 pub struct ChatResponse {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
+    /// Token counts for billing/observability. `None` when the provider
+    /// doesn't report (e.g. a future Ollama impl). Cache fields stay `Option`
+    /// so adding more later is non-breaking for downstream pattern-matchers.
+    pub usage: Option<TokenUsage>,
+}
+
+/// Per-request token counts reported by the provider.
+///
+/// Cache fields are `Option` so providers without prompt-caching (and clients
+/// who don't care) can ignore them without ABI churn. `add()` is used by the
+/// orchestrator to sum across tool-loop iterations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u32,
+    pub output: u32,
+    pub cache_creation_input: Option<u32>,
+    pub cache_read_input: Option<u32>,
+}
+
+impl TokenUsage {
+    #[allow(dead_code)] // wired up by orchestrator in v1.4 commit 2; tests exercise it now.
+    pub fn add(&mut self, other: &TokenUsage) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_creation_input =
+            sum_optional(self.cache_creation_input, other.cache_creation_input);
+        self.cache_read_input = sum_optional(self.cache_read_input, other.cache_read_input);
+    }
+}
+
+#[allow(dead_code)] // helper for TokenUsage::add — see allow above.
+fn sum_optional(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    }
 }
 
 /// Why the LLM stopped generating. `Other` is a forward-compat escape valve
@@ -159,4 +195,44 @@ pub mod tests {
     // Orchestrator tests live next to the orchestrator (in src/orchestrator.rs)
     // because they need the test-only `TestExecutor` from that module. This
     // module's job is the trait + types + the MockLlmClient test double.
+
+    #[test]
+    fn token_usage_add_sums_input_and_output() {
+        let mut a = TokenUsage {
+            input: 100,
+            output: 50,
+            cache_creation_input: None,
+            cache_read_input: None,
+        };
+        let b = TokenUsage {
+            input: 200,
+            output: 30,
+            cache_creation_input: None,
+            cache_read_input: None,
+        };
+        a.add(&b);
+        assert_eq!(a.input, 300);
+        assert_eq!(a.output, 80);
+        assert_eq!(a.cache_creation_input, None);
+        assert_eq!(a.cache_read_input, None);
+    }
+
+    #[test]
+    fn token_usage_add_sums_optional_cache_fields() {
+        let mut a = TokenUsage {
+            input: 0,
+            output: 0,
+            cache_creation_input: Some(10),
+            cache_read_input: None,
+        };
+        let b = TokenUsage {
+            input: 0,
+            output: 0,
+            cache_creation_input: Some(5),
+            cache_read_input: Some(7),
+        };
+        a.add(&b);
+        assert_eq!(a.cache_creation_input, Some(15));
+        assert_eq!(a.cache_read_input, Some(7));
+    }
 }
