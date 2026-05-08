@@ -227,7 +227,7 @@ async fn chat(
     );
 
     let started = std::time::Instant::now();
-    let answer = orchestrator::run_with_messages(
+    let outcome = orchestrator::run_with_messages(
         messages,
         SETUP_PROMPT,
         &state.llm,
@@ -238,6 +238,7 @@ async fn chat(
     )
     .await
     .map_err(|e| AppError(e).into_response())?;
+    let answer = outcome.answer;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     if let Some(publisher) = &state.publisher {
@@ -424,7 +425,7 @@ async fn handle_scheduled(
     teams: Option<&TeamsConfig>,
     key: (u32, u32),
 ) -> anyhow::Result<()> {
-    let answer = orchestrator::run(
+    let outcome = orchestrator::run(
         ANALYZE_CONTROLROOM_PROMPT.to_string(),
         SETUP_PROMPT,
         &state.llm,
@@ -435,6 +436,7 @@ async fn handle_scheduled(
     )
     .await
     .context("scheduled analyze prompt")?;
+    let answer = outcome.answer;
 
     if let Some(teams) = teams {
         publish_to_teams(teams, &answer).await?;

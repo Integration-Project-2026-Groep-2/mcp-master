@@ -9,15 +9,49 @@ use async_trait::async_trait;
 use futures_util::future::try_join_all;
 use serde_json::Value;
 
-use crate::llm::{ContentBlock, LlmClient, Message, Role, StopReason, ToolSpec};
+use crate::llm::{ContentBlock, LlmClient, Message, Role, StopReason, TokenUsage, ToolSpec};
+
+/// Per-call trace built by `McpExecutor::call` impls. `ok=false` carries the
+/// error message; `args` is `None` unless the executor opts in to recording
+/// them (production gates this on `CHAT_TRACE_INCLUDE_ARGS=true`).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // server/ms/args wired into HTTP response in v1.4 commit 3.
+pub struct ToolCallTrace {
+    pub tool: String,
+    pub server: String,
+    pub ms: u64,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub args: Option<Value>,
+}
+
+/// Outcome of one full tool-loop run.
+///
+/// `tool_trace` is in dispatch order across all iterations. A failed tool
+/// call surfaces as `ok=false` in its entry — execution continues so the
+/// LLM can plan recovery (the matching `ContentBlock::ToolResult` carries
+/// `is_error=true` to Anthropic). Fundamental errors (no-such-tool,
+/// schema-mismatch) still bail the whole run with `Err`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // tool_trace/tokens/iterations wired into HTTP response in v1.4 commit 3.
+pub struct RunOutcome {
+    pub answer: String,
+    pub tool_trace: Vec<ToolCallTrace>,
+    pub tokens: TokenUsage,
+    pub iterations: u32,
+}
 
 /// MCP tool dispatcher. Trait so the orchestrator is testable without
 /// spinning up an rmcp session; the production impl in `crate::mcp` wraps
 /// `RunningService`. `Send + Sync` so a `&dyn McpExecutor` can cross
 /// `.await` points and be shared across tasks.
+///
+/// Returns `(result_text, trace)` on success **or** on tool-call failure —
+/// the trace's `ok` flag distinguishes the two. Only fundamental errors
+/// (validation, routing) propagate as `Err`.
 #[async_trait]
 pub trait McpExecutor: Send + Sync {
-    async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<String>;
+    async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<(String, ToolCallTrace)>;
 }
 
 /// Run one conversation turn against the LLM, dispatching tools via `mcp`.
@@ -35,7 +69,7 @@ pub async fn run(
     tool_specs: &[ToolSpec],
     max_iterations: usize,
     max_tokens: u32,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RunOutcome> {
     let messages = vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text { text: question }],
@@ -61,7 +95,9 @@ pub async fn run(
 /// Loop semantics:
 /// - `EndTurn` — fold response Text blocks into a single string, return.
 /// - `ToolUse` — record the assistant turn, dispatch every tool-use,
-///   append all tool-results into one user turn, iterate.
+///   append all tool-results into one user turn, iterate. Tool-call
+///   failures surface as `is_error=true` ToolResult so Anthropic can plan
+///   recovery; only fundamental MCP errors `bail!` the run.
 /// - `MaxTokens` — log warn, return whatever text we have. Partial answer
 ///   beats `bail!` from a UX perspective.
 /// - `Other(s)` — bail with context — unknown stop_reason for this rev.
@@ -75,7 +111,10 @@ pub async fn run_with_messages(
     tool_specs: &[ToolSpec],
     max_iterations: usize,
     max_tokens: u32,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RunOutcome> {
+    let mut tool_trace: Vec<ToolCallTrace> = Vec::new();
+    let mut tokens = TokenUsage::default();
+
     for iteration in 0..max_iterations {
         // Every `.await` here must be `Send` for the future to live behind
         // `&dyn LlmClient` + `&dyn McpExecutor`. The `Send + Sync` supertraits
@@ -85,14 +124,30 @@ pub async fn run_with_messages(
             .chat(system_prompt, &messages, tool_specs, max_tokens)
             .await?;
 
+        if let Some(u) = &response.usage {
+            tokens.add(u);
+        }
+
         match response.stop_reason {
-            StopReason::EndTurn => return Ok(collect_text(&response.content)),
+            StopReason::EndTurn => {
+                return Ok(RunOutcome {
+                    answer: collect_text(&response.content),
+                    tool_trace,
+                    tokens,
+                    iterations: iteration as u32 + 1,
+                });
+            }
             StopReason::MaxTokens => {
                 tracing::warn!(
                     iteration,
                     "anthropic max_tokens hit; returning partial response"
                 );
-                return Ok(collect_text(&response.content));
+                return Ok(RunOutcome {
+                    answer: collect_text(&response.content),
+                    tool_trace,
+                    tokens,
+                    iterations: iteration as u32 + 1,
+                });
             }
             StopReason::ToolUse => {
                 // Record the assistant's turn (full content, including text +
@@ -121,14 +176,18 @@ pub async fn run_with_messages(
                 }
 
                 let tool_futs = tool_calls.into_iter().map(|(id, name, input)| async move {
-                    let result = mcp.call(&name, input).await?;
-                    Ok::<ContentBlock, anyhow::Error>(ContentBlock::ToolResult {
+                    let (result, trace) = mcp.call(&name, input).await?;
+                    let block = ContentBlock::ToolResult {
                         tool_use_id: id,
                         content: result,
-                        is_error: false,
-                    })
+                        is_error: !trace.ok,
+                    };
+                    Ok::<(ContentBlock, ToolCallTrace), anyhow::Error>((block, trace))
                 });
-                let results: Vec<ContentBlock> = try_join_all(tool_futs).await?;
+                let outputs: Vec<(ContentBlock, ToolCallTrace)> = try_join_all(tool_futs).await?;
+                let (results, traces): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
+                tool_trace.extend(traces);
+
                 messages.push(Message {
                     role: Role::User,
                     content: results,
@@ -162,16 +221,19 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
-    /// Test double for `McpExecutor`: returns canned strings keyed by tool
-    /// name. `bail!`s on unknown tool names.
+    /// Test double for `McpExecutor`. `with_response` registers a happy-path
+    /// canned string; `with_error` registers a tool-call failure that
+    /// surfaces in the trace as `ok=false` (mirrors McpPool's behaviour).
     pub struct TestExecutor {
         responses: Mutex<HashMap<String, String>>,
+        errors: Mutex<HashMap<String, String>>,
     }
 
     impl TestExecutor {
         pub fn new() -> Self {
             Self {
                 responses: Mutex::new(HashMap::new()),
+                errors: Mutex::new(HashMap::new()),
             }
         }
 
@@ -182,15 +244,47 @@ mod tests {
                 .insert(name.to_string(), result.to_string());
             self
         }
+
+        pub async fn with_error(self, name: &str, error: &str) -> Self {
+            self.errors
+                .lock()
+                .await
+                .insert(name.to_string(), error.to_string());
+            self
+        }
     }
 
     #[async_trait]
     impl McpExecutor for TestExecutor {
-        async fn call(&self, name: &str, _arguments: Value) -> anyhow::Result<String> {
+        async fn call(
+            &self,
+            name: &str,
+            _arguments: Value,
+        ) -> anyhow::Result<(String, ToolCallTrace)> {
+            if let Some(err) = self.errors.lock().await.get(name).cloned() {
+                let trace = ToolCallTrace {
+                    tool: name.to_string(),
+                    server: "test".to_string(),
+                    ms: 0,
+                    ok: false,
+                    error: Some(err.clone()),
+                    args: None,
+                };
+                return Ok((err, trace));
+            }
             let r = self.responses.lock().await;
-            r.get(name)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("TestExecutor: no canned response for tool {name}"))
+            let result = r.get(name).cloned().ok_or_else(|| {
+                anyhow::anyhow!("TestExecutor: no canned response for tool {name}")
+            })?;
+            let trace = ToolCallTrace {
+                tool: name.to_string(),
+                server: "test".to_string(),
+                ms: 0,
+                ok: true,
+                error: None,
+                args: None,
+            };
+            Ok((result, trace))
         }
     }
 
@@ -218,7 +312,7 @@ mod tests {
             .with_response("heartbeat_status", "[{\"id\":1,\"status\":\"OK\"}]")
             .await;
 
-        let answer = run(
+        let outcome = run(
             "Hoeveel heartbeats?".to_string(),
             "system",
             &llm,
@@ -230,7 +324,7 @@ mod tests {
         .await
         .expect("run should succeed");
 
-        assert_eq!(answer, "Last 5 heartbeats are green.");
+        assert_eq!(outcome.answer, "Last 5 heartbeats are green.");
 
         // Pin the conversation-history bookkeeping: the second LLM call
         // must include the original user, the assistant's tool_use, and a
@@ -301,10 +395,10 @@ mod tests {
             .with_response("error_analysis", "{}")
             .await;
 
-        let answer = run("status?".to_string(), "system", &llm, &exec, &[], 10, 4096)
+        let outcome = run("status?".to_string(), "system", &llm, &exec, &[], 10, 4096)
             .await
             .expect("run should succeed");
-        assert_eq!(answer, "Status green; zero errors.");
+        assert_eq!(outcome.answer, "Status green; zero errors.");
 
         // The second LLM call's last message must be a single user turn
         // containing BOTH tool_result blocks in input order (toolu_a, toolu_b).
@@ -361,11 +455,11 @@ mod tests {
         }]);
         let exec = TestExecutor::new();
 
-        let answer = run_with_messages(seed.clone(), "system", &llm, &exec, &[], 10, 4096)
+        let outcome = run_with_messages(seed.clone(), "system", &llm, &exec, &[], 10, 4096)
             .await
             .expect("run_with_messages should succeed");
 
-        assert!(answer.contains("Brend"));
+        assert!(outcome.answer.contains("Brend"));
 
         let calls = llm.calls().await;
         assert_eq!(calls.len(), 1);
@@ -429,11 +523,11 @@ mod tests {
             .with_response("heartbeat_status", "[]")
             .await;
 
-        let answer = run_with_messages(seed, "system", &llm, &exec, &[], 10, 4096)
+        let outcome = run_with_messages(seed, "system", &llm, &exec, &[], 10, 4096)
             .await
             .expect("run_with_messages should succeed");
 
-        assert_eq!(answer, "Vijf heartbeats, allemaal groen.");
+        assert_eq!(outcome.answer, "Vijf heartbeats, allemaal groen.");
 
         let calls = llm.calls().await;
         assert_eq!(calls.len(), 2);
@@ -487,5 +581,174 @@ mod tests {
             msg.contains("exceeded") && msg.contains("10"),
             "error message should mention exceeded and 10, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_outcome_collects_trace_in_dispatch_order() {
+        // Two parallel tool calls in one round. Trace order must match
+        // tool_calls input order — the contract that try_join_all preserves.
+        let llm = MockLlmClient::new(vec![
+            ChatResponse {
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "toolu_a".to_string(),
+                        name: "tool_a".to_string(),
+                        input: json!({}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "toolu_b".to_string(),
+                        name: "tool_b".to_string(),
+                        input: json!({}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            },
+            ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let exec = TestExecutor::new()
+            .with_response("tool_a", "ra")
+            .await
+            .with_response("tool_b", "rb")
+            .await;
+
+        let outcome = run("q".to_string(), "system", &llm, &exec, &[], 10, 4096)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(outcome.tool_trace.len(), 2);
+        assert_eq!(outcome.tool_trace[0].tool, "tool_a");
+        assert_eq!(outcome.tool_trace[1].tool, "tool_b");
+        assert!(outcome.tool_trace.iter().all(|t| t.ok));
+    }
+
+    #[tokio::test]
+    async fn run_outcome_sums_tokens_across_iterations() {
+        let llm = MockLlmClient::new(vec![
+            ChatResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "tool_a".to_string(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: Some(TokenUsage {
+                    input: 100,
+                    output: 50,
+                    cache_creation_input: None,
+                    cache_read_input: None,
+                }),
+            },
+            ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: Some(TokenUsage {
+                    input: 200,
+                    output: 30,
+                    cache_creation_input: None,
+                    cache_read_input: None,
+                }),
+            },
+        ]);
+        let exec = TestExecutor::new().with_response("tool_a", "result").await;
+
+        let outcome = run("q".to_string(), "system", &llm, &exec, &[], 10, 4096)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(outcome.tokens.input, 300);
+        assert_eq!(outcome.tokens.output, 80);
+    }
+
+    #[tokio::test]
+    async fn run_outcome_records_failed_tool_with_is_error_block() {
+        // TestExecutor::with_error mirrors McpPool: tool-call failure
+        // surfaces as Ok((err_text, trace{ok=false})), orchestrator builds
+        // is_error=true ToolResult so Anthropic can plan recovery.
+        let llm = MockLlmClient::new(vec![
+            ChatResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_fail".to_string(),
+                    name: "tool_fails".to_string(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            },
+            ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "I tried but the tool failed.".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let exec = TestExecutor::new()
+            .with_error("tool_fails", "salesforce timeout")
+            .await;
+
+        let outcome = run("q".to_string(), "system", &llm, &exec, &[], 10, 4096)
+            .await
+            .expect("run should still succeed — tool errors don't bail");
+
+        assert_eq!(outcome.tool_trace.len(), 1);
+        let trace = &outcome.tool_trace[0];
+        assert!(!trace.ok);
+        assert_eq!(trace.error.as_deref(), Some("salesforce timeout"));
+
+        // Anthropic must have seen is_error=true so it could recover.
+        let calls = llm.calls().await;
+        let user_turn = calls[1].messages.last().expect("non-empty");
+        match &user_turn.content[0] {
+            ContentBlock::ToolResult { is_error, .. } => assert!(*is_error),
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_outcome_iteration_count_matches_loop_passes() {
+        // tool_use → tool_use → end_turn = 3 iterations of the outer loop.
+        let llm = MockLlmClient::new(vec![
+            ChatResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "tool_a".to_string(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            },
+            ChatResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "t2".to_string(),
+                    name: "tool_a".to_string(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: None,
+            },
+            ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+            },
+        ]);
+        let exec = TestExecutor::new().with_response("tool_a", "{}").await;
+
+        let outcome = run("q".to_string(), "system", &llm, &exec, &[], 10, 4096)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(outcome.iterations, 3);
     }
 }

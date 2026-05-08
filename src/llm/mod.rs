@@ -88,7 +88,6 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    #[allow(dead_code)] // wired up by orchestrator in v1.4 commit 2; tests exercise it now.
     pub fn add(&mut self, other: &TokenUsage) {
         self.input += other.input;
         self.output += other.output;
@@ -98,7 +97,6 @@ impl TokenUsage {
     }
 }
 
-#[allow(dead_code)] // helper for TokenUsage::add — see allow above.
 fn sum_optional(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     match (a, b) {
         (None, None) => None,
