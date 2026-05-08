@@ -22,8 +22,8 @@ use rmcp::{
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::agent::orchestrator::{McpExecutor, ToolCallTrace};
 use crate::llm::ToolSpec;
-use crate::orchestrator::{McpExecutor, ToolCallTrace};
 use crate::rabbitmq::publisher::Publisher;
 
 /// Open a Streamable-HTTP MCP session against the given URL.

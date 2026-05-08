@@ -1,7 +1,7 @@
+mod agent;
 mod http_api;
 mod llm;
 mod mcp;
-mod orchestrator;
 mod prompts;
 mod rabbitmq;
 mod retry;
@@ -24,7 +24,7 @@ async fn run_prompt(
     pool: &mcp::McpPool,
     tool_specs: &[ToolSpec],
 ) -> Result<String> {
-    let outcome = orchestrator::run(
+    let outcome = agent::orchestrator::run(
         prompt.to_string(),
         prompts::SETUP_PROMPT,
         llm,
