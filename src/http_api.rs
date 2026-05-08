@@ -11,7 +11,10 @@ use axum::{
 use chrono::{NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer,
+    validate_request::ValidateRequestHeaderLayer,
+};
 
 use crate::{
     llm::{ContentBlock, Message, Role, ToolSpec, anthropic::AnthropicClient},
@@ -247,6 +250,54 @@ async fn chat(
     Ok(Json(ChatResponse { answer }))
 }
 
+/// Read `CHAT_BEARER_TOKEN` from env. Whitespace-only or unset → `None`,
+/// so the bearer layer can be conditionally applied with a skip-warn.
+fn auth_token_from_env() -> Option<String> {
+    std::env::var("CHAT_BEARER_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Validates `Authorization: Bearer <token>` against a fixed expected value.
+/// Own impl rather than tower-http's deprecated `bearer()` helper, which
+/// emits a "too basic" warning that breaks `clippy -D warnings`. For our
+/// use-case (single shared secret) the bytewise compare is exactly what's
+/// needed; per-user tokens / JWT live behind a future v2 auth design.
+#[derive(Clone)]
+struct BearerAuth {
+    expected_header: String,
+}
+
+impl BearerAuth {
+    fn new(token: &str) -> Self {
+        Self {
+            expected_header: format!("Bearer {token}"),
+        }
+    }
+}
+
+impl<B> tower_http::validate_request::ValidateRequest<B> for BearerAuth {
+    type ResponseBody = axum::body::Body;
+
+    fn validate(
+        &mut self,
+        request: &mut axum::http::Request<B>,
+    ) -> Result<(), axum::http::Response<Self::ResponseBody>> {
+        let header = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        if header == Some(self.expected_header.as_str()) {
+            Ok(())
+        } else {
+            Err(axum::http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(axum::body::Body::empty())
+                .expect("static UNAUTHORIZED response builds"))
+        }
+    }
+}
+
 /// Build the CORS layer from `CHAT_ALLOWED_ORIGINS` (comma-separated origins).
 /// Unset or empty → permissive fallback with WARN log (dev-only). Set →
 /// strict allow-list of exact origins. A malformed origin invalidates the
@@ -421,8 +472,21 @@ pub async fn serve(
     let consumer_handle =
         consumer_config.map(|cfg| tokio::spawn(rabbitmq_consumer::run(cfg, shutdown_rx.clone())));
 
+    let bearer_token = auth_token_from_env();
+    let mut chat_route = post(chat);
+    if let Some(ref token) = bearer_token {
+        tracing::info!("CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat");
+        chat_route =
+            chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+    } else {
+        tracing::warn!(
+            "CHAT_BEARER_TOKEN unset — /chat accepts unauthenticated requests \
+             (dev-only, NOT for production)"
+        );
+    }
+
     let app = Router::new()
-        .route("/chat", post(chat))
+        .route("/chat", chat_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
@@ -660,5 +724,111 @@ mod tests {
             .as_str()
             .expect("correlation_id present");
         assert_eq!(id.len(), 36, "uuid v4 hyphenated length");
+    }
+
+    // Sets/clears CHAT_BEARER_TOKEN, must be `#[serial]` to avoid races with
+    // any other test reading process env. Edition 2024 requires `unsafe` for
+    // env-mutation; only the test helpers in this file use it.
+    fn with_bearer_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("CHAT_BEARER_TOKEN", v),
+                None => std::env::remove_var("CHAT_BEARER_TOKEN"),
+            }
+        }
+        f();
+        unsafe {
+            std::env::remove_var("CHAT_BEARER_TOKEN");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_token_from_env_returns_some_when_set() {
+        with_bearer_env(Some("abc"), || {
+            assert_eq!(auth_token_from_env().as_deref(), Some("abc"));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_token_from_env_returns_none_when_empty_or_whitespace() {
+        with_bearer_env(Some("   "), || {
+            assert_eq!(auth_token_from_env(), None);
+        });
+        with_bearer_env(Some(""), || {
+            assert_eq!(auth_token_from_env(), None);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auth_token_from_env_returns_none_when_unset() {
+        with_bearer_env(None, || {
+            assert_eq!(auth_token_from_env(), None);
+        });
+    }
+
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
+    fn bearer_test_app(token: &str) -> Router {
+        Router::new()
+            .route("/test", post(ok_handler))
+            .route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)))
+    }
+
+    #[tokio::test]
+    async fn bearer_layer_accepts_correct_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = bearer_test_app("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("Authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_layer_rejects_missing_header() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = bearer_test_app("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_layer_rejects_wrong_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = bearer_test_app("secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/test")
+            .header("Authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }
