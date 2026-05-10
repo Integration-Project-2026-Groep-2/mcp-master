@@ -1,6 +1,7 @@
 mod agent;
 mod gateway;
 mod http_api;
+mod incident;
 mod mcp;
 mod rabbitmq;
 mod retry;

@@ -729,6 +729,18 @@ pub async fn serve(
         shutdown_rx.clone(),
     ));
 
+    let incident_pipeline: Arc<dyn crate::incident::diagnose::DiagnosePipeline> = Arc::new(
+        crate::incident::diagnose::DefaultDiagnosePipeline::new(state.clone()),
+    );
+    let incident_handle = consumer_config.as_ref().map(|cfg| {
+        tokio::spawn(crate::incident::consumer::run(
+            cfg.clone(),
+            state.publisher.clone(),
+            Some(incident_pipeline.clone()),
+            shutdown_rx.clone(),
+        ))
+    });
+
     let consumer_handle =
         consumer_config.map(|cfg| tokio::spawn(rabbitmq_consumer::run(cfg, shutdown_rx.clone())));
 
@@ -824,6 +836,16 @@ pub async fn serve(
             Ok(Err(e)) => tracing::warn!("rabbitmq consumer join error: {e:#}"),
             Err(_) => tracing::warn!(
                 "rabbitmq consumer didn't drain in 2s — task left detached, runtime drop will reclaim"
+            ),
+        }
+    }
+    if let Some(h) = incident_handle {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), h).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::warn!("incident consumer exited with error: {e:#}"),
+            Ok(Err(e)) => tracing::warn!("incident consumer join error: {e:#}"),
+            Err(_) => tracing::warn!(
+                "incident consumer didn't drain in 2s — task left detached, runtime drop will reclaim"
             ),
         }
     }
