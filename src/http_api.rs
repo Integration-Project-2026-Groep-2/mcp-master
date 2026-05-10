@@ -729,10 +729,14 @@ pub async fn serve(
         shutdown_rx.clone(),
     ));
 
+    let incident_pipeline: Arc<dyn crate::incident::diagnose::DiagnosePipeline> = Arc::new(
+        crate::incident::diagnose::DefaultDiagnosePipeline::new(state.clone()),
+    );
     let incident_handle = consumer_config.as_ref().map(|cfg| {
         tokio::spawn(crate::incident::consumer::run(
             cfg.clone(),
             state.publisher.clone(),
+            Some(incident_pipeline.clone()),
             shutdown_rx.clone(),
         ))
     });

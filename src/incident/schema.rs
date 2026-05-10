@@ -1,6 +1,26 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct IncidentDiagnosis {
+    pub root_cause: String,
+    pub critical_failure: String,
+    pub impact: String,
+    pub confidence: Confidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_action: Option<String>,
+    pub evidence_summary: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    InsufficientEvidence,
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct IncidentEvent {
     pub event: String,
@@ -123,5 +143,59 @@ mod tests {
     fn severity_lowercase_wire_format() {
         let s = serde_json::to_string(&Severity::Critical).unwrap();
         assert_eq!(s, "\"critical\"");
+    }
+
+    #[test]
+    fn confidence_snake_case_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&Confidence::InsufficientEvidence).unwrap(),
+            "\"insufficient_evidence\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Confidence::High).unwrap(),
+            "\"high\""
+        );
+    }
+
+    #[test]
+    fn incident_diagnosis_round_trips_with_suggested_action() {
+        let d = IncidentDiagnosis {
+            root_cause: "deploy abc123 broke DB pool sizing".into(),
+            critical_failure: "connection pool exhausted".into(),
+            impact: "checkout flow blocked".into(),
+            confidence: Confidence::High,
+            suggested_action: Some("rollback to deadbeef".into()),
+            evidence_summary: "47 timeouts after 14:18 deploy".into(),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let parsed: IncidentDiagnosis = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, parsed);
+    }
+
+    #[test]
+    fn incident_diagnosis_omits_suggested_action_when_none() {
+        let d = IncidentDiagnosis {
+            root_cause: "x".into(),
+            critical_failure: "x".into(),
+            impact: "x".into(),
+            confidence: Confidence::Low,
+            suggested_action: None,
+            evidence_summary: "x".into(),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("suggested_action"));
+    }
+
+    #[test]
+    fn incident_diagnosis_rejects_unknown_confidence() {
+        let bad = r#"{
+            "root_cause": "x",
+            "critical_failure": "x",
+            "impact": "x",
+            "confidence": "uncertain",
+            "evidence_summary": "x"
+        }"#;
+        let r: Result<IncidentDiagnosis, _> = serde_json::from_str(bad);
+        assert!(r.is_err());
     }
 }

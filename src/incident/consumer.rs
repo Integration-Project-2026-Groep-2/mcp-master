@@ -14,7 +14,8 @@ use lapin::{
 use tokio::sync::watch;
 
 use super::debounce::Debouncer;
-use super::schema::IncidentEvent;
+use super::diagnose::DiagnosePipeline;
+use super::schema::{IncidentDiagnosis, IncidentEvent};
 use crate::rabbitmq::config::RabbitMqConfig;
 use crate::rabbitmq::publisher::Publisher;
 use crate::retry::backoff_with_jitter;
@@ -23,6 +24,7 @@ const QUEUE_NAME: &str = "mcp-master.incidents";
 const ROUTING_KEY: &str = "event.heartbeat_failed";
 const CONSUMER_TAG: &str = "mcp-master-incident";
 const SKIP_EVENT_NAME: &str = "incident_skipped";
+const DIAGNOSED_EVENT_NAME: &str = "incident_diagnosed";
 
 /// Consume `event.heartbeat_failed` until shutdown, reconnecting through
 /// transient broker outages. Mirrors `rabbitmq::consumer::run` but with a
@@ -34,9 +36,14 @@ const SKIP_EVENT_NAME: &str = "incident_skipped";
 /// only logged. The Debouncer lives here (not per-session) so it persists
 /// across reconnects — a service flapping during a broker-blip shouldn't
 /// reset its debounce slot.
+///
+/// `pipeline` is optional too: when absent, accepted events are logged but
+/// no Step A+B run. Tests pass `None` to skip the (heavy to mock) pipeline;
+/// production wires `Some(DefaultDiagnosePipeline::new(state))`.
 pub async fn run(
     config: RabbitMqConfig,
     publisher: Option<Arc<Publisher>>,
+    pipeline: Option<Arc<dyn DiagnosePipeline>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let debouncer = Arc::new(Debouncer::from_env());
@@ -51,7 +58,15 @@ pub async fn run(
             return Ok(());
         }
 
-        match consume_session(&config, &debouncer, publisher.as_ref(), &mut shutdown_rx).await {
+        match consume_session(
+            &config,
+            &debouncer,
+            publisher.as_ref(),
+            pipeline.as_ref(),
+            &mut shutdown_rx,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempt = attempt.saturating_add(1);
@@ -80,6 +95,7 @@ async fn consume_session(
     config: &RabbitMqConfig,
     debouncer: &Debouncer,
     publisher: Option<&Arc<Publisher>>,
+    pipeline: Option<&Arc<dyn DiagnosePipeline>>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let conn = Connection::connect(&config.url, ConnectionProperties::default())
@@ -150,7 +166,7 @@ async fn consume_session(
                 }
             }
             delivery = consumer.next() => match delivery {
-                Some(Ok(msg)) => match handle_delivery(&msg.data, debouncer, publisher).await {
+                Some(Ok(msg)) => match handle_delivery(&msg.data, debouncer, publisher, pipeline).await {
                     Ok(()) => {
                         if let Err(e) = msg.ack(BasicAckOptions::default()).await {
                             tracing::warn!("incident ack failed: {e:#}");
@@ -184,6 +200,7 @@ async fn handle_delivery(
     body: &[u8],
     debouncer: &Debouncer,
     publisher: Option<&Arc<Publisher>>,
+    pipeline: Option<&Arc<dyn DiagnosePipeline>>,
 ) -> Result<()> {
     let evt: IncidentEvent =
         serde_json::from_slice(body).context("decoding IncidentEvent envelope")?;
@@ -215,6 +232,32 @@ async fn handle_delivery(
         summary = %evt.payload.summary,
         "incident accepted for diagnosis"
     );
+
+    let Some(pl) = pipeline else {
+        tracing::warn!(
+            service = %evt.payload.component,
+            "no DiagnosePipeline configured — Step A+B skipped"
+        );
+        return Ok(());
+    };
+
+    match pl.diagnose(&evt).await {
+        Ok(diagnosis) => {
+            tracing::info!(
+                service = %evt.payload.component,
+                confidence = ?diagnosis.confidence,
+                "incident diagnosed"
+            );
+            publish_diagnosis(publisher, &evt, &diagnosis).await;
+        }
+        Err(e) => {
+            tracing::error!(
+                service = %evt.payload.component,
+                "diagnose pipeline failed: {e:#}"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -242,6 +285,26 @@ async fn publish_skip(
     }
 }
 
+async fn publish_diagnosis(
+    publisher: Option<&Arc<Publisher>>,
+    event: &IncidentEvent,
+    diagnosis: &IncidentDiagnosis,
+) {
+    let Some(p) = publisher else {
+        return;
+    };
+    let payload = serde_json::json!({
+        "service": event.payload.component,
+        "severity": event.payload.severity,
+        "diagnosis": diagnosis,
+        "original_summary": event.payload.summary,
+        "original_timestamp": event.timestamp.to_rfc3339(),
+    });
+    if let Err(e) = p.publish_event(DIAGNOSED_EVENT_NAME, payload).await {
+        tracing::warn!("publish_event({DIAGNOSED_EVENT_NAME}) failed: {e:#}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,7 +322,7 @@ mod tests {
         };
 
         let started = Instant::now();
-        let result = run(cfg, None, rx).await;
+        let result = run(cfg, None, None, rx).await;
         let elapsed = started.elapsed();
 
         assert!(result.is_ok(), "shutdown-first should succeed: {result:?}");
@@ -279,7 +342,7 @@ mod tests {
             exchange: "test.events".to_string(),
         };
 
-        let handle = tokio::spawn(run(cfg, None, rx));
+        let handle = tokio::spawn(run(cfg, None, None, rx));
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         tx.send(true).unwrap();
@@ -321,29 +384,29 @@ mod tests {
     #[tokio::test]
     async fn handle_delivery_accepts_critical_first_time() {
         let d = Debouncer::new(Duration::from_secs(60));
-        let r = handle_delivery(&body("critical", "kassa"), &d, None).await;
+        let r = handle_delivery(&body("critical", "kassa"), &d, None, None).await;
         assert!(r.is_ok());
     }
 
     #[tokio::test]
     async fn handle_delivery_skips_warning_severity() {
         let d = Debouncer::new(Duration::from_secs(60));
-        let r = handle_delivery(&body("warning", "kassa"), &d, None).await;
+        let r = handle_delivery(&body("warning", "kassa"), &d, None, None).await;
         assert!(r.is_ok(), "skip is not an error path");
     }
 
     #[tokio::test]
     async fn handle_delivery_skips_info_severity() {
         let d = Debouncer::new(Duration::from_secs(60));
-        let r = handle_delivery(&body("info", "kassa"), &d, None).await;
+        let r = handle_delivery(&body("info", "kassa"), &d, None, None).await;
         assert!(r.is_ok());
     }
 
     #[tokio::test]
     async fn handle_delivery_debounces_rapid_repeats() {
         let d = Debouncer::new(Duration::from_secs(60));
-        let first = handle_delivery(&body("critical", "kassa"), &d, None).await;
-        let second = handle_delivery(&body("critical", "kassa"), &d, None).await;
+        let first = handle_delivery(&body("critical", "kassa"), &d, None, None).await;
+        let second = handle_delivery(&body("critical", "kassa"), &d, None, None).await;
         assert!(first.is_ok());
         assert!(second.is_ok(), "second is skipped, not failed");
         assert!(d.check("kassa").is_err(), "first allow consumed the slot");
@@ -352,10 +415,10 @@ mod tests {
     #[tokio::test]
     async fn handle_delivery_severity_skip_does_not_consume_debounce_slot() {
         let d = Debouncer::new(Duration::from_secs(60));
-        let warn_result = handle_delivery(&body("warning", "kassa"), &d, None).await;
+        let warn_result = handle_delivery(&body("warning", "kassa"), &d, None, None).await;
         assert!(warn_result.is_ok());
         // Critical should now be allowed — warning didn't burn the slot.
-        let crit_result = handle_delivery(&body("critical", "kassa"), &d, None).await;
+        let crit_result = handle_delivery(&body("critical", "kassa"), &d, None, None).await;
         assert!(crit_result.is_ok());
         assert!(d.check("kassa").is_err());
     }
@@ -363,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn handle_delivery_rejects_malformed_json() {
         let d = Debouncer::new(Duration::from_secs(60));
-        let r = handle_delivery(b"not json", &d, None).await;
+        let r = handle_delivery(b"not json", &d, None, None).await;
         assert!(r.is_err());
     }
 
@@ -380,7 +443,117 @@ mod tests {
                 "component": "x"
             }
         }"#;
-        let r = handle_delivery(body, &d, None).await;
+        let r = handle_delivery(body, &d, None, None).await;
         assert!(r.is_err());
+    }
+
+    use crate::incident::schema::{Confidence, IncidentDiagnosis};
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex;
+
+    struct MockPipeline {
+        queued: Mutex<VecDeque<Result<IncidentDiagnosis, String>>>,
+        call_count: AtomicUsize,
+    }
+
+    impl MockPipeline {
+        fn new() -> Self {
+            Self {
+                queued: Mutex::new(VecDeque::new()),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+
+        async fn with_ok(self, d: IncidentDiagnosis) -> Self {
+            self.queued.lock().await.push_back(Ok(d));
+            self
+        }
+
+        async fn with_err(self, msg: &str) -> Self {
+            self.queued.lock().await.push_back(Err(msg.into()));
+            self
+        }
+
+        fn call_count(&self) -> usize {
+            self.call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl DiagnosePipeline for MockPipeline {
+        async fn diagnose(&self, _event: &IncidentEvent) -> Result<IncidentDiagnosis> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            match self.queued.lock().await.pop_front() {
+                Some(Ok(d)) => Ok(d),
+                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
+                None => Err(anyhow::anyhow!("MockPipeline: no canned response")),
+            }
+        }
+    }
+
+    fn diag(confidence: Confidence) -> IncidentDiagnosis {
+        IncidentDiagnosis {
+            root_cause: "test cause".into(),
+            critical_failure: "test failure".into(),
+            impact: "test impact".into(),
+            confidence,
+            suggested_action: None,
+            evidence_summary: "test evidence".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_delivery_calls_pipeline_when_configured_and_accepted() {
+        let d = Debouncer::new(Duration::from_secs(60));
+        let mock = Arc::new(MockPipeline::new().with_ok(diag(Confidence::High)).await);
+        let pipeline: Arc<dyn DiagnosePipeline> = mock.clone();
+        let r = handle_delivery(&body("critical", "kassa"), &d, None, Some(&pipeline)).await;
+        assert!(r.is_ok());
+        assert_eq!(mock.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_delivery_skips_pipeline_when_severity_filtered() {
+        let d = Debouncer::new(Duration::from_secs(60));
+        let mock = Arc::new(MockPipeline::new());
+        let pipeline: Arc<dyn DiagnosePipeline> = mock.clone();
+        let r = handle_delivery(&body("warning", "kassa"), &d, None, Some(&pipeline)).await;
+        assert!(r.is_ok());
+        assert_eq!(mock.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn handle_delivery_skips_pipeline_when_debounced() {
+        let d = Debouncer::new(Duration::from_secs(60));
+        let mock = Arc::new(MockPipeline::new().with_ok(diag(Confidence::High)).await);
+        let pipeline: Arc<dyn DiagnosePipeline> = mock.clone();
+
+        let first = handle_delivery(&body("critical", "kassa"), &d, None, Some(&pipeline)).await;
+        let second = handle_delivery(&body("critical", "kassa"), &d, None, Some(&pipeline)).await;
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(mock.call_count(), 1, "second event was debounced");
+    }
+
+    #[tokio::test]
+    async fn handle_delivery_swallows_pipeline_errors_so_message_is_acked() {
+        let d = Debouncer::new(Duration::from_secs(60));
+        let mock = Arc::new(MockPipeline::new().with_err("LLM timeout").await);
+        let pipeline: Arc<dyn DiagnosePipeline> = mock.clone();
+        let r = handle_delivery(&body("critical", "kassa"), &d, None, Some(&pipeline)).await;
+        assert!(
+            r.is_ok(),
+            "pipeline failure must not propagate (would trigger DLQ)"
+        );
+        assert_eq!(mock.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_delivery_accepts_when_no_pipeline_configured() {
+        let d = Debouncer::new(Duration::from_secs(60));
+        let r = handle_delivery(&body("critical", "kassa"), &d, None, None).await;
+        assert!(r.is_ok());
     }
 }
