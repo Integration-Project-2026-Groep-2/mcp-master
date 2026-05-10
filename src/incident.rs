@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod consumer;
 pub mod debounce;
 pub mod diagnose;
