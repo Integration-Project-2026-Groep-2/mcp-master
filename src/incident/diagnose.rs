@@ -13,8 +13,8 @@ use crate::http_api::AppState;
 
 const STEP_A_TOOLS: &[&str] = &["fetch_logs", "fetch_recent_deploys"];
 const STEP_A_MAX_ITERATIONS: usize = 6;
-const STEP_A_MAX_TOKENS: u32 = 4096;
-const STEP_B_MAX_TOKENS: u32 = 2048;
+const STEP_A_MAX_TOKENS: u32 = 8192;
+const STEP_B_MAX_TOKENS: u32 = 8192;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EvidenceBundle {
@@ -706,5 +706,145 @@ mod tests {
         // discards the tools arg — but the production AnthropicClient will
         // wire `&[]` straight to Anthropic, giving Step B no tools at the
         // wire level. The system prompt also asserts this in plain English.
+    }
+
+    /// End-to-end chain: gather_evidence (Step A) → compose_diagnosis (Step B)
+    /// against a single shared `MockLlmClient` queue. Mirrors what
+    /// `DefaultDiagnosePipeline::diagnose` does in production, minus the
+    /// Arc<AppState> wrapping.
+    ///
+    /// Verifies that the sequence of LLM calls is correct (3 for Step A's
+    /// tool-loop + 1 for Step B = 4 total) and that the evidence-summary
+    /// from Step A's JSON output flows into Step B's prompt unchanged.
+    #[tokio::test]
+    async fn full_pipeline_step_a_then_step_b_chains_correctly() {
+        let step_a_evidence = "47 connection pool timeouts after deploy abc123 at 14:18";
+        let llm = MockLlmClient::new(vec![
+            tool_use_response("toolu_a1", "fetch_logs", json!({"service": "kassa"})),
+            tool_use_response(
+                "toolu_a2",
+                "fetch_recent_deploys",
+                json!({"service": "kassa"}),
+            ),
+            end_turn(&format!(
+                r#"{{"summary":"{step_a_evidence}","missing_sources":[]}}"#
+            )),
+            end_turn(
+                r#"{
+                    "root_cause": "deploy abc123 broke DB connection pool sizing",
+                    "critical_failure": "Postgres connection pool exhausted within 2 minutes",
+                    "impact": "all checkout endpoints returning 502",
+                    "confidence": "high",
+                    "suggested_action": "rollback to deadbeef (last healthy 13:00)",
+                    "evidence_summary": "47 ERROR lines starting 14:18:30 + Argo deploy abc123 at 14:18:03"
+                }"#,
+            ),
+        ]);
+        let mcp = StubMcpExecutor::new()
+            .with_ok("fetch_logs", "47 ERROR lines: connection pool timeout")
+            .await
+            .with_ok(
+                "fetch_recent_deploys",
+                r#"[{"sha":"abc123","at":"14:18:03","conclusion":"success"}]"#,
+            )
+            .await;
+        let specs = vec![
+            spec("fetch_logs", false),
+            spec("fetch_recent_deploys", false),
+        ];
+        let event = sample_event();
+
+        let evidence = gather_evidence(&event, &llm, &mcp, &specs).await.unwrap();
+        assert_eq!(evidence.summary, step_a_evidence);
+        assert!(evidence.missing_sources.is_empty());
+        assert_eq!(evidence.tool_trace.len(), 2);
+
+        let diagnosis = compose_diagnosis(&event, &evidence, &llm).await.unwrap();
+        assert_eq!(
+            diagnosis.confidence,
+            crate::incident::schema::Confidence::High
+        );
+        assert!(diagnosis.root_cause.contains("abc123"));
+        assert!(
+            diagnosis
+                .suggested_action
+                .as_deref()
+                .unwrap()
+                .contains("rollback")
+        );
+
+        let calls = llm.calls().await;
+        assert_eq!(
+            calls.len(),
+            4,
+            "expected 3 Step A turns + 1 Step B turn, got {}",
+            calls.len()
+        );
+        let step_b_user_message = match &calls[3].messages[0].content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("Step B should receive Text, got {other:?}"),
+        };
+        assert!(
+            step_b_user_message.contains(step_a_evidence),
+            "Step A's summary must be wrapped into Step B's prompt"
+        );
+        assert!(
+            step_b_user_message.contains("<UNTRUSTED_EVIDENCE>"),
+            "Step B's prompt must mark Step A output as untrusted"
+        );
+    }
+
+    /// E2E with degraded path: Loki (fetch_logs) is down, only deploys are
+    /// reachable. Step A flags `elasticsearch` as missing; Step B receives
+    /// degraded evidence and should produce a `low` or `insufficient_evidence`
+    /// diagnosis (the LLM in this test produces `low`).
+    #[tokio::test]
+    async fn full_pipeline_with_partial_evidence_produces_low_confidence() {
+        let llm = MockLlmClient::new(vec![
+            tool_use_response("toolu_a1", "fetch_logs", json!({"service": "kassa"})),
+            tool_use_response(
+                "toolu_a2",
+                "fetch_recent_deploys",
+                json!({"service": "kassa"}),
+            ),
+            end_turn(
+                r#"{"summary":"only deploy data; logs unreachable","missing_sources":["elasticsearch"]}"#,
+            ),
+            end_turn(
+                r#"{
+                    "root_cause": "recent deploy abc123 is the only signal — logs unreachable",
+                    "critical_failure": "unknown — log pipeline down",
+                    "impact": "unknown",
+                    "confidence": "low",
+                    "evidence_summary": "1 deploy seen, 0 log entries"
+                }"#,
+            ),
+        ]);
+        let mcp = StubMcpExecutor::new()
+            .with_err("fetch_logs", "elasticsearch connection refused")
+            .await
+            .with_ok("fetch_recent_deploys", r#"[{"sha":"abc123"}]"#)
+            .await;
+        let specs = vec![
+            spec("fetch_logs", false),
+            spec("fetch_recent_deploys", false),
+        ];
+        let event = sample_event();
+
+        let evidence = gather_evidence(&event, &llm, &mcp, &specs).await.unwrap();
+        assert!(
+            evidence
+                .missing_sources
+                .contains(&"elasticsearch".to_string()),
+            "Step A must flag failing source: {:?}",
+            evidence.missing_sources
+        );
+
+        let diagnosis = compose_diagnosis(&event, &evidence, &llm).await.unwrap();
+        assert_eq!(
+            diagnosis.confidence,
+            crate::incident::schema::Confidence::Low
+        );
+        assert!(diagnosis.suggested_action.is_none());
     }
 }
