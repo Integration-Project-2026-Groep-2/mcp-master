@@ -230,7 +230,7 @@ pub mod tests {
     /// Test double: pops responses from a queue in order, records calls.
     pub struct MockLlmClient {
         responses: Mutex<Vec<ChatResponse>>,
-        streams: Mutex<Vec<Vec<StreamEvent>>>,
+        streams: Mutex<Vec<Vec<anyhow::Result<StreamEvent>>>>,
         calls: Mutex<Vec<MockCall>>,
     }
 
@@ -248,7 +248,15 @@ pub mod tests {
         /// default — `chat` + a single `Done` event.
         #[allow(dead_code)] // exercised from orchestrator tests via stream pathway
         pub async fn queue_stream(&self, events: Vec<StreamEvent>) {
-            self.streams.lock().await.push(events);
+            let wrapped: Vec<anyhow::Result<StreamEvent>> = events.into_iter().map(Ok).collect();
+            self.streams.lock().await.push(wrapped);
+        }
+
+        /// Like `queue_stream` but accepts raw `Result` items so tests can
+        /// inject mid-stream transport errors as `Err`.
+        #[allow(dead_code)]
+        pub async fn queue_stream_results(&self, items: Vec<anyhow::Result<StreamEvent>>) {
+            self.streams.lock().await.push(items);
         }
 
         pub async fn calls(&self) -> Vec<MockCall> {
@@ -291,12 +299,11 @@ pub mod tests {
                     Some(q.remove(0))
                 }
             };
-            if let Some(events) = queued {
+            if let Some(items) = queued {
                 self.calls.lock().await.push(MockCall {
                     system: system.to_string(),
                     messages: messages.to_vec(),
                 });
-                let items: Vec<anyhow::Result<StreamEvent>> = events.into_iter().map(Ok).collect();
                 return Ok(Box::pin(stream::iter(items)));
             }
             let resp = self.chat(system, messages, tools, max_tokens).await?;
