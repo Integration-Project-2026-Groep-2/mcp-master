@@ -48,6 +48,12 @@ const REQUEST_TIMEOUT_SECONDS: u64 = 240;
 // queue te lang blijft staan.
 const MAX_CONCURRENT_CHAT: usize = 8;
 
+// Wallclock cap for the entire `/chat/stream` run. TimeoutLayer is
+// deliberately not applied to the streaming route (would kill long-but-
+// legitimate tool-cascades) so this is the hard bound on a concurrency
+// slot. 600s comfortably exceeds the longest observed multi-MCP cascade.
+const STREAM_DEADLINE_SECS: u64 = 600;
+
 pub struct AppState {
     pub llm: AnthropicClient,
     pub pool: McpPool,
@@ -578,40 +584,74 @@ async fn chat_stream(
         let mut tokens = TokenUsage::default();
         let mut iterations: u32 = 0;
         let mut succeeded = true;
+        let mut timed_out = false;
 
-        while let Some(ev) = orch_rx.recv().await {
-            match &ev {
-                ProgressEvent::TextChunk { text } => answer.push_str(text),
-                ProgressEvent::ToolCallCompleted {
-                    name,
-                    ok,
-                    ms,
-                    status,
-                    action_id,
-                } => {
-                    tool_trace.push(serde_json::json!({
-                        "tool": name,
-                        "ok": ok,
-                        "ms": ms,
-                        "status": status,
-                        "action_id": action_id,
-                    }));
+        // Wallclock cap on the entire streaming run. TimeoutLayer is
+        // intentionally NOT on /chat/stream (would kill long but
+        // legitimate tool-cascades), so this is the hard bound that
+        // prevents a slow-loris upstream from pinning a concurrency
+        // slot forever. 600s comfortably exceeds the longest observed
+        // CRM-cascade (~3-4 min) while bounding DoS surface.
+        let accumulator = async {
+            while let Some(ev) = orch_rx.recv().await {
+                match &ev {
+                    ProgressEvent::TextChunk { text } => answer.push_str(text),
+                    ProgressEvent::ToolCallCompleted {
+                        name,
+                        ok,
+                        ms,
+                        status,
+                        action_id,
+                    } => {
+                        tool_trace.push(serde_json::json!({
+                            "tool": name,
+                            "ok": ok,
+                            "ms": ms,
+                            "status": status,
+                            "action_id": action_id,
+                        }));
+                    }
+                    ProgressEvent::Done {
+                        tokens: t,
+                        iterations: i,
+                        ..
+                    } => {
+                        tokens = t.clone();
+                        iterations = *i;
+                    }
+                    ProgressEvent::Error { .. } => succeeded = false,
+                    _ => {}
                 }
-                ProgressEvent::Done {
-                    tokens: t,
-                    iterations: i,
-                    ..
-                } => {
-                    tokens = t.clone();
-                    iterations = *i;
-                }
-                ProgressEvent::Error { .. } => succeeded = false,
-                _ => {}
+                let _ = sse_tx.send(ev).await;
             }
-            let _ = sse_tx.send(ev).await;
+        };
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(STREAM_DEADLINE_SECS),
+            accumulator,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_elapsed) => {
+                tracing::warn!(
+                    correlation_id = %correlation_id_pub,
+                    elapsed_secs = STREAM_DEADLINE_SECS,
+                    "/chat/stream wallclock timeout — aborting orchestrator",
+                );
+                orch_handle.abort();
+                timed_out = true;
+                succeeded = false;
+                let _ = sse_tx
+                    .send(ProgressEvent::Error {
+                        message: "stream timeout".into(),
+                        correlation_id: correlation_id_pub.clone(),
+                    })
+                    .await;
+            }
         }
 
-        if let Ok(Err(_)) = orch_handle.await {
+        if !timed_out && let Ok(Err(_)) = orch_handle.await {
             succeeded = false;
         }
 
@@ -629,6 +669,7 @@ async fn chat_stream(
                 "iterations": iterations,
                 "succeeded": succeeded,
                 "streamed": true,
+                "timed_out": timed_out,
             });
             if let Err(e) = publisher.publish_event("chat_completed", payload).await {
                 tracing::warn!("failed to publish chat_completed event from stream: {e:#}");
