@@ -172,6 +172,17 @@ fn build_routing_table(
     Ok((specs, idx_map))
 }
 
+/// Map each server's `Vec<Tool>` to a parallel `Vec<ToolSpec>`, preserving
+/// the outer-index alignment with the `sessions` slot they'll occupy. The
+/// flat `tool_specs` from `build_routing_table` loses server-attribution;
+/// this preserves it for introspection callers.
+fn per_server_specs(server_tools: &[(String, Vec<Tool>)]) -> Vec<Vec<ToolSpec>> {
+    server_tools
+        .iter()
+        .map(|(_, tools)| tools.iter().map(tool_to_spec).collect())
+        .collect()
+}
+
 /// One MCP-server session with the URL kept around so we can reopen the
 /// transport after a transient failure (SSE break, idle timeout, broker
 /// restart, etc.). The inner `RunningService` is locked behind an async
@@ -205,6 +216,12 @@ pub struct McpPool {
     /// Aggregate `ToolSpec`s across all connected servers. Cached so the
     /// orchestrator can borrow without re-querying.
     tool_specs: Vec<ToolSpec>,
+
+    /// Per-server `ToolSpec`s, parallel-indexed with `sessions`. Retained
+    /// so introspection endpoints can attribute tools back to their
+    /// originating server (which the flat `tool_specs` aggregate erases).
+    #[allow(dead_code)] // read by `catalog()` in the follow-up commit
+    server_tools: Vec<Vec<ToolSpec>>,
 
     /// Optional event-sink for `tool_called` events on `ai.events`. Set via
     /// `attach_publisher`; absent means no events fired (skip-warn pattern).
@@ -279,6 +296,7 @@ impl McpPool {
         }
 
         let (tool_specs, tool_to_session_idx) = build_routing_table(&server_tools)?;
+        let server_tools_specs = per_server_specs(&server_tools);
 
         let sessions: Vec<ManagedSession> = connected
             .into_iter()
@@ -299,6 +317,7 @@ impl McpPool {
             sessions,
             tool_to_session_idx,
             tool_specs,
+            server_tools: server_tools_specs,
             publisher: None,
         })
     }
@@ -658,6 +677,60 @@ mod tests {
         assert_eq!(idx.get("count_contacts").copied(), Some(0));
         assert_eq!(idx.get("error_analysis").copied(), Some(1));
         assert_eq!(idx.get("heartbeat_status").copied(), Some(1));
+    }
+
+    #[test]
+    fn per_server_specs_preserves_per_server_attribution() {
+        let server_tools = vec![
+            (
+                "crm".to_string(),
+                vec![tool("search_contact"), tool("count_contacts")],
+            ),
+            ("controlroom".to_string(), vec![tool("error_analysis")]),
+        ];
+
+        let result = per_server_specs(&server_tools);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 2);
+        assert_eq!(result[0][0].name, "search_contact");
+        assert_eq!(result[0][1].name, "count_contacts");
+        assert_eq!(result[1].len(), 1);
+        assert_eq!(result[1][0].name, "error_analysis");
+    }
+
+    #[test]
+    fn per_server_specs_handles_empty_input() {
+        assert!(per_server_specs(&[]).is_empty());
+    }
+
+    #[test]
+    fn per_server_specs_aligns_with_routing_table_indices() {
+        // Invariant: for every (tool_name, idx) in tool_to_session_idx,
+        // server_tools[idx] must contain a spec with that tool_name.
+        let server_tools = vec![
+            (
+                "crm".to_string(),
+                vec![tool("search_contact"), tool("count_contacts")],
+            ),
+            (
+                "controlroom".to_string(),
+                vec![tool("error_analysis"), tool("heartbeat_status")],
+            ),
+        ];
+        let (_specs, idx_map) = build_routing_table(&server_tools).expect("should build");
+        let per_server = per_server_specs(&server_tools);
+
+        for (name, server_idx) in &idx_map {
+            let owned = per_server[*server_idx]
+                .iter()
+                .any(|spec| spec.name == *name);
+            assert!(
+                owned,
+                "tool '{}' routed to server {} must live in server_tools[{}]",
+                name, server_idx, server_idx
+            );
+        }
     }
 
     #[test]
