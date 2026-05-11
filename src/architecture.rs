@@ -10,6 +10,7 @@
 // arrive in follow-up commits within the same PR. Suppress until then.
 #![allow(dead_code, unused_imports)]
 
+pub mod builder;
 pub mod dto;
 pub mod rabbitmq;
 pub mod statics;
