@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rmcp::{
     ServiceExt,
     model::{
@@ -19,6 +20,7 @@ use rmcp::{
     service::{RoleClient, RunningService},
     transport::StreamableHttpClientTransport,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -172,6 +174,79 @@ fn build_routing_table(
     Ok((specs, idx_map))
 }
 
+/// Map each server's `Vec<Tool>` to a parallel `Vec<ToolSpec>`, preserving
+/// the outer-index alignment with the `sessions` slot they'll occupy. The
+/// flat `tool_specs` from `build_routing_table` loses server-attribution;
+/// this preserves it for introspection callers.
+fn per_server_specs(server_tools: &[(String, Vec<Tool>)]) -> Vec<Vec<ToolSpec>> {
+    server_tools
+        .iter()
+        .map(|(_, tools)| tools.iter().map(tool_to_spec).collect())
+        .collect()
+}
+
+/// JSON-shaped tool description for the `/tools-catalog` endpoint.
+/// Distinct from `ToolSpec` (which is the orchestrator's internal type) so
+/// that the wire-format can evolve independently from the LLM-facing schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolSummary {
+    pub name: String,
+    pub description: String,
+    pub requires_approval: bool,
+    pub input_schema: Value,
+}
+
+/// One MCP server's entry in the catalog: identity + tool inventory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerCatalog {
+    pub label: String,
+    pub url: String,
+    pub connected: bool,
+    pub tool_count: usize,
+    pub tools: Vec<ToolSummary>,
+}
+
+/// Top-level response shape for `GET /tools-catalog`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogResponse {
+    pub servers: Vec<ServerCatalog>,
+    pub generated_at: DateTime<Utc>,
+}
+
+fn spec_to_summary(spec: &ToolSpec) -> ToolSummary {
+    ToolSummary {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        requires_approval: spec.requires_approval,
+        input_schema: spec.input_schema.clone(),
+    }
+}
+
+/// Pure assembly of `CatalogResponse` from session metadata + per-server
+/// tool lists. Extracted so tests can pass fixtures directly without
+/// constructing a real `McpPool` (which requires live MCP sessions).
+fn build_catalog(
+    sessions_meta: &[(String, String)],
+    server_tools: &[Vec<ToolSpec>],
+    generated_at: DateTime<Utc>,
+) -> CatalogResponse {
+    let servers = sessions_meta
+        .iter()
+        .zip(server_tools.iter())
+        .map(|((label, url), tools)| ServerCatalog {
+            label: label.clone(),
+            url: url.clone(),
+            connected: true,
+            tool_count: tools.len(),
+            tools: tools.iter().map(spec_to_summary).collect(),
+        })
+        .collect();
+    CatalogResponse {
+        servers,
+        generated_at,
+    }
+}
+
 /// One MCP-server session with the URL kept around so we can reopen the
 /// transport after a transient failure (SSE break, idle timeout, broker
 /// restart, etc.). The inner `RunningService` is locked behind an async
@@ -205,6 +280,11 @@ pub struct McpPool {
     /// Aggregate `ToolSpec`s across all connected servers. Cached so the
     /// orchestrator can borrow without re-querying.
     tool_specs: Vec<ToolSpec>,
+
+    /// Per-server `ToolSpec`s, parallel-indexed with `sessions`. Retained
+    /// so introspection endpoints can attribute tools back to their
+    /// originating server (which the flat `tool_specs` aggregate erases).
+    server_tools: Vec<Vec<ToolSpec>>,
 
     /// Optional event-sink for `tool_called` events on `ai.events`. Set via
     /// `attach_publisher`; absent means no events fired (skip-warn pattern).
@@ -279,6 +359,7 @@ impl McpPool {
         }
 
         let (tool_specs, tool_to_session_idx) = build_routing_table(&server_tools)?;
+        let server_tools_specs = per_server_specs(&server_tools);
 
         let sessions: Vec<ManagedSession> = connected
             .into_iter()
@@ -299,6 +380,7 @@ impl McpPool {
             sessions,
             tool_to_session_idx,
             tool_specs,
+            server_tools: server_tools_specs,
             publisher: None,
         })
     }
@@ -307,6 +389,33 @@ impl McpPool {
     /// the orchestrator as the agent's tool surface.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tool_specs.clone()
+    }
+
+    /// Build a JSON-serializable snapshot of all connected MCP servers and
+    /// their tools, for the read-only `/tools-catalog` HTTP endpoint.
+    /// `connected` is always `true` in v1 — dead servers are dropped from
+    /// the pool at startup, so anything still here was reachable.
+    pub fn catalog(&self) -> CatalogResponse {
+        let sessions_meta: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .map(|s| (s.label.clone(), s.url.clone()))
+            .collect();
+        build_catalog(&sessions_meta, &self.server_tools, Utc::now())
+    }
+
+    /// Test-only: build an empty pool with no live MCP sessions. Used by
+    /// HTTP integration tests that need an `AppState` without paying for
+    /// real MCP-server connections.
+    #[cfg(test)]
+    pub fn empty_for_test() -> Self {
+        Self {
+            sessions: Vec::new(),
+            tool_to_session_idx: HashMap::new(),
+            tool_specs: Vec::new(),
+            server_tools: Vec::new(),
+            publisher: None,
+        }
     }
 
     /// Wire up an AMQP publisher so each `tool_called` event lands on
@@ -658,6 +767,130 @@ mod tests {
         assert_eq!(idx.get("count_contacts").copied(), Some(0));
         assert_eq!(idx.get("error_analysis").copied(), Some(1));
         assert_eq!(idx.get("heartbeat_status").copied(), Some(1));
+    }
+
+    #[test]
+    fn per_server_specs_preserves_per_server_attribution() {
+        let server_tools = vec![
+            (
+                "crm".to_string(),
+                vec![tool("search_contact"), tool("count_contacts")],
+            ),
+            ("controlroom".to_string(), vec![tool("error_analysis")]),
+        ];
+
+        let result = per_server_specs(&server_tools);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 2);
+        assert_eq!(result[0][0].name, "search_contact");
+        assert_eq!(result[0][1].name, "count_contacts");
+        assert_eq!(result[1].len(), 1);
+        assert_eq!(result[1][0].name, "error_analysis");
+    }
+
+    #[test]
+    fn per_server_specs_handles_empty_input() {
+        assert!(per_server_specs(&[]).is_empty());
+    }
+
+    fn spec(name: &str, requires_approval: bool) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: format!("description of {name}"),
+            input_schema: json!({"type": "object", "properties": {}}),
+            requires_approval,
+        }
+    }
+
+    #[test]
+    fn build_catalog_emits_one_entry_per_session() {
+        let sessions_meta = vec![
+            ("crm".into(), "http://crm:7001/mcp".into()),
+            ("controlroom".into(), "http://controlroom:5555/mcp".into()),
+        ];
+        let server_tools = vec![
+            vec![spec("search_contact", false), spec("get_contact", false)],
+            vec![spec("error_analysis", false)],
+        ];
+        let now = Utc::now();
+
+        let cat = build_catalog(&sessions_meta, &server_tools, now);
+
+        assert_eq!(cat.servers.len(), 2);
+        assert_eq!(cat.servers[0].label, "crm");
+        assert_eq!(cat.servers[0].url, "http://crm:7001/mcp");
+        assert!(cat.servers[0].connected);
+        assert_eq!(cat.servers[0].tool_count, 2);
+        assert_eq!(cat.servers[0].tools[0].name, "search_contact");
+        assert_eq!(cat.servers[1].label, "controlroom");
+        assert_eq!(cat.servers[1].tool_count, 1);
+        assert_eq!(cat.generated_at, now);
+    }
+
+    #[test]
+    fn build_catalog_preserves_requires_approval_per_tool() {
+        let sessions_meta = vec![("crm".into(), "http://crm:7001/mcp".into())];
+        let server_tools = vec![vec![
+            spec("search_contact", false),
+            spec("create_contact", true),
+        ]];
+
+        let cat = build_catalog(&sessions_meta, &server_tools, Utc::now());
+
+        assert!(!cat.servers[0].tools[0].requires_approval);
+        assert!(cat.servers[0].tools[1].requires_approval);
+    }
+
+    #[test]
+    fn build_catalog_handles_empty_pool() {
+        let cat = build_catalog(&[], &[], Utc::now());
+        assert!(cat.servers.is_empty());
+    }
+
+    #[test]
+    fn catalog_response_serde_roundtrips() {
+        let now = Utc::now();
+        let cat = build_catalog(
+            &[("crm".into(), "http://crm:7001/mcp".into())],
+            &[vec![spec("search_contact", false)]],
+            now,
+        );
+
+        let json = serde_json::to_string(&cat).expect("serializes");
+        let parsed: CatalogResponse = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(parsed.servers, cat.servers);
+        // DateTime round-trip preserves the instant; equality must hold.
+        assert_eq!(parsed.generated_at, cat.generated_at);
+    }
+
+    #[test]
+    fn per_server_specs_aligns_with_routing_table_indices() {
+        // Invariant: for every (tool_name, idx) in tool_to_session_idx,
+        // server_tools[idx] must contain a spec with that tool_name.
+        let server_tools = vec![
+            (
+                "crm".to_string(),
+                vec![tool("search_contact"), tool("count_contacts")],
+            ),
+            (
+                "controlroom".to_string(),
+                vec![tool("error_analysis"), tool("heartbeat_status")],
+            ),
+        ];
+        let (_specs, idx_map) = build_routing_table(&server_tools).expect("should build");
+        let per_server = per_server_specs(&server_tools);
+
+        for (name, server_idx) in &idx_map {
+            let owned = per_server[*server_idx]
+                .iter()
+                .any(|spec| spec.name == *name);
+            assert!(
+                owned,
+                "tool '{}' routed to server {} must live in server_tools[{}]",
+                name, server_idx, server_idx
+            );
+        }
     }
 
     #[test]
