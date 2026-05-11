@@ -1,5 +1,4 @@
 mod agent;
-mod architecture;
 mod gateway;
 mod http_api;
 mod incident;
