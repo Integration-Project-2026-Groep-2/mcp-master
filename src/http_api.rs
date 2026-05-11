@@ -1600,4 +1600,288 @@ mod tests {
             unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
         }
     }
+
+    fn architecture_test_state(
+        mgmt_client: Option<Arc<crate::architecture::rabbitmq::ManagementClient>>,
+    ) -> Arc<AppState> {
+        use crate::gateway::approval::flow::ApprovalFlow;
+        use crate::gateway::approval::state::ApprovalStore;
+        use crate::gateway::audit::AuditPublisher;
+        use std::time::Duration;
+
+        let store = Arc::new(ApprovalStore::new(Duration::from_secs(900)));
+        let audit = Arc::new(AuditPublisher::new(None));
+        let approval_flow = Arc::new(ApprovalFlow::new(store, audit, Duration::from_secs(900)));
+        Arc::new(AppState {
+            llm: AnthropicClient::new("test-key-unused".into()),
+            pool: crate::mcp::McpPool::empty_for_test(),
+            tool_specs: Vec::new(),
+            publisher: None,
+            approval_flow,
+            mgmt_client,
+        })
+    }
+
+    fn architecture_test_app(
+        token: Option<&str>,
+        mgmt_client: Option<Arc<crate::architecture::rabbitmq::ManagementClient>>,
+    ) -> Router {
+        let state = architecture_test_state(mgmt_client);
+        let mut route = get(architecture);
+        if let Some(t) = token {
+            route = route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(t)));
+        }
+        Router::new()
+            .route("/architecture", route)
+            .with_state(state)
+    }
+
+    /// Mount wiremock stubs for the 3 RabbitMQ management endpoints.
+    /// Caller controls the JSON bodies for `exchanges` / `queues` /
+    /// `bindings`. Returns the mock server (kept alive by caller).
+    async fn mount_rabbitmq_mock(
+        exchanges: serde_json::Value,
+        queues: serde_json::Value,
+        bindings: serde_json::Value,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/exchanges/%2F"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(exchanges))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/queues/%2F"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(queues))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/bindings/%2F"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bindings))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn architecture_returns_static_only_when_topology_empty() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use serde_json::json;
+        use tower::ServiceExt;
+
+        let prev_secret = std::env::var("CHAT_JWT_SECRET").ok();
+        unsafe { std::env::remove_var("CHAT_JWT_SECRET") };
+
+        let mock = mount_rabbitmq_mock(json!([]), json!([]), json!([])).await;
+        let mgmt =
+            Arc::new(crate::architecture::rabbitmq::ManagementClient::new_for_test(mock.uri()));
+
+        let app = architecture_test_app(None, Some(mgmt));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/architecture")
+            .header("Authorization", "Bearer dev-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let bytes = to_bytes(res.into_body(), 256 * 1024).await.unwrap();
+        let resp: crate::architecture::ArchitectureResponse =
+            serde_json::from_slice(&bytes).unwrap();
+
+        // Static-only run: master + consumer + broker + services + externals
+        let kinds: std::collections::HashSet<&str> = resp
+            .nodes
+            .iter()
+            .map(|n| match n.kind {
+                crate::architecture::dto::NodeKind::Master => "master",
+                crate::architecture::dto::NodeKind::Consumer => "consumer",
+                crate::architecture::dto::NodeKind::Broker => "broker",
+                crate::architecture::dto::NodeKind::Service => "service",
+                crate::architecture::dto::NodeKind::External => "external",
+                crate::architecture::dto::NodeKind::McpServer => "mcp_server",
+                crate::architecture::dto::NodeKind::Exchange => "exchange",
+                crate::architecture::dto::NodeKind::Queue => "queue",
+            })
+            .collect();
+        assert!(kinds.contains("master"));
+        assert!(kinds.contains("consumer"));
+        assert!(kinds.contains("broker"));
+        assert!(kinds.contains("service"));
+        assert!(kinds.contains("external"));
+        assert!(!kinds.contains("mcp_server"), "no MCP servers in test pool");
+        assert!(
+            !kinds.contains("exchange"),
+            "empty topology has no exchanges"
+        );
+
+        if let Some(s) = prev_secret {
+            unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn architecture_renders_exchange_and_binding_from_topology() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use serde_json::json;
+        use tower::ServiceExt;
+
+        let prev_secret = std::env::var("CHAT_JWT_SECRET").ok();
+        unsafe { std::env::remove_var("CHAT_JWT_SECRET") };
+
+        let exchanges = json!([
+            {"name": "ai.events", "type": "topic"},
+            {"name": "amq.direct", "type": "direct"}  // system → filtered
+        ]);
+        let queues = json!([{"name": "frontend.ai_incidents"}]);
+        let bindings = json!([{
+            "source": "ai.events",
+            "destination": "frontend.ai_incidents",
+            "destination_type": "queue",
+            "routing_key": "event.incident_diagnosed"
+        }]);
+        let mock = mount_rabbitmq_mock(exchanges, queues, bindings).await;
+        let mgmt =
+            Arc::new(crate::architecture::rabbitmq::ManagementClient::new_for_test(mock.uri()));
+
+        let app = architecture_test_app(None, Some(mgmt));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/architecture")
+            .header("Authorization", "Bearer dev-token")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let bytes = to_bytes(res.into_body(), 256 * 1024).await.unwrap();
+        let resp: crate::architecture::ArchitectureResponse =
+            serde_json::from_slice(&bytes).unwrap();
+
+        let node_ids: std::collections::HashSet<&str> =
+            resp.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(node_ids.contains("exchange.ai.events"));
+        assert!(!node_ids.contains("exchange.amq.direct"));
+        assert!(node_ids.contains("queue.frontend.ai_incidents"));
+
+        let binding = resp
+            .edges
+            .iter()
+            .find(|e| e.source == "exchange.ai.events" && e.target == "queue.frontend.ai_incidents")
+            .expect("binding edge present");
+        assert_eq!(binding.label.as_deref(), Some("event.incident_diagnosed"));
+
+        if let Some(s) = prev_secret {
+            unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn architecture_rejects_missing_bearer_with_401() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use serde_json::json;
+        use tower::ServiceExt;
+
+        let prev_secret = std::env::var("CHAT_JWT_SECRET").ok();
+        unsafe { std::env::remove_var("CHAT_JWT_SECRET") };
+
+        let mock = mount_rabbitmq_mock(json!([]), json!([]), json!([])).await;
+        let mgmt =
+            Arc::new(crate::architecture::rabbitmq::ManagementClient::new_for_test(mock.uri()));
+
+        let app = architecture_test_app(Some("secret"), Some(mgmt));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/architecture")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        if let Some(s) = prev_secret {
+            unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn architecture_returns_503_when_mgmt_client_unavailable() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let prev_secret = std::env::var("CHAT_JWT_SECRET").ok();
+        unsafe { std::env::remove_var("CHAT_JWT_SECRET") };
+
+        let app = architecture_test_app(None, None); // skip-warn: mgmt_client=None
+        let req = Request::builder()
+            .method("GET")
+            .uri("/architecture")
+            .header("Authorization", "Bearer dev-token")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        if let Some(s) = prev_secret {
+            unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn architecture_returns_500_when_mgmt_api_errors() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let prev_secret = std::env::var("CHAT_JWT_SECRET").ok();
+        unsafe { std::env::remove_var("CHAT_JWT_SECRET") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/exchanges/%2F"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/queues/%2F"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/bindings/%2F"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mgmt =
+            Arc::new(crate::architecture::rabbitmq::ManagementClient::new_for_test(server.uri()));
+        let app = architecture_test_app(None, Some(mgmt));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/architecture")
+            .header("Authorization", "Bearer dev-token")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        if let Some(s) = prev_secret {
+            unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
+        }
+    }
 }

@@ -63,6 +63,23 @@ pub struct ManagementClient {
 }
 
 impl ManagementClient {
+    /// Test-only constructor: build a client pointing at an arbitrary
+    /// `base_url` (wiremock, localhost dev broker, etc.) without going
+    /// through env-var parsing.
+    #[cfg(test)]
+    pub fn new_for_test(base_url: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
+                .build()
+                .expect("test reqwest client builds"),
+            base_url: base_url.into(),
+            user: "guest".to_string(),
+            pass: "guest".to_string(),
+            vhost_encoded: "%2F".to_string(),
+        }
+    }
+
     /// Construct from env. Required: `RABBITMQ_URL` (same var the AMQP
     /// publisher reads). Optional: `RABBITMQ_MGMT_URL` to override the
     /// derived base URL (e.g. when the management plugin lives on a
