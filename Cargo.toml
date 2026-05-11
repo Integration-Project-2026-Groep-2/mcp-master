@@ -53,6 +53,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Stream-trait combinators (StreamExt::next) for lapin's Consumer.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# Server-Sent Events parser layered on top of a byte stream. Used to
+# consume Anthropic's text/event-stream responses without hand-rolling
+# the `event:`/`data:` line-grouping protocol.
+eventsource-stream = "0.2"
+
 # URL parsing for redacting userinfo (password) from RABBITMQ_URL before
 # logging. Only used for log-side scrubbing — lapin still gets the raw URL.
 url = "2"
