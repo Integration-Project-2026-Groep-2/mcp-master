@@ -55,6 +55,11 @@ pub struct AppState {
     /// (not Arc<AppState>) — keeps `Arc::try_unwrap` clean at shutdown.
     #[allow(dead_code)]
     pub approval_flow: Arc<crate::gateway::approval::flow::ApprovalFlow>,
+    /// Optional RabbitMQ management API client for the `/architecture`
+    /// endpoint. `None` when RABBITMQ_URL is unreachable / unparseable —
+    /// `/architecture` then returns 503 (skip-warn pattern, matching the
+    /// publisher).
+    pub mgmt_client: Option<Arc<crate::architecture::rabbitmq::ManagementClient>>,
 }
 
 /// Read `CHAT_APPROVAL_TTL_SECONDS` env-var; fall back to 900s (15min) on
@@ -247,6 +252,30 @@ async fn tools_catalog(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::mcp::CatalogResponse> {
     Json(state.pool.catalog())
+}
+
+/// Live integration-architecture graph for the Drupal Cytoscape page.
+/// Combines `pool.catalog()` (MCP-servers + tools) + RabbitMQ management
+/// API topology + compile-time static config. Same bearer-auth as
+/// `/tools-catalog`; not wrapped in the chat concurrency limit.
+///
+/// Returns 503 when the RabbitMQ management client failed to construct
+/// at startup (skip-warn pattern) — clients should retry after Infra
+/// restores the broker. 500 on transient mgmt-API errors.
+async fn architecture(
+    _scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::architecture::ArchitectureResponse>, Response> {
+    let Some(client) = state.mgmt_client.as_ref() else {
+        let body = Json(serde_json::json!({
+            "error": "RabbitMQ management API unavailable"
+        }));
+        return Err((StatusCode::SERVICE_UNAVAILABLE, body).into_response());
+    };
+    crate::architecture::builder::build_architecture(&state.pool, client)
+        .await
+        .map(Json)
+        .map_err(|e| AppError(e).into_response())
 }
 
 async fn chat(
@@ -718,12 +747,26 @@ pub async fn serve(
         approval_ttl(),
     ));
 
+    let mgmt_client = match crate::architecture::rabbitmq::ManagementClient::from_env() {
+        Ok(c) => {
+            tracing::info!("RabbitMQ management client ready — /architecture enabled");
+            Some(Arc::new(c))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "RabbitMQ management client unavailable: {e:#} — /architecture will return 503"
+            );
+            None
+        }
+    };
+
     let state = Arc::new(AppState {
         llm,
         pool,
         tool_specs,
         publisher: publisher_arc,
         approval_flow: approval_flow.clone(),
+        mgmt_client,
     });
     let teams_config = teams_config.map(Arc::new);
 
@@ -766,9 +809,10 @@ pub async fn serve(
     let mut approve_route = post(chat_approve);
     let mut reject_route = post(chat_reject);
     let mut tools_catalog_route = get(tools_catalog);
+    let mut architecture_route = get(architecture);
     if let Some(ref token) = bearer_token {
         tracing::info!(
-            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject + /tools-catalog"
+            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject + /tools-catalog + /architecture"
         );
         chat_route =
             chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
@@ -778,10 +822,12 @@ pub async fn serve(
             reject_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
         tools_catalog_route = tools_catalog_route
             .route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        architecture_route = architecture_route
+            .route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
     } else {
         tracing::warn!(
-            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject + /tools-catalog accept \
-             unauthenticated requests (dev-only, NOT for production)"
+            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject + /tools-catalog + /architecture \
+             accept unauthenticated requests (dev-only, NOT for production)"
         );
     }
     // Bearer is outer (added first); ConcurrencyLimit is inner (added later).
@@ -800,6 +846,7 @@ pub async fn serve(
         .route("/chat/approve", approve_route)
         .route("/chat/reject", reject_route)
         .route("/tools-catalog", tools_catalog_route)
+        .route("/architecture", architecture_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
@@ -1456,6 +1503,7 @@ mod tests {
             tool_specs: Vec::new(),
             publisher: None,
             approval_flow,
+            mgmt_client: None,
         })
     }
 

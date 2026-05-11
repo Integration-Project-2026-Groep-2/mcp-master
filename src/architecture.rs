@@ -6,13 +6,9 @@
 //! Cytoscape.js-renderable JSON payload. Drupal Frontend consumes this
 //! one-shot to draw the interactive architecture page.
 
-// Types + statics land in this commit; their consumers (builder + handler)
-// arrive in follow-up commits within the same PR. Suppress until then.
-#![allow(dead_code, unused_imports)]
-
 pub mod builder;
 pub mod dto;
 pub mod rabbitmq;
 pub mod statics;
 
-pub use dto::{ArchitectureResponse, Edge, EdgeKind, Node, NodeKind};
+pub use dto::ArchitectureResponse;

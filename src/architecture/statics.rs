@@ -27,9 +27,7 @@ pub const SERVICES: &[&str] = &[
 /// them dynamically. Updated only on deploy.
 pub struct ExternalSpec {
     pub id: &'static str,
-    #[allow(dead_code)] // read by builder in follow-up commit
     pub label: &'static str,
-    #[allow(dead_code)] // read by builder in follow-up commit
     pub url: &'static str,
 }
 
@@ -66,9 +64,7 @@ pub const EXTERNALS: &[ExternalSpec] = &[
 pub struct StaticEdge {
     pub source: &'static str,
     pub target: &'static str,
-    #[allow(dead_code)] // read by builder in follow-up commit
     pub kind: EdgeKind,
-    #[allow(dead_code)] // read by builder in follow-up commit
     pub label: Option<&'static str>,
 }
 
