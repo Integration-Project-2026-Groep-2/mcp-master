@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rmcp::{
     ServiceExt,
     model::{
@@ -19,6 +20,7 @@ use rmcp::{
     service::{RoleClient, RunningService},
     transport::StreamableHttpClientTransport,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -183,6 +185,68 @@ fn per_server_specs(server_tools: &[(String, Vec<Tool>)]) -> Vec<Vec<ToolSpec>> 
         .collect()
 }
 
+/// JSON-shaped tool description for the `/tools-catalog` endpoint.
+/// Distinct from `ToolSpec` (which is the orchestrator's internal type) so
+/// that the wire-format can evolve independently from the LLM-facing schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolSummary {
+    pub name: String,
+    pub description: String,
+    pub requires_approval: bool,
+    pub input_schema: Value,
+}
+
+/// One MCP server's entry in the catalog: identity + tool inventory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerCatalog {
+    pub label: String,
+    pub url: String,
+    pub connected: bool,
+    pub tool_count: usize,
+    pub tools: Vec<ToolSummary>,
+}
+
+/// Top-level response shape for `GET /tools-catalog`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogResponse {
+    pub servers: Vec<ServerCatalog>,
+    pub generated_at: DateTime<Utc>,
+}
+
+fn spec_to_summary(spec: &ToolSpec) -> ToolSummary {
+    ToolSummary {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        requires_approval: spec.requires_approval,
+        input_schema: spec.input_schema.clone(),
+    }
+}
+
+/// Pure assembly of `CatalogResponse` from session metadata + per-server
+/// tool lists. Extracted so tests can pass fixtures directly without
+/// constructing a real `McpPool` (which requires live MCP sessions).
+fn build_catalog(
+    sessions_meta: &[(String, String)],
+    server_tools: &[Vec<ToolSpec>],
+    generated_at: DateTime<Utc>,
+) -> CatalogResponse {
+    let servers = sessions_meta
+        .iter()
+        .zip(server_tools.iter())
+        .map(|((label, url), tools)| ServerCatalog {
+            label: label.clone(),
+            url: url.clone(),
+            connected: true,
+            tool_count: tools.len(),
+            tools: tools.iter().map(spec_to_summary).collect(),
+        })
+        .collect();
+    CatalogResponse {
+        servers,
+        generated_at,
+    }
+}
+
 /// One MCP-server session with the URL kept around so we can reopen the
 /// transport after a transient failure (SSE break, idle timeout, broker
 /// restart, etc.). The inner `RunningService` is locked behind an async
@@ -220,7 +284,6 @@ pub struct McpPool {
     /// Per-server `ToolSpec`s, parallel-indexed with `sessions`. Retained
     /// so introspection endpoints can attribute tools back to their
     /// originating server (which the flat `tool_specs` aggregate erases).
-    #[allow(dead_code)] // read by `catalog()` in the follow-up commit
     server_tools: Vec<Vec<ToolSpec>>,
 
     /// Optional event-sink for `tool_called` events on `ai.events`. Set via
@@ -326,6 +389,19 @@ impl McpPool {
     /// the orchestrator as the agent's tool surface.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tool_specs.clone()
+    }
+
+    /// Build a JSON-serializable snapshot of all connected MCP servers and
+    /// their tools, for the read-only `/tools-catalog` HTTP endpoint.
+    /// `connected` is always `true` in v1 — dead servers are dropped from
+    /// the pool at startup, so anything still here was reachable.
+    pub fn catalog(&self) -> CatalogResponse {
+        let sessions_meta: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .map(|s| (s.label.clone(), s.url.clone()))
+            .collect();
+        build_catalog(&sessions_meta, &self.server_tools, Utc::now())
     }
 
     /// Wire up an AMQP publisher so each `tool_called` event lands on
@@ -702,6 +778,76 @@ mod tests {
     #[test]
     fn per_server_specs_handles_empty_input() {
         assert!(per_server_specs(&[]).is_empty());
+    }
+
+    fn spec(name: &str, requires_approval: bool) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: format!("description of {name}"),
+            input_schema: json!({"type": "object", "properties": {}}),
+            requires_approval,
+        }
+    }
+
+    #[test]
+    fn build_catalog_emits_one_entry_per_session() {
+        let sessions_meta = vec![
+            ("crm".into(), "http://crm:7001/mcp".into()),
+            ("controlroom".into(), "http://controlroom:5555/mcp".into()),
+        ];
+        let server_tools = vec![
+            vec![spec("search_contact", false), spec("get_contact", false)],
+            vec![spec("error_analysis", false)],
+        ];
+        let now = Utc::now();
+
+        let cat = build_catalog(&sessions_meta, &server_tools, now);
+
+        assert_eq!(cat.servers.len(), 2);
+        assert_eq!(cat.servers[0].label, "crm");
+        assert_eq!(cat.servers[0].url, "http://crm:7001/mcp");
+        assert!(cat.servers[0].connected);
+        assert_eq!(cat.servers[0].tool_count, 2);
+        assert_eq!(cat.servers[0].tools[0].name, "search_contact");
+        assert_eq!(cat.servers[1].label, "controlroom");
+        assert_eq!(cat.servers[1].tool_count, 1);
+        assert_eq!(cat.generated_at, now);
+    }
+
+    #[test]
+    fn build_catalog_preserves_requires_approval_per_tool() {
+        let sessions_meta = vec![("crm".into(), "http://crm:7001/mcp".into())];
+        let server_tools = vec![vec![
+            spec("search_contact", false),
+            spec("create_contact", true),
+        ]];
+
+        let cat = build_catalog(&sessions_meta, &server_tools, Utc::now());
+
+        assert!(!cat.servers[0].tools[0].requires_approval);
+        assert!(cat.servers[0].tools[1].requires_approval);
+    }
+
+    #[test]
+    fn build_catalog_handles_empty_pool() {
+        let cat = build_catalog(&[], &[], Utc::now());
+        assert!(cat.servers.is_empty());
+    }
+
+    #[test]
+    fn catalog_response_serde_roundtrips() {
+        let now = Utc::now();
+        let cat = build_catalog(
+            &[("crm".into(), "http://crm:7001/mcp".into())],
+            &[vec![spec("search_contact", false)]],
+            now,
+        );
+
+        let json = serde_json::to_string(&cat).expect("serializes");
+        let parsed: CatalogResponse = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(parsed.servers, cat.servers);
+        // DateTime round-trip preserves the instant; equality must hold.
+        assert_eq!(parsed.generated_at, cat.generated_at);
     }
 
     #[test]
