@@ -110,8 +110,13 @@ pub enum ProgressEvent {
         iterations: u32,
         correlation_id: String,
     },
+    /// Terminal failure event. `message` is intentionally opaque — full
+    /// error context goes to `tracing::error!` server-side with the same
+    /// `correlation_id`, mirroring `AppError::into_response`'s v1.1
+    /// hardening so SSE doesn't regress the opaque-error invariant.
     Error {
         message: String,
+        correlation_id: String,
     },
 }
 
@@ -420,9 +425,15 @@ pub async fn run_with_messages_in_mode_streaming(
                     break;
                 }
                 Err(e) => {
+                    tracing::error!(
+                        correlation_id = %ctx.correlation_id,
+                        error = ?e,
+                        "streaming error from llm.stream_chat",
+                    );
                     let _ = tx
                         .send(ProgressEvent::Error {
-                            message: format!("{e:#}"),
+                            message: "internal error".into(),
+                            correlation_id: ctx.correlation_id.clone(),
                         })
                         .await;
                     return Err(e);
@@ -473,6 +484,7 @@ pub async fn run_with_messages_in_mode_streaming(
                     let _ = tx
                         .send(ProgressEvent::Error {
                             message: msg.clone(),
+                            correlation_id: ctx.correlation_id.clone(),
                         })
                         .await;
                     bail!(msg);
@@ -591,6 +603,7 @@ pub async fn run_with_messages_in_mode_streaming(
                 let _ = tx
                     .send(ProgressEvent::Error {
                         message: msg.clone(),
+                        correlation_id: ctx.correlation_id.clone(),
                     })
                     .await;
                 bail!(msg);
@@ -602,6 +615,7 @@ pub async fn run_with_messages_in_mode_streaming(
     let _ = tx
         .send(ProgressEvent::Error {
             message: msg.clone(),
+            correlation_id: ctx.correlation_id.clone(),
         })
         .await;
     bail!(msg);
@@ -1876,8 +1890,15 @@ mod tests {
 
         assert!(matches!(events[0], ProgressEvent::TextChunk { .. }));
         match &events[1] {
-            ProgressEvent::Error { message } => {
-                assert!(message.contains("transport error"), "got: {message}");
+            ProgressEvent::Error {
+                message,
+                correlation_id,
+            } => {
+                // Wire body must be opaque per v1.1 hardening — the
+                // "transport error" substring is the *anyhow* context
+                // chain we want to keep server-side-only.
+                assert_eq!(message, "internal error");
+                assert_eq!(correlation_id, &ctx.correlation_id);
             }
             other => panic!("expected Error, got {other:?}"),
         }

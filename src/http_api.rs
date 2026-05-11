@@ -1665,6 +1665,7 @@ mod tests {
             (
                 ProgressEvent::Error {
                     message: "boom".into(),
+                    correlation_id: "c".into(),
                 },
                 "error",
             ),
