@@ -508,6 +508,7 @@ fn progress_event_name(ev: &ProgressEvent) -> &'static str {
 async fn chat_stream(
     scope: crate::gateway::auth::AuthScope,
     State(state): State<Arc<AppState>>,
+    axum::Extension(shutdown_rx): axum::Extension<watch::Receiver<bool>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<
@@ -585,73 +586,93 @@ async fn chat_stream(
         let mut iterations: u32 = 0;
         let mut succeeded = true;
         let mut timed_out = false;
+        let mut shutdown_aborted = false;
 
-        // Wallclock cap on the entire streaming run. TimeoutLayer is
-        // intentionally NOT on /chat/stream (would kill long but
-        // legitimate tool-cascades), so this is the hard bound that
-        // prevents a slow-loris upstream from pinning a concurrency
-        // slot forever. 600s comfortably exceeds the longest observed
-        // CRM-cascade (~3-4 min) while bounding DoS surface.
-        let accumulator = async {
-            while let Some(ev) = orch_rx.recv().await {
-                match &ev {
-                    ProgressEvent::TextChunk { text } => answer.push_str(text),
-                    ProgressEvent::ToolCallCompleted {
-                        name,
-                        ok,
-                        ms,
-                        status,
-                        action_id,
-                    } => {
-                        tool_trace.push(serde_json::json!({
-                            "tool": name,
-                            "ok": ok,
-                            "ms": ms,
-                            "status": status,
-                            "action_id": action_id,
-                        }));
+        // Three-way race: orchestrator events, hard deadline (DoS bound
+        // when no TimeoutLayer applies), graceful shutdown signal. The
+        // deadline + shutdown branches both abort the inner orch_handle
+        // so Anthropic billing stops as soon as one fires.
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(STREAM_DEADLINE_SECS));
+        tokio::pin!(deadline);
+        let mut shutdown_rx = shutdown_rx;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        tracing::info!(
+                            correlation_id = %correlation_id_pub,
+                            "/chat/stream aborting on shutdown signal",
+                        );
+                        shutdown_aborted = true;
+                        succeeded = false;
+                        break;
                     }
-                    ProgressEvent::Done {
-                        tokens: t,
-                        iterations: i,
-                        ..
-                    } => {
-                        tokens = t.clone();
-                        iterations = *i;
-                    }
-                    ProgressEvent::Error { .. } => succeeded = false,
-                    _ => {}
                 }
-                let _ = sse_tx.send(ev).await;
-            }
-        };
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(STREAM_DEADLINE_SECS),
-            accumulator,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(_elapsed) => {
-                tracing::warn!(
-                    correlation_id = %correlation_id_pub,
-                    elapsed_secs = STREAM_DEADLINE_SECS,
-                    "/chat/stream wallclock timeout — aborting orchestrator",
-                );
-                orch_handle.abort();
-                timed_out = true;
-                succeeded = false;
-                let _ = sse_tx
-                    .send(ProgressEvent::Error {
-                        message: "stream timeout".into(),
-                        correlation_id: correlation_id_pub.clone(),
-                    })
-                    .await;
+                _ = &mut deadline => {
+                    tracing::warn!(
+                        correlation_id = %correlation_id_pub,
+                        elapsed_secs = STREAM_DEADLINE_SECS,
+                        "/chat/stream wallclock timeout — aborting orchestrator",
+                    );
+                    timed_out = true;
+                    succeeded = false;
+                    break;
+                }
+                recv = orch_rx.recv() => {
+                    match recv {
+                        Some(ev) => {
+                            match &ev {
+                                ProgressEvent::TextChunk { text } => answer.push_str(text),
+                                ProgressEvent::ToolCallCompleted {
+                                    name,
+                                    ok,
+                                    ms,
+                                    status,
+                                    action_id,
+                                } => {
+                                    tool_trace.push(serde_json::json!({
+                                        "tool": name,
+                                        "ok": ok,
+                                        "ms": ms,
+                                        "status": status,
+                                        "action_id": action_id,
+                                    }));
+                                }
+                                ProgressEvent::Done {
+                                    tokens: t,
+                                    iterations: i,
+                                    ..
+                                } => {
+                                    tokens = t.clone();
+                                    iterations = *i;
+                                }
+                                ProgressEvent::Error { .. } => succeeded = false,
+                                _ => {}
+                            }
+                            let _ = sse_tx.send(ev).await;
+                        }
+                        None => break,
+                    }
+                }
             }
         }
 
-        if !timed_out && let Ok(Err(_)) = orch_handle.await {
+        if timed_out || shutdown_aborted {
+            orch_handle.abort();
+            let msg = if shutdown_aborted {
+                "stream aborted by shutdown"
+            } else {
+                "stream timeout"
+            };
+            let _ = sse_tx
+                .send(ProgressEvent::Error {
+                    message: msg.into(),
+                    correlation_id: correlation_id_pub.clone(),
+                })
+                .await;
+        } else if let Ok(Err(_)) = orch_handle.await {
             succeeded = false;
         }
 
@@ -670,6 +691,7 @@ async fn chat_stream(
                 "succeeded": succeeded,
                 "streamed": true,
                 "timed_out": timed_out,
+                "shutdown_aborted": shutdown_aborted,
             });
             if let Err(e) = publisher.publish_event("chat_completed", payload).await {
                 tracing::warn!("failed to publish chat_completed event from stream: {e:#}");
@@ -1029,6 +1051,10 @@ pub async fn serve(
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(build_cors_layer()?)
+        // chat_stream pulls this via Extension<watch::Receiver<bool>> so the
+        // spawned orchestrator task can abort cleanly on SIGTERM instead of
+        // running to natural completion while the runtime drains.
+        .layer(axum::Extension(shutdown_rx.clone()))
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
