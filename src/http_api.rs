@@ -237,6 +237,18 @@ async fn metrics() -> (StatusCode, &'static str) {
     (StatusCode::NOT_IMPLEMENTED, "not implemented")
 }
 
+/// Read-only introspection of the MCP server pool — labels, URLs, and the
+/// tools each server exposes. Gated by the same Bearer-auth as `/chat`
+/// (via the `AuthScope` extractor + optional `BearerAuth` route-layer).
+/// Not wrapped in the chat concurrency limit — cheap, stateless, fine to
+/// answer in parallel with active chats.
+async fn tools_catalog(
+    _scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::mcp::CatalogResponse> {
+    Json(state.pool.catalog())
+}
+
 async fn chat(
     scope: crate::gateway::auth::AuthScope,
     State(state): State<Arc<AppState>>,
@@ -753,9 +765,10 @@ pub async fn serve(
     let mut chat_route = post(chat);
     let mut approve_route = post(chat_approve);
     let mut reject_route = post(chat_reject);
+    let mut tools_catalog_route = get(tools_catalog);
     if let Some(ref token) = bearer_token {
         tracing::info!(
-            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject"
+            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject + /tools-catalog"
         );
         chat_route =
             chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
@@ -763,10 +776,12 @@ pub async fn serve(
             approve_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
         reject_route =
             reject_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        tools_catalog_route = tools_catalog_route
+            .route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
     } else {
         tracing::warn!(
-            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject accept unauthenticated \
-             requests (dev-only, NOT for production)"
+            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject + /tools-catalog accept \
+             unauthenticated requests (dev-only, NOT for production)"
         );
     }
     // Bearer is outer (added first); ConcurrencyLimit is inner (added later).
@@ -774,6 +789,8 @@ pub async fn serve(
     // GlobalConcurrencyLimit shares one Arc<Semaphore> across all per-request
     // service clones; the non-global variant builds a fresh semaphore per
     // Layer::layer() call → no actual capping.
+    // /tools-catalog is intentionally NOT in the chat concurrency pool:
+    // read-only, cheap, no LLM cost — should not contend with active chats.
     chat_route = chat_route.route_layer(chat_concurrency.clone());
     approve_route = approve_route.route_layer(chat_concurrency.clone());
     reject_route = reject_route.route_layer(chat_concurrency);
@@ -782,6 +799,7 @@ pub async fn serve(
         .route("/chat", chat_route)
         .route("/chat/approve", approve_route)
         .route("/chat/reject", reject_route)
+        .route("/tools-catalog", tools_catalog_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
