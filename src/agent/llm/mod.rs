@@ -10,6 +10,7 @@
 
 pub mod anthropic;
 
+use futures_util::stream::{self, BoxStream};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -123,6 +124,48 @@ pub enum StopReason {
     Other(String),
 }
 
+/// Provider-agnostic streaming event yielded by `LlmClient::stream_chat`.
+///
+/// Mirrors the conceptual deltas of Anthropic's SSE format but stays
+/// vendor-neutral so OpenAI/Ollama impls can map their own protocols here.
+/// The terminal `Done` event carries the *reassembled* `full_content`
+/// — the orchestrator feeds it back into the next iteration unchanged,
+/// preserving `Thinking { signature }` byte-for-byte (Anthropic rejects
+/// the next call otherwise) and the parsed `ToolUse.input` JSON.
+#[allow(dead_code)] // reachable via orchestrator streaming variant (PR3 in this stack)
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEvent {
+    /// Incremental text-block bytes from the assistant's visible answer.
+    TextDelta(String),
+    /// Assistant has begun a `ToolUse` block; subsequent `ToolUseDelta`
+    /// fragments belong to this `id` until `ToolUseStop`.
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    /// One `input_json_delta`-style fragment. Cannot be parsed in isolation;
+    /// consumers must accumulate per `id` and parse once on `ToolUseStop`.
+    ToolUseDelta {
+        id: String,
+        partial_json: String,
+    },
+    ToolUseStop {
+        id: String,
+    },
+    /// Incremental extended-thinking text. Signature arrives separately and
+    /// only ends up in `Done.full_content`'s `Thinking { signature }` block.
+    ThinkingDelta(String),
+    /// Terminal event. Always emitted exactly once at the end of a successful
+    /// stream. `full_content` is the orchestrator-feedable assistant turn
+    /// reconstructed from the deltas plus any non-streamed blocks
+    /// (e.g. `RedactedThinking`).
+    Done {
+        stop_reason: StopReason,
+        usage: Option<TokenUsage>,
+        full_content: Vec<ContentBlock>,
+    },
+}
+
 /// Provider-agnostic LLM client.
 ///
 /// `Send + Sync` so trait objects (`&dyn LlmClient`) can cross `.await`
@@ -143,6 +186,31 @@ pub trait LlmClient: Send + Sync {
         tools: &[ToolSpec],
         max_tokens: u32,
     ) -> anyhow::Result<ChatResponse>;
+
+    /// Streaming counterpart of `chat`. Returns a boxed `Stream` so the
+    /// trait remains object-safe behind `&dyn LlmClient` and the returned
+    /// stream can be moved across `tokio::spawn`.
+    ///
+    /// The default implementation drains `chat` and emits a single terminal
+    /// `Done` event — providers without native streaming (e.g. a future
+    /// Ollama impl) opt into this path for free. Providers that do speak
+    /// SSE (Anthropic) override to forward token-level deltas.
+    #[allow(dead_code)] // reachable via orchestrator streaming variant (PR3 in this stack)
+    async fn stream_chat(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        max_tokens: u32,
+    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamEvent>>> {
+        let resp = self.chat(system, messages, tools, max_tokens).await?;
+        let event = StreamEvent::Done {
+            stop_reason: resp.stop_reason,
+            usage: resp.usage,
+            full_content: resp.content,
+        };
+        Ok(Box::pin(stream::once(async move { Ok(event) })))
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +230,7 @@ pub mod tests {
     /// Test double: pops responses from a queue in order, records calls.
     pub struct MockLlmClient {
         responses: Mutex<Vec<ChatResponse>>,
+        streams: Mutex<Vec<Vec<StreamEvent>>>,
         calls: Mutex<Vec<MockCall>>,
     }
 
@@ -169,8 +238,17 @@ pub mod tests {
         pub fn new(responses: Vec<ChatResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                streams: Mutex::new(Vec::new()),
                 calls: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Queue a custom event sequence for the next `stream_chat` call.
+        /// When no stream is queued, `stream_chat` falls back to the trait
+        /// default — `chat` + a single `Done` event.
+        #[allow(dead_code)] // exercised from orchestrator tests via stream pathway
+        pub async fn queue_stream(&self, events: Vec<StreamEvent>) {
+            self.streams.lock().await.push(events);
         }
 
         pub async fn calls(&self) -> Vec<MockCall> {
@@ -197,6 +275,38 @@ pub mod tests {
             }
             Ok(q.remove(0))
         }
+
+        async fn stream_chat(
+            &self,
+            system: &str,
+            messages: &[Message],
+            tools: &[ToolSpec],
+            max_tokens: u32,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamEvent>>> {
+            let queued = {
+                let mut q = self.streams.lock().await;
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            };
+            if let Some(events) = queued {
+                self.calls.lock().await.push(MockCall {
+                    system: system.to_string(),
+                    messages: messages.to_vec(),
+                });
+                let items: Vec<anyhow::Result<StreamEvent>> = events.into_iter().map(Ok).collect();
+                return Ok(Box::pin(stream::iter(items)));
+            }
+            let resp = self.chat(system, messages, tools, max_tokens).await?;
+            let event = StreamEvent::Done {
+                stop_reason: resp.stop_reason,
+                usage: resp.usage,
+                full_content: resp.content,
+            };
+            Ok(Box::pin(stream::once(async move { Ok(event) })))
+        }
     }
 
     // Orchestrator tests live next to the orchestrator (in src/orchestrator.rs)
@@ -222,6 +332,62 @@ pub mod tests {
         assert_eq!(a.output, 80);
         assert_eq!(a.cache_creation_input, None);
         assert_eq!(a.cache_read_input, None);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_default_impl_emits_single_done_event() {
+        use futures_util::StreamExt;
+        let response = ChatResponse {
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+            stop_reason: StopReason::EndTurn,
+            usage: Some(TokenUsage {
+                input: 7,
+                output: 2,
+                cache_creation_input: None,
+                cache_read_input: None,
+            }),
+        };
+        let mock = MockLlmClient::new(vec![response.clone()]);
+        let mut s = mock.stream_chat("sys", &[], &[], 1024).await.unwrap();
+        let first = s.next().await.expect("event").unwrap();
+        match first {
+            StreamEvent::Done {
+                stop_reason,
+                usage,
+                full_content,
+            } => {
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                assert_eq!(usage, response.usage);
+                assert_eq!(full_content, response.content);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        assert!(s.next().await.is_none(), "stream should terminate");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_queued_stream_emits_events_in_order() {
+        use futures_util::StreamExt;
+        let events = vec![
+            StreamEvent::TextDelta("Hel".into()),
+            StreamEvent::TextDelta("lo".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            },
+        ];
+        let mock = MockLlmClient::new(vec![]);
+        mock.queue_stream(events.clone()).await;
+
+        let mut s = mock.stream_chat("sys", &[], &[], 1024).await.unwrap();
+        let mut got = Vec::new();
+        while let Some(item) = s.next().await {
+            got.push(item.unwrap());
+        }
+        assert_eq!(got, events);
     }
 
     #[test]
