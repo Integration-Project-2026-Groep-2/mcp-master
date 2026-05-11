@@ -734,17 +734,14 @@ fn parse_cors_allow_list(strict: bool, csv: Option<&str>) -> Result<CorsLayer> {
     match parsed {
         Ok(origins) if !origins.is_empty() => {
             tracing::info!(count = origins.len(), "CORS locked to allow-list");
-            // Cache-Control + Last-Event-ID needed for SSE clients (browser
-            // EventSource sends Last-Event-ID on reconnect; some clients
-            // surface Cache-Control to opt out of intermediate proxies).
+            // Cache-Control is whitelisted for SSE clients that ask intermediate
+            // proxies not to buffer. Last-Event-ID is intentionally NOT advertised:
+            // the handler has no resume store, so promising the header is capability
+            // we can't honor — add it back once we wire actual replay.
             Ok(CorsLayer::new()
                 .allow_origin(origins)
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers([
-                    CONTENT_TYPE,
-                    axum::http::header::CACHE_CONTROL,
-                    axum::http::HeaderName::from_static("last-event-id"),
-                ]))
+                .allow_headers([CONTENT_TYPE, axum::http::header::CACHE_CONTROL]))
         }
         Ok(_) if strict => {
             bail!("CHAT_ALLOWED_ORIGINS contained no usable origins under CHAT_CORS_STRICT=true")
