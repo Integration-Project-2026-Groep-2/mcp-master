@@ -1440,4 +1440,116 @@ mod tests {
         assert_eq!(v["iterations"], 2);
         assert_eq!(v["correlation_id"], "abc-123");
     }
+
+    fn tools_catalog_test_state() -> Arc<AppState> {
+        use crate::gateway::approval::flow::ApprovalFlow;
+        use crate::gateway::approval::state::ApprovalStore;
+        use crate::gateway::audit::AuditPublisher;
+        use std::time::Duration;
+
+        let store = Arc::new(ApprovalStore::new(Duration::from_secs(900)));
+        let audit = Arc::new(AuditPublisher::new(None));
+        let approval_flow = Arc::new(ApprovalFlow::new(store, audit, Duration::from_secs(900)));
+        Arc::new(AppState {
+            llm: AnthropicClient::new("test-key-unused".into()),
+            pool: crate::mcp::McpPool::empty_for_test(),
+            tool_specs: Vec::new(),
+            publisher: None,
+            approval_flow,
+        })
+    }
+
+    fn tools_catalog_test_app(token: Option<&str>) -> Router {
+        let state = tools_catalog_test_state();
+        let mut route = get(tools_catalog);
+        if let Some(t) = token {
+            route = route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(t)));
+        }
+        Router::new()
+            .route("/tools-catalog", route)
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tools_catalog_returns_empty_servers_in_skip_warn_mode() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Skip-warn: CHAT_JWT_SECRET unset → AuthScope extractor still requires
+        // a Bearer header (it just accepts ANY non-empty token as scope=Read).
+        let prev_secret = std::env::var("CHAT_JWT_SECRET").ok();
+        unsafe { std::env::remove_var("CHAT_JWT_SECRET") };
+
+        let app = tools_catalog_test_app(None);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/tools-catalog")
+            .header("Authorization", "Bearer dev-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let bytes = to_bytes(res.into_body(), 8192).await.unwrap();
+        let cat: crate::mcp::CatalogResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(cat.servers.is_empty());
+
+        if let Some(s) = prev_secret {
+            unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tools_catalog_rejects_missing_bearer_when_wrapped() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let prev_secret = std::env::var("CHAT_JWT_SECRET").ok();
+        unsafe { std::env::remove_var("CHAT_JWT_SECRET") };
+
+        let app = tools_catalog_test_app(Some("secret"));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/tools-catalog")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        if let Some(s) = prev_secret {
+            unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tools_catalog_rejects_malformed_bearer_with_401_not_500() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let prev_secret = std::env::var("CHAT_JWT_SECRET").ok();
+        unsafe { std::env::remove_var("CHAT_JWT_SECRET") };
+
+        let app = tools_catalog_test_app(Some("secret"));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/tools-catalog")
+            .header("Authorization", "NotBearer secret")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        if let Some(s) = prev_secret {
+            unsafe { std::env::set_var("CHAT_JWT_SECRET", s) };
+        }
+    }
 }

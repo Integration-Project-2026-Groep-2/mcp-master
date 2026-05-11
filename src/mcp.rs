@@ -404,6 +404,20 @@ impl McpPool {
         build_catalog(&sessions_meta, &self.server_tools, Utc::now())
     }
 
+    /// Test-only: build an empty pool with no live MCP sessions. Used by
+    /// HTTP integration tests that need an `AppState` without paying for
+    /// real MCP-server connections.
+    #[cfg(test)]
+    pub fn empty_for_test() -> Self {
+        Self {
+            sessions: Vec::new(),
+            tool_to_session_idx: HashMap::new(),
+            tool_specs: Vec::new(),
+            server_tools: Vec::new(),
+            publisher: None,
+        }
+    }
+
     /// Wire up an AMQP publisher so each `tool_called` event lands on
     /// `ai.events`. Call before the pool is shared via `Arc<AppState>`.
     pub fn attach_publisher(&mut self, publisher: Arc<Publisher>) {
