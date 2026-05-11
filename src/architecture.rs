@@ -11,6 +11,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod dto;
+pub mod rabbitmq;
 pub mod statics;
 
 pub use dto::{ArchitectureResponse, Edge, EdgeKind, Node, NodeKind};
