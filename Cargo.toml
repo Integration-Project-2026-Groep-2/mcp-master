@@ -25,7 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Anthropic Messages API transport. rustls + json only, no native TLS,
 # matches rmcp's TLS choice and keeps the binary distroless-ready.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # Async fn in trait objects (`&dyn LlmClient`) on stable Rust without
 # Send/Sync friction. Desugars to `Box<dyn Future + Send>`.
@@ -52,6 +52,16 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Stream-trait combinators (StreamExt::next) for lapin's Consumer.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Server-Sent Events parser layered on top of a byte stream. Used to
+# consume Anthropic's text/event-stream responses without hand-rolling
+# the `event:`/`data:` line-grouping protocol.
+eventsource-stream = "0.2"
+
+# Stateful stream translators via the `try_stream!` macro — keeps the
+# Anthropic SSE-to-StreamEvent decoder linear instead of hand-rolling
+# a Stream impl with a manual state machine.
+async-stream = "0.3"
 
 # URL parsing for redacting userinfo (password) from RABBITMQ_URL before
 # logging. Only used for log-side scrubbing — lapin still gets the raw URL.

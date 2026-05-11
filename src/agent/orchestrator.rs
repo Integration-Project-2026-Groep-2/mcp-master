@@ -6,11 +6,15 @@
 
 use anyhow::bail;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use futures_util::future::try_join_all;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
-use crate::agent::llm::{ContentBlock, LlmClient, Message, Role, StopReason, TokenUsage, ToolSpec};
+use crate::agent::llm::{
+    ContentBlock, LlmClient, Message, Role, StopReason, StreamEvent, TokenUsage, ToolSpec,
+};
 use crate::agent::modes::{
     AgentMode, DispatchContext, ReadOnlyMode, build_blocked_read_only_result,
 };
@@ -54,6 +58,66 @@ pub struct RunOutcome {
     pub tool_trace: Vec<ToolCallTrace>,
     pub tokens: TokenUsage,
     pub iterations: u32,
+}
+
+/// Higher-level events emitted by [`run_with_messages_in_mode_streaming`] over
+/// an `mpsc::Sender` so the HTTP handler (PR4) can forward them as SSE.
+///
+/// `Thinking` / `TextChunk` are forwarded straight from the provider's
+/// `StreamEvent` deltas; `ToolCallStarted` / `ToolCallCompleted` /
+/// `ApprovalPending` are synthesised at the orchestrator-level boundary so
+/// the client sees a coherent "thought → tool call → answer" narrative
+/// without having to track provider-level block indices.
+///
+/// `Done` is terminal — always sent exactly once at the end of a successful
+/// run, carrying the totals so a single trailing event closes the stream.
+/// `Error` is also terminal on the failure path.
+///
+/// `args_preview` is intentionally absent on `ToolCallStarted`: tool args
+/// may contain GDPR data (VATs, emails, names) per `HTTP_API.md §1`. UI
+/// renders the tool name; full args remain audit-feed-only.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+#[allow(dead_code)] // reachable via /chat/stream HTTP route in PR4
+pub enum ProgressEvent {
+    Thinking {
+        text: String,
+    },
+    TextChunk {
+        text: String,
+    },
+    ToolCallStarted {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+    },
+    ToolCallCompleted {
+        name: String,
+        ok: bool,
+        ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action_id: Option<String>,
+    },
+    ApprovalPending {
+        action_id: String,
+        tool: String,
+        server: String,
+    },
+    Done {
+        tokens: TokenUsage,
+        iterations: u32,
+        correlation_id: String,
+    },
+    /// Terminal failure event. `message` is intentionally opaque — full
+    /// error context goes to `tracing::error!` server-side with the same
+    /// `correlation_id`, mirroring `AppError::into_response`'s v1.1
+    /// hardening so SSE doesn't regress the opaque-error invariant.
+    Error {
+        message: String,
+        correlation_id: String,
+    },
 }
 
 /// MCP tool dispatcher. Trait so the orchestrator is testable without
@@ -288,6 +352,273 @@ pub async fn run_with_messages_in_mode(
     }
 
     bail!("tool-call loop exceeded {max_iterations} iterations");
+}
+
+/// Streaming counterpart of [`run_with_messages_in_mode`]. Same tool-loop
+/// semantics, but every LLM call goes through `stream_chat` and per-delta
+/// progress is forwarded on `tx` so the HTTP layer can stream SSE events
+/// to the client without buffering the full answer first.
+///
+/// Returns `Ok(())` on natural completion (terminal `Done` event already
+/// sent on `tx`); `Err` only on fundamental failures the HTTP layer needs
+/// to surface as a 5xx. Send-errors on `tx` (client disconnect) are
+/// logged and ignored — the orchestrator runs the iteration to completion
+/// so partial state isn't left dangling.
+///
+/// On approval-pending: emits `ApprovalPending` + terminal `Done` and
+/// returns `Ok(())`. Client restarts a new `/chat/stream` after
+/// `/chat/approve`. This matches R2's request/response approval semantics
+/// — orchestrator-state is not persisted across HTTP calls.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // reachable via /chat/stream HTTP route in PR4
+pub async fn run_with_messages_in_mode_streaming(
+    mut messages: Vec<Message>,
+    system_prompt: &str,
+    llm: &dyn LlmClient,
+    mcp: &dyn McpExecutor,
+    tool_specs: &[ToolSpec],
+    max_iterations: usize,
+    max_tokens: u32,
+    mode: &AgentMode,
+    ctx: &DispatchContext,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> anyhow::Result<()> {
+    let mut tokens = TokenUsage::default();
+
+    for iteration in 0..max_iterations {
+        // Drain one streaming round. The provider's translator (PR2) emits
+        // exactly one terminal `Done` event per call carrying the
+        // reassembled `full_content` (thinking signatures byte-identical,
+        // tool_use input JSON parsed once), `stop_reason`, and `usage`.
+        let mut stream = llm
+            .stream_chat(system_prompt, &messages, tool_specs, max_tokens)
+            .await?;
+
+        let mut full_content: Vec<ContentBlock> = Vec::new();
+        let mut stop_reason = StopReason::Other("stream_ended_without_done".into());
+
+        while let Some(event_result) = stream.next().await {
+            match event_result {
+                Ok(StreamEvent::TextDelta(text)) => {
+                    let _ = tx.send(ProgressEvent::TextChunk { text }).await;
+                }
+                Ok(StreamEvent::ThinkingDelta(text)) => {
+                    let _ = tx.send(ProgressEvent::Thinking { text }).await;
+                }
+                Ok(StreamEvent::ToolUseStart { .. })
+                | Ok(StreamEvent::ToolUseDelta { .. })
+                | Ok(StreamEvent::ToolUseStop { .. }) => {
+                    // Provider-level deltas — the orchestrator emits the
+                    // higher-level ToolCallStarted from the aggregated
+                    // tool_use blocks in `full_content` instead.
+                }
+                Ok(StreamEvent::Done {
+                    stop_reason: sr,
+                    usage,
+                    full_content: fc,
+                }) => {
+                    if let Some(u) = usage {
+                        tokens.add(&u);
+                    }
+                    stop_reason = sr;
+                    full_content = fc;
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        correlation_id = %ctx.correlation_id,
+                        error = ?e,
+                        "streaming error from llm.stream_chat",
+                    );
+                    let _ = tx
+                        .send(ProgressEvent::Error {
+                            message: "internal error".into(),
+                            correlation_id: ctx.correlation_id.clone(),
+                        })
+                        .await;
+                    return Err(e);
+                }
+            }
+        }
+
+        match stop_reason {
+            StopReason::EndTurn => {
+                let _ = tx
+                    .send(ProgressEvent::Done {
+                        tokens,
+                        iterations: iteration as u32 + 1,
+                        correlation_id: ctx.correlation_id.clone(),
+                    })
+                    .await;
+                return Ok(());
+            }
+            StopReason::MaxTokens => {
+                tracing::warn!(
+                    iteration,
+                    "anthropic max_tokens hit; closing stream with partial response"
+                );
+                let _ = tx
+                    .send(ProgressEvent::Done {
+                        tokens,
+                        iterations: iteration as u32 + 1,
+                        correlation_id: ctx.correlation_id.clone(),
+                    })
+                    .await;
+                return Ok(());
+            }
+            StopReason::ToolUse => {
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: full_content.clone(),
+                });
+
+                let tool_calls: Vec<(String, String, Value)> = full_content
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+                        _ => None,
+                    })
+                    .collect();
+                if tool_calls.is_empty() {
+                    let msg = "stop_reason=tool_use but no tool_use blocks found".to_string();
+                    let _ = tx
+                        .send(ProgressEvent::Error {
+                            message: msg.clone(),
+                            correlation_id: ctx.correlation_id.clone(),
+                        })
+                        .await;
+                    bail!(msg);
+                }
+
+                // Surface each upcoming dispatch before we kick off the
+                // parallel join — the UI can render "Calling tool: X" in
+                // the order the assistant requested.
+                for (_, name, _) in &tool_calls {
+                    let _ = tx
+                        .send(ProgressEvent::ToolCallStarted {
+                            name: name.clone(),
+                            server: mcp.server_label_for(name),
+                        })
+                        .await;
+                }
+
+                let tool_futs = tool_calls.into_iter().map(|(id, name, input)| async move {
+                    let requires_approval = tool_specs
+                        .iter()
+                        .find(|s| s.name == name)
+                        .map(|s| s.requires_approval)
+                        .unwrap_or(false);
+                    let (result, trace) = match (mode, requires_approval) {
+                        (AgentMode::ReadOnly(_), true) => {
+                            let server_label = mcp
+                                .server_label_for(&name)
+                                .unwrap_or_else(|| "<unknown>".into());
+                            build_blocked_read_only_result(&name, &server_label)
+                        }
+                        (AgentMode::ReadOnly(m), false) => {
+                            m.dispatch_read_tool(mcp, &name, input).await?
+                        }
+                        (AgentMode::Actionable(m), false) => {
+                            m.dispatch_read_tool(mcp, &name, input).await?
+                        }
+                        (AgentMode::Actionable(m), true) => {
+                            m.dispatch_write_tool(mcp, ctx, &name, input).await?
+                        }
+                    };
+                    let block = ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content: result,
+                        is_error: !trace.ok,
+                    };
+                    Ok::<(ContentBlock, ToolCallTrace), anyhow::Error>((block, trace))
+                });
+                let outputs: Vec<(ContentBlock, ToolCallTrace)> = try_join_all(tool_futs).await?;
+
+                let mut pending: Option<(String, String, String)> = None;
+                for (_, trace) in &outputs {
+                    let _ = tx
+                        .send(ProgressEvent::ToolCallCompleted {
+                            name: trace.tool.clone(),
+                            ok: trace.ok,
+                            ms: trace.ms,
+                            status: trace.status.clone(),
+                            action_id: trace.action_id.clone(),
+                        })
+                        .await;
+                    if trace.status.as_deref() == Some("pending")
+                        && pending.is_none()
+                        && let Some(action_id) = &trace.action_id
+                    {
+                        pending =
+                            Some((action_id.clone(), trace.tool.clone(), trace.server.clone()));
+                    }
+                }
+
+                if let Some((action_id, tool, server)) = pending {
+                    let _ = tx
+                        .send(ProgressEvent::ApprovalPending {
+                            action_id,
+                            tool,
+                            server,
+                        })
+                        .await;
+                    let _ = tx
+                        .send(ProgressEvent::Done {
+                            tokens,
+                            iterations: iteration as u32 + 1,
+                            correlation_id: ctx.correlation_id.clone(),
+                        })
+                        .await;
+                    return Ok(());
+                }
+
+                let (results, _traces): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
+                messages.push(Message {
+                    role: Role::User,
+                    content: results,
+                });
+            }
+            StopReason::Other(ref s) if s == "premature_close" => {
+                // Anthropic closed the connection without `message_stop`.
+                // The provider-side translator has already finalised any
+                // partially-built blocks and the user already saw the text
+                // deltas. Close the stream gracefully with a terminal Done
+                // — no iteration, no follow-up call (which would 400 on
+                // malformed signatures anyway).
+                tracing::warn!(
+                    correlation_id = %ctx.correlation_id,
+                    "anthropic stream closed prematurely; flushing partial response",
+                );
+                let _ = tx
+                    .send(ProgressEvent::Done {
+                        tokens,
+                        iterations: iteration as u32 + 1,
+                        correlation_id: ctx.correlation_id.clone(),
+                    })
+                    .await;
+                return Ok(());
+            }
+            StopReason::Other(s) => {
+                let msg = format!("unexpected stop_reason: {s}");
+                let _ = tx
+                    .send(ProgressEvent::Error {
+                        message: msg.clone(),
+                        correlation_id: ctx.correlation_id.clone(),
+                    })
+                    .await;
+                bail!(msg);
+            }
+        }
+    }
+
+    let msg = format!("tool-call loop exceeded {max_iterations} iterations");
+    let _ = tx
+        .send(ProgressEvent::Error {
+            message: msg.clone(),
+            correlation_id: ctx.correlation_id.clone(),
+        })
+        .await;
+    bail!(msg);
 }
 
 /// Concatenate the `Text` blocks of a content vector with `\n\n`.
@@ -1152,6 +1483,430 @@ mod tests {
             outcome.tool_trace[0].status.as_deref(),
             Some("blocked_read_only"),
             "legacy shim must default to ReadOnly behaviour",
+        );
+    }
+
+    // ---- Streaming-variant tests ----
+    //
+    // Pattern: run `run_with_messages_in_mode_streaming` and a drain-rx
+    // future concurrently via `tokio::join!`. The orchestrator owns `tx`;
+    // dropping it on return closes the channel, ending the drain loop.
+
+    use crate::agent::llm::StreamEvent;
+
+    fn user_seed(prompt: &str) -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: prompt.into(),
+            }],
+        }]
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_text_chunks_and_terminal_done() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Hello".into()),
+            StreamEvent::TextDelta(", ".into()),
+            StreamEvent::TextDelta("world".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Some(TokenUsage {
+                    input: 10,
+                    output: 3,
+                    cache_creation_input: None,
+                    cache_read_input: None,
+                }),
+                full_content: vec![ContentBlock::Text {
+                    text: "Hello, world".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("say hi"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+
+        result.expect("run ok");
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            events[0],
+            ProgressEvent::TextChunk {
+                text: "Hello".into()
+            }
+        );
+        assert_eq!(events[1], ProgressEvent::TextChunk { text: ", ".into() });
+        assert_eq!(
+            events[2],
+            ProgressEvent::TextChunk {
+                text: "world".into()
+            }
+        );
+        match &events[3] {
+            ProgressEvent::Done {
+                tokens,
+                iterations,
+                correlation_id,
+            } => {
+                assert_eq!(tokens.input, 10);
+                assert_eq!(tokens.output, 3);
+                assert_eq!(*iterations, 1);
+                assert_eq!(correlation_id, &ctx.correlation_id);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_loop_emits_started_and_completed() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![StreamEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            full_content: vec![ContentBlock::ToolUse {
+                id: "toolu_1".into(),
+                name: "heartbeat_status".into(),
+                input: json!({"limit": 5}),
+            }],
+        }])
+        .await;
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Last 5 heartbeats green.".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Last 5 heartbeats green.".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new()
+            .with_response("heartbeat_status", "[]")
+            .await;
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("status?"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        let started = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::ToolCallStarted { name, .. } if name == "heartbeat_status"))
+            .expect("got ToolCallStarted");
+        let completed = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::ToolCallCompleted { name, .. } if name == "heartbeat_status"))
+            .expect("got ToolCallCompleted");
+        assert!(started < completed, "started must come before completed");
+
+        match &events[completed] {
+            ProgressEvent::ToolCallCompleted { ok, status, .. } => {
+                assert!(*ok);
+                assert!(status.is_none(), "no status discriminator for happy read");
+            }
+            _ => unreachable!(),
+        }
+
+        let text_idx = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::TextChunk { .. }))
+            .expect("got TextChunk after tool");
+        assert!(text_idx > completed, "tool completion precedes final text");
+        assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn streaming_parallel_tool_dispatch_preserves_order() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![StreamEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            full_content: vec![
+                ContentBlock::ToolUse {
+                    id: "toolu_a".into(),
+                    name: "tool_a".into(),
+                    input: json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_b".into(),
+                    name: "tool_b".into(),
+                    input: json!({}),
+                },
+            ],
+        }])
+        .await;
+        llm.queue_stream(vec![StreamEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+            full_content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+        }])
+        .await;
+        let exec = TestExecutor::new()
+            .with_response("tool_a", "ra")
+            .await
+            .with_response("tool_b", "rb")
+            .await;
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        let starts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProgressEvent::ToolCallStarted { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec!["tool_a", "tool_b"]);
+
+        let completes: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProgressEvent::ToolCallCompleted { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completes, vec!["tool_a", "tool_b"]);
+    }
+
+    #[tokio::test]
+    async fn streaming_approval_pending_terminates_stream() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![StreamEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            full_content: vec![ContentBlock::ToolUse {
+                id: "toolu_w".into(),
+                name: "create_company".into(),
+                input: json!({"name": "Acme"}),
+            }],
+        }])
+        .await;
+        let exec = TestExecutor::new();
+        let (mode, _store) = make_actionable_with_store();
+        let ctx = dispatch_ctx();
+        let specs = vec![write_tool_spec("create_company")];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("create Acme"),
+            "system",
+            &llm,
+            &exec,
+            &specs,
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        // Must have ApprovalPending followed by terminal Done.
+        let approval_idx = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::ApprovalPending { .. }))
+            .expect("got ApprovalPending");
+        let done_idx = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::Done { .. }))
+            .expect("got terminal Done");
+        assert!(
+            approval_idx < done_idx,
+            "ApprovalPending precedes terminal Done",
+        );
+        match &events[approval_idx] {
+            ProgressEvent::ApprovalPending {
+                tool, action_id, ..
+            } => {
+                assert_eq!(tool, "create_company");
+                assert!(uuid::Uuid::parse_str(action_id).is_ok());
+            }
+            _ => unreachable!(),
+        }
+
+        // Mock got exactly one stream_chat call — no second LLM round.
+        let calls = llm.calls().await;
+        assert_eq!(calls.len(), 1, "orchestrator must terminate after pending");
+    }
+
+    #[tokio::test]
+    async fn streaming_thinking_delta_emits_progress_event() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![
+            StreamEvent::ThinkingDelta("Let me check...".into()),
+            StreamEvent::TextDelta("Done.".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Done.".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(matches!(events[0], ProgressEvent::Thinking { .. }));
+        assert!(matches!(events[1], ProgressEvent::TextChunk { .. }));
+        assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn streaming_llm_stream_error_emits_error_event_and_bails() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream_results(vec![
+            Ok(StreamEvent::TextDelta("partial".into())),
+            Err(anyhow::anyhow!("anthropic stream transport error")),
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect_err("stream error must propagate as Err");
+
+        assert!(matches!(events[0], ProgressEvent::TextChunk { .. }));
+        match &events[1] {
+            ProgressEvent::Error {
+                message,
+                correlation_id,
+            } => {
+                // Wire body must be opaque per v1.1 hardening — the
+                // "transport error" substring is the *anyhow* context
+                // chain we want to keep server-side-only.
+                assert_eq!(message, "internal error");
+                assert_eq!(correlation_id, &ctx.correlation_id);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // No terminal Done after Error — the error itself is terminal.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Done { .. }))
         );
     }
 }
