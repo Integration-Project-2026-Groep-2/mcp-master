@@ -566,6 +566,26 @@ pub async fn run_with_messages_in_mode_streaming(
                     content: results,
                 });
             }
+            StopReason::Other(ref s) if s == "premature_close" => {
+                // Anthropic closed the connection without `message_stop`.
+                // The provider-side translator has already finalised any
+                // partially-built blocks and the user already saw the text
+                // deltas. Close the stream gracefully with a terminal Done
+                // — no iteration, no follow-up call (which would 400 on
+                // malformed signatures anyway).
+                tracing::warn!(
+                    correlation_id = %ctx.correlation_id,
+                    "anthropic stream closed prematurely; flushing partial response",
+                );
+                let _ = tx
+                    .send(ProgressEvent::Done {
+                        tokens,
+                        iterations: iteration as u32 + 1,
+                        correlation_id: ctx.correlation_id.clone(),
+                    })
+                    .await;
+                return Ok(());
+            }
             StopReason::Other(s) => {
                 let msg = format!("unexpected stop_reason: {s}");
                 let _ = tx

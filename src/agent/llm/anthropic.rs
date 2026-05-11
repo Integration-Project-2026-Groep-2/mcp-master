@@ -550,8 +550,31 @@ where
             }
         }
 
-        // Loop exited without hitting MessageStop (which would `return`),
-        // so the upstream ended prematurely.
+        // Loop exited without hitting MessageStop. If any block accumulated
+        // content, emit a partial `Done` with stop_reason=Other("premature_close")
+        // so the client keeps the 95% answer they already saw via TextDelta
+        // events instead of getting a hard error. Partial tool_use blocks
+        // whose json_buf is mid-token are dropped — the orchestrator won't
+        // iterate (terminal Done), so a malformed tool_use never reaches
+        // Anthropic on a follow-up call.
+        if !accumulators.is_empty() {
+            let mut full_content = Vec::with_capacity(accumulators.len());
+            for (_, acc) in std::mem::take(&mut accumulators) {
+                match acc.finalize() {
+                    Ok(block) => full_content.push(block),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "dropping partial block on premature close")
+                    }
+                }
+            }
+            yield StreamEvent::Done {
+                stop_reason: StopReason::Other("premature_close".into()),
+                usage: usage.take(),
+                full_content,
+            };
+            return;
+        }
+
         Err::<(), anyhow::Error>(anyhow::anyhow!(
             "anthropic stream ended without message_stop"
         ))?;
@@ -1196,6 +1219,57 @@ mod tests {
                 }
             }
             other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_partial_text_on_premature_close_yields_done_not_err() {
+        use futures_util::StreamExt;
+        let server = MockServer::start().await;
+        // Body deliberately omits `message_stop` — simulates Anthropic
+        // closing the TCP connection mid-stream after some content
+        // (the partial-network-failure mid-stream case).
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial answer\"}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&server)
+            .await;
+
+        let client = AnthropicClient::new("k".into()).with_base_url(server.uri());
+        let mut stream = client.stream_chat("sys", &[], &[], 4096).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(e) = stream.next().await {
+            events.push(e.unwrap());
+        }
+        // Expect: TextDelta + terminal Done (NOT Err)
+        assert!(matches!(events[0], StreamEvent::TextDelta(_)));
+        match events.last().expect("at least one event") {
+            StreamEvent::Done {
+                stop_reason,
+                full_content,
+                ..
+            } => {
+                assert_eq!(*stop_reason, StopReason::Other("premature_close".into()));
+                assert_eq!(
+                    full_content,
+                    &vec![ContentBlock::Text {
+                        text: "partial answer".into()
+                    }]
+                );
+            }
+            other => panic!("expected terminal Done, got {other:?}"),
         }
     }
 
