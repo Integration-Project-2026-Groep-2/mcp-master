@@ -5,12 +5,15 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
     http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event as SseEvent, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use chrono::{NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tower_http::{
     cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer,
     validate_request::ValidateRequestHeaderLayer,
@@ -18,7 +21,7 @@ use tower_http::{
 
 use crate::{
     agent::llm::{ContentBlock, Message, Role, TokenUsage, ToolSpec, anthropic::AnthropicClient},
-    agent::orchestrator::{self, McpExecutor, ToolCallTrace},
+    agent::orchestrator::{self, McpExecutor, ProgressEvent, ToolCallTrace},
     agent::prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     gateway::approval::types::ApprovalError,
     mcp::McpPool,
@@ -469,6 +472,182 @@ async fn chat_reject(
     .into_response()
 }
 
+/// Map a `ProgressEvent` to its SSE event-name field. The event-name lets
+/// browser `EventSource` listeners filter; clients using `fetch` + a reader
+/// can dispatch on it too. Mirrors the serde tag values for consistency.
+fn progress_event_name(ev: &ProgressEvent) -> &'static str {
+    match ev {
+        ProgressEvent::Thinking { .. } => "thinking",
+        ProgressEvent::TextChunk { .. } => "text_chunk",
+        ProgressEvent::ToolCallStarted { .. } => "tool_call_started",
+        ProgressEvent::ToolCallCompleted { .. } => "tool_call_completed",
+        ProgressEvent::ApprovalPending { .. } => "approval_pending",
+        ProgressEvent::Done { .. } => "done",
+        ProgressEvent::Error { .. } => "error",
+    }
+}
+
+/// `POST /chat/stream`. Same body validation + mode/scope mapping as `/chat`,
+/// but the response is `text/event-stream` carrying [`ProgressEvent`]s. The
+/// orchestrator runs in a spawned task whose tx side is forwarded to SSE
+/// while in parallel accumulating the audit shape for the trailing
+/// `chat_completed` AMQP event — so streaming clients still produce the same
+/// audit-feed entry shape as `/chat` does for non-streaming.
+///
+/// Client disconnect mid-stream drops the SSE-rx; the orchestrator task
+/// keeps running (its tx.send becomes Err and is ignored per orchestrator
+/// channel discipline) until natural completion, and the AMQP event still
+/// fires. Anthropic billing keeps running too — that's the price of "audit
+/// continuity over partial cancellation" we accept for R2-grade audit.
+async fn chat_stream(
+    scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ChatRequest>,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = std::result::Result<SseEvent, std::convert::Infallible>>>,
+    Response,
+> {
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+
+    let messages = req.into_messages().map_err(|e| {
+        let body = Json(serde_json::json!({ "error": e }));
+        (StatusCode::BAD_REQUEST, body).into_response()
+    })?;
+    let prompt = match messages.last().map(|m| &m.content[..]) {
+        Some([ContentBlock::Text { text }]) => text.clone(),
+        _ => String::new(),
+    };
+    let conversation_length = messages.len();
+    tracing::info!(
+        correlation_id = %correlation_id,
+        prompt_length = prompt.len(),
+        conversation_length,
+        scope = ?scope,
+        "/chat/stream received"
+    );
+
+    let mode = match scope {
+        crate::gateway::auth::AuthScope::Read => {
+            crate::agent::modes::AgentMode::ReadOnly(crate::agent::modes::ReadOnlyMode)
+        }
+        crate::gateway::auth::AuthScope::ReadAndAct => crate::agent::modes::AgentMode::Actionable(
+            crate::agent::modes::ActionableMode::new(state.approval_flow.clone()),
+        ),
+    };
+    let user_id = crate::gateway::auth::current_user_id(&headers).unwrap_or_default();
+    let ctx = crate::agent::modes::DispatchContext {
+        correlation_id: correlation_id.clone(),
+        user_id,
+        scope,
+    };
+
+    let (sse_tx, mut sse_rx) = mpsc::channel::<ProgressEvent>(64);
+
+    let state_clone = state.clone();
+    let tool_specs = state.tool_specs.clone();
+    let publisher = state.publisher.clone();
+    let correlation_id_pub = correlation_id.clone();
+    let prompt_pub = prompt;
+    let started = std::time::Instant::now();
+
+    tokio::spawn(async move {
+        let (orch_tx, mut orch_rx) = mpsc::channel::<ProgressEvent>(64);
+        let state_for_orch = state_clone;
+        let specs_for_orch = tool_specs;
+        let mode_for_orch = mode;
+        let ctx_for_orch = ctx;
+        let orch_handle = tokio::spawn(async move {
+            orchestrator::run_with_messages_in_mode_streaming(
+                messages,
+                SETUP_PROMPT,
+                &state_for_orch.llm,
+                &state_for_orch.pool,
+                &specs_for_orch,
+                MAX_ITERATIONS,
+                MAX_TOKENS,
+                &mode_for_orch,
+                &ctx_for_orch,
+                orch_tx,
+            )
+            .await
+        });
+
+        let mut answer = String::new();
+        let mut tool_trace: Vec<serde_json::Value> = Vec::new();
+        let mut tokens = TokenUsage::default();
+        let mut iterations: u32 = 0;
+        let mut succeeded = true;
+
+        while let Some(ev) = orch_rx.recv().await {
+            match &ev {
+                ProgressEvent::TextChunk { text } => answer.push_str(text),
+                ProgressEvent::ToolCallCompleted {
+                    name,
+                    ok,
+                    ms,
+                    status,
+                    action_id,
+                } => {
+                    tool_trace.push(serde_json::json!({
+                        "tool": name,
+                        "ok": ok,
+                        "ms": ms,
+                        "status": status,
+                        "action_id": action_id,
+                    }));
+                }
+                ProgressEvent::Done {
+                    tokens: t,
+                    iterations: i,
+                    ..
+                } => {
+                    tokens = t.clone();
+                    iterations = *i;
+                }
+                ProgressEvent::Error { .. } => succeeded = false,
+                _ => {}
+            }
+            let _ = sse_tx.send(ev).await;
+        }
+
+        if let Ok(Err(_)) = orch_handle.await {
+            succeeded = false;
+        }
+
+        if let Some(publisher) = publisher {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let payload = serde_json::json!({
+                "correlation_id": correlation_id_pub,
+                "prompt": prompt_pub,
+                "answer": answer.clone(),
+                "answer_length": answer.len(),
+                "duration_ms": duration_ms,
+                "conversation_length": conversation_length,
+                "tool_trace": tool_trace,
+                "tokens": tokens,
+                "iterations": iterations,
+                "succeeded": succeeded,
+                "streamed": true,
+            });
+            if let Err(e) = publisher.publish_event("chat_completed", payload).await {
+                tracing::warn!("failed to publish chat_completed event from stream: {e:#}");
+            }
+        }
+    });
+
+    let event_stream = async_stream::stream! {
+        while let Some(ev) = sse_rx.recv().await {
+            let name = progress_event_name(&ev);
+            if let Ok(data) = serde_json::to_string(&ev) {
+                yield Ok::<_, std::convert::Infallible>(SseEvent::default().event(name).data(data));
+            }
+        }
+    };
+
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+}
+
 /// Read `CHAT_BEARER_TOKEN` from env. Whitespace-only or unset → `None`,
 /// so the bearer layer can be conditionally applied with a skip-warn.
 fn auth_token_from_env() -> Option<String> {
@@ -555,10 +734,17 @@ fn parse_cors_allow_list(strict: bool, csv: Option<&str>) -> Result<CorsLayer> {
     match parsed {
         Ok(origins) if !origins.is_empty() => {
             tracing::info!(count = origins.len(), "CORS locked to allow-list");
+            // Cache-Control + Last-Event-ID needed for SSE clients (browser
+            // EventSource sends Last-Event-ID on reconnect; some clients
+            // surface Cache-Control to opt out of intermediate proxies).
             Ok(CorsLayer::new()
                 .allow_origin(origins)
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers([CONTENT_TYPE]))
+                .allow_headers([
+                    CONTENT_TYPE,
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderName::from_static("last-event-id"),
+                ]))
         }
         Ok(_) if strict => {
             bail!("CHAT_ALLOWED_ORIGINS contained no usable origins under CHAT_CORS_STRICT=true")
@@ -753,9 +939,10 @@ pub async fn serve(
     let mut chat_route = post(chat);
     let mut approve_route = post(chat_approve);
     let mut reject_route = post(chat_reject);
+    let mut stream_route = post(chat_stream);
     if let Some(ref token) = bearer_token {
         tracing::info!(
-            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject"
+            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject + /chat/stream"
         );
         chat_route =
             chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
@@ -763,33 +950,46 @@ pub async fn serve(
             approve_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
         reject_route =
             reject_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        stream_route =
+            stream_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
     } else {
         tracing::warn!(
-            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject accept unauthenticated \
-             requests (dev-only, NOT for production)"
+            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject + /chat/stream accept \
+             unauthenticated requests (dev-only, NOT for production)"
         );
     }
     // Bearer is outer (added first); ConcurrencyLimit is inner (added later).
     // Unauthenticated requests are rejected before consuming a slot.
     // GlobalConcurrencyLimit shares one Arc<Semaphore> across all per-request
     // service clones; the non-global variant builds a fresh semaphore per
-    // Layer::layer() call → no actual capping.
+    // Layer::layer() call → no actual capping. /chat/stream shares the same
+    // 8-slot pool — long-lived SSE streams should not starve sync /chat
+    // beyond MAX_CONCURRENT_CHAT, but the slot is held for the entire
+    // stream duration (acceptable given Anthropic Tier 2 budget).
     chat_route = chat_route.route_layer(chat_concurrency.clone());
     approve_route = approve_route.route_layer(chat_concurrency.clone());
-    reject_route = reject_route.route_layer(chat_concurrency);
+    reject_route = reject_route.route_layer(chat_concurrency.clone());
+    stream_route = stream_route.route_layer(chat_concurrency);
 
-    let app = Router::new()
+    // Router-split: TimeoutLayer applies only to non-streaming routes. SSE
+    // streams legitimately exceed 240s (e.g. multi-tool-cascade against
+    // slow Salesforce) — applying the layer would kill them mid-flight.
+    let timed_routes = Router::new()
         .route("/chat", chat_route)
         .route("/chat/approve", approve_route)
         .route("/chat/reject", reject_route)
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS),
+        ));
+
+    let app = Router::new()
+        .merge(timed_routes)
+        .route("/chat/stream", stream_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS),
-        ))
         .layer(build_cors_layer()?)
         .layer(TraceLayer::new_for_http());
 
@@ -1421,5 +1621,64 @@ mod tests {
         assert!(v["tokens"].get("cache_creation_input").is_none());
         assert_eq!(v["iterations"], 2);
         assert_eq!(v["correlation_id"], "abc-123");
+    }
+
+    #[test]
+    fn progress_event_names_match_serde_tags() {
+        // SSE event-name = serde tag (snake_case of variant). Pin the
+        // mapping so a future variant rename can't silently desync the
+        // wire-format from the helper.
+        use crate::agent::llm::{StopReason, TokenUsage};
+        let cases: &[(ProgressEvent, &str)] = &[
+            (ProgressEvent::Thinking { text: "".into() }, "thinking"),
+            (ProgressEvent::TextChunk { text: "".into() }, "text_chunk"),
+            (
+                ProgressEvent::ToolCallStarted {
+                    name: "x".into(),
+                    server: None,
+                },
+                "tool_call_started",
+            ),
+            (
+                ProgressEvent::ToolCallCompleted {
+                    name: "x".into(),
+                    ok: true,
+                    ms: 0,
+                    status: None,
+                    action_id: None,
+                },
+                "tool_call_completed",
+            ),
+            (
+                ProgressEvent::ApprovalPending {
+                    action_id: "a".into(),
+                    tool: "t".into(),
+                    server: "s".into(),
+                },
+                "approval_pending",
+            ),
+            (
+                ProgressEvent::Done {
+                    tokens: TokenUsage::default(),
+                    iterations: 0,
+                    correlation_id: "c".into(),
+                },
+                "done",
+            ),
+            (
+                ProgressEvent::Error {
+                    message: "boom".into(),
+                },
+                "error",
+            ),
+        ];
+        // Reference unused — keep compiler happy without leaking StopReason.
+        let _ = std::any::type_name::<StopReason>();
+        for (ev, name) in cases {
+            assert_eq!(progress_event_name(ev), *name);
+            // Serde tag inside the JSON payload should match exactly.
+            let v = serde_json::to_value(ev).unwrap();
+            assert_eq!(v["event"].as_str(), Some(*name));
+        }
     }
 }
