@@ -54,6 +54,12 @@ const MAX_CONCURRENT_CHAT: usize = 8;
 // slot. 600s comfortably exceeds the longest observed multi-MCP cascade.
 const STREAM_DEADLINE_SECS: u64 = 600;
 
+fn cloudflare_pad_comment() -> &'static str {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<String> = OnceLock::new();
+    PAD.get_or_init(|| "cf-stream-pad ".repeat(293))
+}
+
 pub struct AppState {
     pub llm: AnthropicClient,
     pub pool: McpPool,
@@ -700,6 +706,9 @@ async fn chat_stream(
     });
 
     let event_stream = async_stream::stream! {
+        yield Ok::<_, std::convert::Infallible>(
+            SseEvent::default().comment(cloudflare_pad_comment()),
+        );
         while let Some(ev) = sse_rx.recv().await {
             let name = progress_event_name(&ev);
             if let Ok(data) = serde_json::to_string(&ev) {
@@ -1745,5 +1754,20 @@ mod tests {
             let v = serde_json::to_value(ev).unwrap();
             assert_eq!(v["event"].as_str(), Some(*name));
         }
+    }
+
+    #[test]
+    fn cloudflare_pad_comment_crosses_cf_buffer_threshold() {
+        let pad = cloudflare_pad_comment();
+        assert!(
+            pad.len() >= 4096,
+            "pad must be >= 4096 bytes to defeat Cloudflare buffering, got {}",
+            pad.len(),
+        );
+        assert!(pad.is_ascii(), "pad must be ASCII to avoid encoding issues");
+        assert!(
+            !pad.contains('\n') && !pad.contains('\r'),
+            "CR/LF in comment would prematurely terminate the SSE frame",
+        );
     }
 }
