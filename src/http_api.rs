@@ -54,13 +54,6 @@ const MAX_CONCURRENT_CHAT: usize = 8;
 // slot. 600s comfortably exceeds the longest observed multi-MCP cascade.
 const STREAM_DEADLINE_SECS: u64 = 600;
 
-// Cloudflare's proxy buffers text/event-stream bodies up to ~4 KB before
-// the first flush — measured 2026-05-12: first chunk landed at 6675ms
-// carrying 1723 bytes of bundled deltas, defeating per-token streaming.
-// Shipping a 4 KB SSE comment as the first wire-write crosses the buffer
-// threshold immediately so every subsequent ProgressEvent flows through.
-// SSE comment lines (`:` prefix) are discarded by spec-compliant parsers
-// including the Drupal jarvis_chat SseEventParser.
 fn cloudflare_pad_comment() -> &'static str {
     use std::sync::OnceLock;
     static PAD: OnceLock<String> = OnceLock::new();
