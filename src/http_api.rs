@@ -996,6 +996,14 @@ pub async fn serve(
         ))
     });
 
+    let recovery_handle = consumer_config.as_ref().map(|cfg| {
+        tokio::spawn(crate::incident::recovery::run(
+            cfg.clone(),
+            state.publisher.clone(),
+            shutdown_rx.clone(),
+        ))
+    });
+
     let consumer_handle =
         consumer_config.map(|cfg| tokio::spawn(rabbitmq_consumer::run(cfg, shutdown_rx.clone())));
 
@@ -1119,6 +1127,16 @@ pub async fn serve(
             Ok(Err(e)) => tracing::warn!("incident consumer join error: {e:#}"),
             Err(_) => tracing::warn!(
                 "incident consumer didn't drain in 2s — task left detached, runtime drop will reclaim"
+            ),
+        }
+    }
+    if let Some(h) = recovery_handle {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), h).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::warn!("recovery consumer exited with error: {e:#}"),
+            Ok(Err(e)) => tracing::warn!("recovery consumer join error: {e:#}"),
+            Err(_) => tracing::warn!(
+                "recovery consumer didn't drain in 2s — task left detached, runtime drop will reclaim"
             ),
         }
     }
