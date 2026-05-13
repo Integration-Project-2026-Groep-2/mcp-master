@@ -8,8 +8,9 @@ use anyhow::bail;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::future::try_join_all;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::llm::{
@@ -18,6 +19,7 @@ use crate::agent::llm::{
 use crate::agent::modes::{
     AgentMode, DispatchContext, ReadOnlyMode, build_blocked_read_only_result,
 };
+use crate::agent::prompts::SUGGESTIONS_SYSTEM_PROMPT;
 
 /// Per-call trace built by `McpExecutor::call` impls. `ok=false` carries the
 /// error message; `args` is `None` unless the executor opts in to recording
@@ -634,6 +636,100 @@ fn collect_text(content: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)] // wired into streaming loop in next commit
+struct SuggestionsPayload {
+    texts: Vec<String>,
+}
+
+#[allow(dead_code)] // wired into streaming loop in next commit
+const SUGGESTIONS_MAX_TOKENS: u32 = 256;
+#[allow(dead_code)] // wired into streaming loop in next commit
+const SUGGESTIONS_TIMEOUT_SECS: u64 = 15;
+#[allow(dead_code)] // wired into streaming loop in next commit
+const SUGGESTIONS_MIN_CHARS: usize = 5;
+#[allow(dead_code)] // wired into streaming loop in next commit
+const SUGGESTIONS_MAX_CHARS: usize = 100;
+
+/// Best-effort follow-up generator. Wraps a single `LlmClient::chat` in a
+/// hard timeout so a stuck inference cannot delay the terminal `Done`
+/// event. Returns an empty vector on any failure — caller treats that as
+/// "skip Suggestions event" (graceful degradation).
+#[allow(dead_code)] // wired into streaming loop in next commit
+async fn generate_suggestions(
+    llm: &dyn LlmClient,
+    final_answer: &str,
+    correlation_id: &str,
+) -> Vec<String> {
+    let user_text = format!("<UNTRUSTED>{final_answer}</UNTRUSTED>\n\nGenereer 3 vervolgvragen.");
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text { text: user_text }],
+    }];
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(SUGGESTIONS_TIMEOUT_SECS),
+        llm.chat(
+            SUGGESTIONS_SYSTEM_PROMPT,
+            &messages,
+            &[],
+            SUGGESTIONS_MAX_TOKENS,
+        ),
+    )
+    .await;
+    let response = match outcome {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::warn!(%correlation_id, error = ?e, "suggestions llm.chat failed");
+            return Vec::new();
+        }
+        Err(_) => {
+            tracing::warn!(%correlation_id, "suggestions llm.chat timed out");
+            return Vec::new();
+        }
+    };
+    let raw = collect_text(&response.content);
+    let payload_json = strip_outer_code_fence(&raw);
+    let payload: SuggestionsPayload = match serde_json::from_str(payload_json) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%correlation_id, error = ?e, "suggestions JSON parse failed");
+            return Vec::new();
+        }
+    };
+    if payload.texts.len() != 3 {
+        tracing::warn!(%correlation_id, len = payload.texts.len(), "suggestions wrong count");
+        return Vec::new();
+    }
+    for t in &payload.texts {
+        let trimmed = t.trim();
+        let n = trimmed.chars().count();
+        if trimmed.is_empty() || !(SUGGESTIONS_MIN_CHARS..=SUGGESTIONS_MAX_CHARS).contains(&n) {
+            tracing::warn!(%correlation_id, chars = n, "suggestion failed length check");
+            return Vec::new();
+        }
+    }
+    payload.texts
+}
+
+/// Strip an optional triple-backtick fence around a JSON payload. Defensive
+/// for the case where the model wraps its structured output despite the
+/// system-prompt instruction not to.
+#[allow(dead_code)] // wired into streaming loop in next commit
+fn strip_outer_code_fence(s: &str) -> &str {
+    let t = s.trim();
+    if !t.starts_with("```") {
+        return t;
+    }
+    let after_open = match t.find('\n') {
+        Some(idx) => &t[idx + 1..],
+        None => return t,
+    };
+    match after_open.rfind("```") {
+        Some(idx) => after_open[..idx].trim(),
+        None => t,
+    }
 }
 
 #[cfg(test)]
@@ -1921,5 +2017,61 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ProgressEvent::Done { .. }))
         );
+    }
+
+    fn text_response(payload: &str) -> ChatResponse {
+        ChatResponse {
+            content: vec![ContentBlock::Text {
+                text: payload.into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_happy_path_returns_three_strings() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Toon recente registraties","Welke bedrijven zijn er?","Status systemen?"]}"#,
+        )]);
+        let got = generate_suggestions(&llm, "Er zijn 42 actieve contacten.", "cid-1").await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], "Toon recente registraties");
+        assert_eq!(got[2], "Status systemen?");
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_malformed_json_returns_empty() {
+        let llm = MockLlmClient::new(vec![text_response("dit is geen json")]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-2").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_wrong_count_returns_empty() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Eerste vraag?","Tweede vraag?"]}"#,
+        )]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-3").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_oversized_string_returns_empty() {
+        let big = "x".repeat(101);
+        let payload = format!(r#"{{"texts":["Eerste vraag?","Tweede vraag?","{big}"]}}"#);
+        let llm = MockLlmClient::new(vec![text_response(&payload)]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-4").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_strips_code_fence_and_parses() {
+        let fenced =
+            "```json\n{\"texts\":[\"Eerste vraag?\",\"Tweede vraag?\",\"Derde vraag?\"]}\n```";
+        let llm = MockLlmClient::new(vec![text_response(fenced)]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-5").await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], "Eerste vraag?");
     }
 }
