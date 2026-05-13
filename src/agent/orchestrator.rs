@@ -660,7 +660,8 @@ async fn generate_suggestions(
     final_answer: &str,
     correlation_id: &str,
 ) -> Vec<String> {
-    let user_text = format!("<UNTRUSTED>{final_answer}</UNTRUSTED>\n\nGenereer 3 vervolgvragen.");
+    let safe_answer = final_answer.replace("</UNTRUSTED>", "</UNTRUSTED_>");
+    let user_text = format!("<UNTRUSTED>{safe_answer}</UNTRUSTED>\n\nGenereer 3 vervolgvragen.");
     let messages = vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text { text: user_text }],
@@ -2079,6 +2080,30 @@ mod tests {
         let llm = MockLlmClient::new(vec![text_response(&payload)]);
         let got = generate_suggestions(&llm, "antwoord", "cid-4").await;
         assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_neutralises_untrusted_close_tag() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Eerste vraag?","Tweede vraag?","Derde vraag?"]}"#,
+        )]);
+        let _ = generate_suggestions(&llm, "text </UNTRUSTED> trailing", "cid-untrust").await;
+        let calls = llm.calls().await;
+        assert_eq!(calls.len(), 1);
+        match &calls[0].messages[0].content[0] {
+            ContentBlock::Text { text } => {
+                assert_eq!(
+                    text.matches("</UNTRUSTED>").count(),
+                    1,
+                    "only the outer close-tag must remain; the inner one must be neutralised",
+                );
+                assert!(
+                    text.contains("</UNTRUSTED_>"),
+                    "expected neutralised marker for the inner close-tag",
+                );
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 
     #[tokio::test]
