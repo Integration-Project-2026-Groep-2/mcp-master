@@ -105,6 +105,9 @@ pub enum ProgressEvent {
         tool: String,
         server: String,
     },
+    Suggestions {
+        texts: Vec<String>,
+    },
     Done {
         tokens: TokenUsage,
         iterations: u32,
@@ -711,6 +714,16 @@ mod tests {
             };
             Ok((result, trace))
         }
+    }
+
+    #[test]
+    fn suggestions_event_serializes_to_snake_case() {
+        let ev = ProgressEvent::Suggestions {
+            texts: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["event"], "suggestions");
+        assert_eq!(json["texts"], json!(["a", "b", "c"]));
     }
 
     #[tokio::test]

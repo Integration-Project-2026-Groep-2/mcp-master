@@ -494,6 +494,7 @@ fn progress_event_name(ev: &ProgressEvent) -> &'static str {
         ProgressEvent::ToolCallStarted { .. } => "tool_call_started",
         ProgressEvent::ToolCallCompleted { .. } => "tool_call_completed",
         ProgressEvent::ApprovalPending { .. } => "approval_pending",
+        ProgressEvent::Suggestions { .. } => "suggestions",
         ProgressEvent::Done { .. } => "done",
         ProgressEvent::Error { .. } => "error",
     }
