@@ -448,6 +448,7 @@ pub async fn run_with_messages_in_mode_streaming(
 
         match stop_reason {
             StopReason::EndTurn => {
+                maybe_emit_suggestions(&full_content, &tx, llm, &ctx.correlation_id).await;
                 let _ = tx
                     .send(ProgressEvent::Done {
                         tokens,
@@ -462,6 +463,7 @@ pub async fn run_with_messages_in_mode_streaming(
                     iteration,
                     "anthropic max_tokens hit; closing stream with partial response"
                 );
+                maybe_emit_suggestions(&full_content, &tx, llm, &ctx.correlation_id).await;
                 let _ = tx
                     .send(ProgressEvent::Done {
                         tokens,
@@ -594,6 +596,7 @@ pub async fn run_with_messages_in_mode_streaming(
                     correlation_id = %ctx.correlation_id,
                     "anthropic stream closed prematurely; flushing partial response",
                 );
+                maybe_emit_suggestions(&full_content, &tx, llm, &ctx.correlation_id).await;
                 let _ = tx
                     .send(ProgressEvent::Done {
                         tokens,
@@ -639,25 +642,19 @@ fn collect_text(content: &[ContentBlock]) -> String {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)] // wired into streaming loop in next commit
 struct SuggestionsPayload {
     texts: Vec<String>,
 }
 
-#[allow(dead_code)] // wired into streaming loop in next commit
 const SUGGESTIONS_MAX_TOKENS: u32 = 256;
-#[allow(dead_code)] // wired into streaming loop in next commit
 const SUGGESTIONS_TIMEOUT_SECS: u64 = 15;
-#[allow(dead_code)] // wired into streaming loop in next commit
 const SUGGESTIONS_MIN_CHARS: usize = 5;
-#[allow(dead_code)] // wired into streaming loop in next commit
 const SUGGESTIONS_MAX_CHARS: usize = 100;
 
 /// Best-effort follow-up generator. Wraps a single `LlmClient::chat` in a
 /// hard timeout so a stuck inference cannot delay the terminal `Done`
 /// event. Returns an empty vector on any failure — caller treats that as
 /// "skip Suggestions event" (graceful degradation).
-#[allow(dead_code)] // wired into streaming loop in next commit
 async fn generate_suggestions(
     llm: &dyn LlmClient,
     final_answer: &str,
@@ -713,10 +710,29 @@ async fn generate_suggestions(
     payload.texts
 }
 
+/// Generate + emit follow-up suggestions for `full_content` if the
+/// assistant produced any user-visible text. No-op when answer-text is
+/// empty (e.g. tool-only turns) or when the LLM call fails — keeps the
+/// terminal `Done` event semantics intact under degradation.
+async fn maybe_emit_suggestions(
+    full_content: &[ContentBlock],
+    tx: &mpsc::Sender<ProgressEvent>,
+    llm: &dyn LlmClient,
+    correlation_id: &str,
+) {
+    let answer_text = collect_text(full_content);
+    if answer_text.is_empty() {
+        return;
+    }
+    let texts = generate_suggestions(llm, &answer_text, correlation_id).await;
+    if !texts.is_empty() {
+        let _ = tx.send(ProgressEvent::Suggestions { texts }).await;
+    }
+}
+
 /// Strip an optional triple-backtick fence around a JSON payload. Defensive
 /// for the case where the model wraps its structured output despite the
 /// system-prompt instruction not to.
-#[allow(dead_code)] // wired into streaming loop in next commit
 fn strip_outer_code_fence(s: &str) -> &str {
     let t = s.trim();
     if !t.starts_with("```") {
@@ -2073,5 +2089,168 @@ mod tests {
         let got = generate_suggestions(&llm, "antwoord", "cid-5").await;
         assert_eq!(got.len(), 3);
         assert_eq!(got[0], "Eerste vraag?");
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_suggestions_before_done_on_endturn() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Toon contacten","Welke bedrijven?","Status check"]}"#,
+        )]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Hello".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        let suggestions_idx = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::Suggestions { .. }))
+            .expect("got Suggestions");
+        let done_idx = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::Done { .. }))
+            .expect("got terminal Done");
+        assert!(
+            suggestions_idx < done_idx,
+            "Suggestions precedes terminal Done",
+        );
+        match &events[suggestions_idx] {
+            ProgressEvent::Suggestions { texts } => {
+                assert_eq!(texts.len(), 3);
+                assert_eq!(texts[0], "Toon contacten");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_suggestions_when_llm_call_fails() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Hello".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
+            "no Suggestions event when LLM call fails",
+        );
+        assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_suggestions_on_approval_pending() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![StreamEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            full_content: vec![ContentBlock::ToolUse {
+                id: "toolu_w".into(),
+                name: "create_company".into(),
+                input: json!({"name": "Acme"}),
+            }],
+        }])
+        .await;
+        let exec = TestExecutor::new();
+        let (mode, _store) = make_actionable_with_store();
+        let ctx = dispatch_ctx();
+        let specs = vec![write_tool_spec("create_company")];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("create Acme"),
+            "system",
+            &llm,
+            &exec,
+            &specs,
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
+            "no Suggestions event on approval-pending path",
+        );
     }
 }
