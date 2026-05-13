@@ -701,12 +701,34 @@ async fn generate_suggestions(
     for t in &payload.texts {
         let trimmed = t.trim();
         let n = trimmed.chars().count();
-        if trimmed.is_empty() || !(SUGGESTIONS_MIN_CHARS..=SUGGESTIONS_MAX_CHARS).contains(&n) {
-            tracing::warn!(%correlation_id, chars = n, "suggestion failed length check");
+        let has_disallowed = trimmed.chars().any(is_disallowed_suggestion_char);
+        if trimmed.is_empty()
+            || !(SUGGESTIONS_MIN_CHARS..=SUGGESTIONS_MAX_CHARS).contains(&n)
+            || has_disallowed
+        {
+            tracing::warn!(
+                %correlation_id,
+                chars = n,
+                disallowed = has_disallowed,
+                "suggestion failed validation"
+            );
             return Vec::new();
         }
     }
-    payload.texts
+    payload
+        .texts
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .collect()
+}
+
+/// Reject control codepoints + zero-width + bidi-override marks. Defense-in-depth
+/// for the Frontend chip render — `textContent` defangs HTML but cannot stop
+/// RTL-override or ZWJ from confusing the visual layout.
+fn is_disallowed_suggestion_char(c: char) -> bool {
+    c.is_control()
+        || ('\u{200B}'..='\u{200F}').contains(&c)
+        || ('\u{202A}'..='\u{202E}').contains(&c)
 }
 
 /// Generate + emit follow-up suggestions for `full_content` if the
@@ -2078,6 +2100,34 @@ mod tests {
         let llm = MockLlmClient::new(vec![text_response(&payload)]);
         let got = generate_suggestions(&llm, "antwoord", "cid-4").await;
         assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_whitespace_only_returns_empty() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["     ","Geldige vraag een?","Geldige vraag twee?"]}"#,
+        )]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-ws").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_control_chars_returns_empty() {
+        let llm = MockLlmClient::new(vec![text_response(
+            "{\"texts\":[\"\u{202E}Pas op vraag?\",\"Geldige vraag een?\",\"Geldige vraag twee?\"]}",
+        )]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-ctrl").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_returns_trimmed_strings() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["  Vraag een?  ","Vraag twee?","Vraag drie?"]}"#,
+        )]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-trim").await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], "Vraag een?");
     }
 
     #[tokio::test]
