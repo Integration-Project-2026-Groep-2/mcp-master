@@ -656,6 +656,9 @@ pub(crate) async fn generate_suggestions(
     final_answer: &str,
     correlation_id: &str,
 ) -> Vec<String> {
+    if final_answer.trim().is_empty() {
+        return Vec::new();
+    }
     let safe_answer = final_answer.replace("</UNTRUSTED>", "</UNTRUSTED_>");
     let user_text = format!("<UNTRUSTED>{safe_answer}</UNTRUSTED>\n\nGenereer 3 vervolgvragen.");
     let messages = vec![Message {
@@ -2118,6 +2121,18 @@ mod tests {
         let got = generate_suggestions(&llm, "antwoord", "cid-trim").await;
         assert_eq!(got.len(), 3);
         assert_eq!(got[0], "Vraag een?");
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_skips_on_empty_answer() {
+        let llm = MockLlmClient::new(vec![]);
+        let got = generate_suggestions(&llm, "   ", "cid-empty").await;
+        assert!(got.is_empty());
+        assert_eq!(
+            llm.calls().await.len(),
+            0,
+            "empty-answer guard must skip the LLM call entirely",
+        );
     }
 
     #[tokio::test]
