@@ -651,7 +651,7 @@ const SUGGESTIONS_MAX_CHARS: usize = 80;
 
 /// Returns `Vec::new()` on any failure so the terminal `Done` event is never
 /// delayed by a stuck inference and the caller can skip the SSE frame.
-async fn generate_suggestions(
+pub(crate) async fn generate_suggestions(
     llm: &dyn LlmClient,
     final_answer: &str,
     correlation_id: &str,
