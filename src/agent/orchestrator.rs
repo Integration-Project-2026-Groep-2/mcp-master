@@ -649,10 +649,8 @@ const SUGGESTIONS_TIMEOUT_SECS: u64 = 15;
 const SUGGESTIONS_MIN_CHARS: usize = 5;
 const SUGGESTIONS_MAX_CHARS: usize = 80;
 
-/// Best-effort follow-up generator. Wraps a single `LlmClient::chat` in a
-/// hard timeout so a stuck inference cannot delay the terminal `Done`
-/// event. Returns an empty vector on any failure — caller treats that as
-/// "skip Suggestions event" (graceful degradation).
+/// Returns `Vec::new()` on any failure so the terminal `Done` event is never
+/// delayed by a stuck inference and the caller can skip the SSE frame.
 async fn generate_suggestions(
     llm: &dyn LlmClient,
     final_answer: &str,
@@ -722,19 +720,14 @@ async fn generate_suggestions(
         .collect()
 }
 
-/// Reject control codepoints + zero-width + bidi-override marks. Defense-in-depth
-/// for the Frontend chip render — `textContent` defangs HTML but cannot stop
-/// RTL-override or ZWJ from confusing the visual layout.
+/// Frontend `textContent` defangs HTML but cannot stop RTL-override or ZWJ
+/// from confusing the visual chip layout.
 fn is_disallowed_suggestion_char(c: char) -> bool {
     c.is_control()
         || ('\u{200B}'..='\u{200F}').contains(&c)
         || ('\u{202A}'..='\u{202E}').contains(&c)
 }
 
-/// Generate + emit follow-up suggestions for `full_content` if the
-/// assistant produced any user-visible text. No-op when answer-text is
-/// empty (e.g. tool-only turns) or when the LLM call fails — keeps the
-/// terminal `Done` event semantics intact under degradation.
 async fn maybe_emit_suggestions(
     full_content: &[ContentBlock],
     tx: &mpsc::Sender<ProgressEvent>,
@@ -751,9 +744,6 @@ async fn maybe_emit_suggestions(
     }
 }
 
-/// Strip an optional triple-backtick fence around a JSON payload. Defensive
-/// for the case where the model wraps its structured output despite the
-/// system-prompt instruction not to.
 fn strip_outer_code_fence(s: &str) -> &str {
     let t = s.trim();
     if !t.starts_with("```") {
