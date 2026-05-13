@@ -649,7 +649,7 @@ struct SuggestionsPayload {
 const SUGGESTIONS_MAX_TOKENS: u32 = 256;
 const SUGGESTIONS_TIMEOUT_SECS: u64 = 15;
 const SUGGESTIONS_MIN_CHARS: usize = 5;
-const SUGGESTIONS_MAX_CHARS: usize = 100;
+const SUGGESTIONS_MAX_CHARS: usize = 80;
 
 /// Best-effort follow-up generator. Wraps a single `LlmClient::chat` in a
 /// hard timeout so a stuck inference cannot delay the terminal `Done`
