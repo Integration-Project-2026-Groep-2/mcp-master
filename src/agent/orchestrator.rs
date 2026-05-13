@@ -463,7 +463,6 @@ pub async fn run_with_messages_in_mode_streaming(
                     iteration,
                     "anthropic max_tokens hit; closing stream with partial response"
                 );
-                maybe_emit_suggestions(&full_content, &tx, llm, &ctx.correlation_id).await;
                 let _ = tx
                     .send(ProgressEvent::Done {
                         tokens,
@@ -596,7 +595,6 @@ pub async fn run_with_messages_in_mode_streaming(
                     correlation_id = %ctx.correlation_id,
                     "anthropic stream closed prematurely; flushing partial response",
                 );
-                maybe_emit_suggestions(&full_content, &tx, llm, &ctx.correlation_id).await;
                 let _ = tx
                     .send(ProgressEvent::Done {
                         tokens,
@@ -2226,6 +2224,110 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
             "no Suggestions event when LLM call fails",
+        );
+        assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_suggestions_on_max_tokens() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Eerste vraag?","Tweede vraag?","Derde vraag?"]}"#,
+        )]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Partial".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::MaxTokens,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Partial".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
+            "no Suggestions event on max_tokens-truncated answer",
+        );
+        assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_suggestions_on_premature_close() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Eerste vraag?","Tweede vraag?","Derde vraag?"]}"#,
+        )]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Half".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::Other("premature_close".into()),
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Half".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
+            "no Suggestions event on premature_close",
         );
         assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
     }
