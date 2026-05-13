@@ -1479,10 +1479,7 @@ mod tests {
             unsafe {
                 std::env::set_var("CHAT_SUGGESTIONS_ENABLED", v);
             }
-            assert!(
-                chat_suggestions_enabled(),
-                "only literal false-like trimmed/case-insensitive disables; expected enabled for {v:?}",
-            );
+            assert!(chat_suggestions_enabled(), "expected enabled for {v:?}");
         }
         unsafe {
             std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
