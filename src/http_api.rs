@@ -322,17 +322,15 @@ async fn chat(
     .map_err(|e| AppError(e).into_response())?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    let suggestions = if std::env::var("CHAT_SUGGESTIONS_ENABLED")
-        .is_ok_and(|v| v.eq_ignore_ascii_case("false"))
-    {
-        Vec::new()
-    } else {
+    let suggestions = if chat_suggestions_enabled() {
         crate::agent::orchestrator::generate_suggestions(
             &state.llm,
             &outcome.answer,
             &correlation_id,
         )
         .await
+    } else {
+        Vec::new()
     };
 
     if let Some(publisher) = &state.publisher {
@@ -745,6 +743,13 @@ fn auth_token_from_env() -> Option<String> {
     std::env::var("CHAT_BEARER_TOKEN")
         .ok()
         .filter(|s| !s.trim().is_empty())
+}
+
+fn chat_suggestions_enabled() -> bool {
+    std::env::var("CHAT_SUGGESTIONS_ENABLED")
+        .ok()
+        .map(|s| !s.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
 }
 
 /// Validates `Authorization: Bearer <token>` against a fixed expected value.
@@ -1438,6 +1443,50 @@ mod tests {
             // zero is a sentinel for "unparseable" — fallback applies
             assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
         });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chat_suggestions_enabled_defaults_true_when_unset() {
+        unsafe {
+            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
+        }
+        assert!(chat_suggestions_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chat_suggestions_enabled_disables_on_false() {
+        unsafe {
+            std::env::set_var("CHAT_SUGGESTIONS_ENABLED", "false");
+        }
+        assert!(!chat_suggestions_enabled());
+        unsafe {
+            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chat_suggestions_enabled_trims_and_case_insensitive() {
+        for v in ["FALSE", "False", " false ", "\tfalse\n"] {
+            unsafe {
+                std::env::set_var("CHAT_SUGGESTIONS_ENABLED", v);
+            }
+            assert!(!chat_suggestions_enabled(), "expected disabled for {v:?}");
+        }
+        for v in ["0", "no", "off", "true", "", "anything"] {
+            unsafe {
+                std::env::set_var("CHAT_SUGGESTIONS_ENABLED", v);
+            }
+            assert!(
+                chat_suggestions_enabled(),
+                "only literal false-like trimmed/case-insensitive disables; expected enabled for {v:?}",
+            );
+        }
+        unsafe {
+            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
+        }
     }
 
     async fn ok_handler() -> &'static str {
