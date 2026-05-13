@@ -200,6 +200,8 @@ pub struct ChatResponse {
     pub tokens: TokenUsage,
     pub iterations: u32,
     pub correlation_id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
 }
 
 /// Substrings that suggest the client tried to forge a structured tool-use
@@ -320,6 +322,17 @@ async fn chat(
     .map_err(|e| AppError(e).into_response())?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
+    let suggestions = if chat_suggestions_enabled() {
+        crate::agent::orchestrator::generate_suggestions(
+            &state.llm,
+            &outcome.answer,
+            &correlation_id,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+
     if let Some(publisher) = &state.publisher {
         let payload = serde_json::json!({
             "correlation_id": correlation_id,
@@ -343,6 +356,7 @@ async fn chat(
         tokens: outcome.tokens,
         iterations: outcome.iterations,
         correlation_id,
+        suggestions,
     }))
 }
 
@@ -431,6 +445,7 @@ async fn chat_approve(
         tokens: TokenUsage::default(),
         iterations: 0,
         correlation_id: action.correlation_id,
+        suggestions: Vec::new(),
     })
     .into_response()
 }
@@ -480,6 +495,7 @@ async fn chat_reject(
         tokens: TokenUsage::default(),
         iterations: 0,
         correlation_id: action.correlation_id,
+        suggestions: Vec::new(),
     })
     .into_response()
 }
@@ -494,6 +510,7 @@ fn progress_event_name(ev: &ProgressEvent) -> &'static str {
         ProgressEvent::ToolCallStarted { .. } => "tool_call_started",
         ProgressEvent::ToolCallCompleted { .. } => "tool_call_completed",
         ProgressEvent::ApprovalPending { .. } => "approval_pending",
+        ProgressEvent::Suggestions { .. } => "suggestions",
         ProgressEvent::Done { .. } => "done",
         ProgressEvent::Error { .. } => "error",
     }
@@ -726,6 +743,13 @@ fn auth_token_from_env() -> Option<String> {
     std::env::var("CHAT_BEARER_TOKEN")
         .ok()
         .filter(|s| !s.trim().is_empty())
+}
+
+fn chat_suggestions_enabled() -> bool {
+    std::env::var("CHAT_SUGGESTIONS_ENABLED")
+        .ok()
+        .map(|s| !s.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
 }
 
 /// Validates `Authorization: Bearer <token>` against a fixed expected value.
@@ -1421,6 +1445,47 @@ mod tests {
         });
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn chat_suggestions_enabled_defaults_true_when_unset() {
+        unsafe {
+            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
+        }
+        assert!(chat_suggestions_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chat_suggestions_enabled_disables_on_false() {
+        unsafe {
+            std::env::set_var("CHAT_SUGGESTIONS_ENABLED", "false");
+        }
+        assert!(!chat_suggestions_enabled());
+        unsafe {
+            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chat_suggestions_enabled_trims_and_case_insensitive() {
+        for v in ["FALSE", "False", " false ", "\tfalse\n"] {
+            unsafe {
+                std::env::set_var("CHAT_SUGGESTIONS_ENABLED", v);
+            }
+            assert!(!chat_suggestions_enabled(), "expected disabled for {v:?}");
+        }
+        for v in ["0", "no", "off", "true", "", "anything"] {
+            unsafe {
+                std::env::set_var("CHAT_SUGGESTIONS_ENABLED", v);
+            }
+            assert!(chat_suggestions_enabled(), "expected enabled for {v:?}");
+        }
+        unsafe {
+            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
+        }
+    }
+
     async fn ok_handler() -> &'static str {
         "ok"
     }
@@ -1697,6 +1762,7 @@ mod tests {
             },
             iterations: 2,
             correlation_id: "abc-123".into(),
+            suggestions: Vec::new(),
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["answer"], "ok");
@@ -1704,7 +1770,6 @@ mod tests {
         assert_eq!(v["tool_trace"][0]["server"], "crm");
         assert_eq!(v["tool_trace"][0]["ms"], 412);
         assert_eq!(v["tool_trace"][0]["ok"], true);
-        // skip_serializing_if keeps args/error out when None.
         assert!(v["tool_trace"][0].get("args").is_none());
         assert!(v["tool_trace"][0].get("error").is_none());
         assert_eq!(v["tokens"]["input"], 100);
@@ -1712,6 +1777,29 @@ mod tests {
         assert!(v["tokens"].get("cache_creation_input").is_none());
         assert_eq!(v["iterations"], 2);
         assert_eq!(v["correlation_id"], "abc-123");
+        assert!(
+            v.get("suggestions").is_none(),
+            "empty Vec must skip serialization for v1.4 backwards-compat",
+        );
+    }
+
+    #[test]
+    fn chat_response_serializes_suggestions_when_present() {
+        let resp = ChatResponse {
+            answer: "ok".into(),
+            tool_trace: Vec::new(),
+            tokens: TokenUsage::default(),
+            iterations: 1,
+            correlation_id: "cid".into(),
+            suggestions: vec![
+                "Vraag een?".into(),
+                "Vraag twee?".into(),
+                "Vraag drie?".into(),
+            ],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["suggestions"][0], "Vraag een?");
+        assert_eq!(v["suggestions"].as_array().unwrap().len(), 3);
     }
 
     #[test]

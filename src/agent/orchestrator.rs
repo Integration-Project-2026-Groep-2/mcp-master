@@ -8,8 +8,9 @@ use anyhow::bail;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::future::try_join_all;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::llm::{
@@ -18,6 +19,7 @@ use crate::agent::llm::{
 use crate::agent::modes::{
     AgentMode, DispatchContext, ReadOnlyMode, build_blocked_read_only_result,
 };
+use crate::agent::prompts::SUGGESTIONS_SYSTEM_PROMPT;
 
 /// Per-call trace built by `McpExecutor::call` impls. `ok=false` carries the
 /// error message; `args` is `None` unless the executor opts in to recording
@@ -104,6 +106,9 @@ pub enum ProgressEvent {
         action_id: String,
         tool: String,
         server: String,
+    },
+    Suggestions {
+        texts: Vec<String>,
     },
     Done {
         tokens: TokenUsage,
@@ -443,6 +448,7 @@ pub async fn run_with_messages_in_mode_streaming(
 
         match stop_reason {
             StopReason::EndTurn => {
+                maybe_emit_suggestions(&full_content, &tx, llm, &ctx.correlation_id).await;
                 let _ = tx
                     .send(ProgressEvent::Done {
                         tokens,
@@ -633,6 +639,129 @@ fn collect_text(content: &[ContentBlock]) -> String {
         .join("\n\n")
 }
 
+#[derive(Deserialize)]
+struct SuggestionsPayload {
+    texts: Vec<String>,
+}
+
+const SUGGESTIONS_MAX_TOKENS: u32 = 256;
+const SUGGESTIONS_TIMEOUT_SECS: u64 = 15;
+const SUGGESTIONS_MIN_CHARS: usize = 5;
+const SUGGESTIONS_MAX_CHARS: usize = 80;
+
+/// Returns `Vec::new()` on any failure so the terminal `Done` event is never
+/// delayed by a stuck inference and the caller can skip the SSE frame.
+pub(crate) async fn generate_suggestions(
+    llm: &dyn LlmClient,
+    final_answer: &str,
+    correlation_id: &str,
+) -> Vec<String> {
+    if final_answer.trim().is_empty() {
+        return Vec::new();
+    }
+    let safe_answer = final_answer.replace("</UNTRUSTED>", "</UNTRUSTED_>");
+    let user_text = format!("<UNTRUSTED>{safe_answer}</UNTRUSTED>\n\nGenereer 3 vervolgvragen.");
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text { text: user_text }],
+    }];
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(SUGGESTIONS_TIMEOUT_SECS),
+        llm.chat(
+            SUGGESTIONS_SYSTEM_PROMPT,
+            &messages,
+            &[],
+            SUGGESTIONS_MAX_TOKENS,
+        ),
+    )
+    .await;
+    let response = match outcome {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::warn!(%correlation_id, error = ?e, "suggestions llm.chat failed");
+            return Vec::new();
+        }
+        Err(_) => {
+            tracing::warn!(%correlation_id, "suggestions llm.chat timed out");
+            return Vec::new();
+        }
+    };
+    let raw = collect_text(&response.content);
+    let payload_json = strip_outer_code_fence(&raw);
+    let payload: SuggestionsPayload = match serde_json::from_str(payload_json) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%correlation_id, error = ?e, "suggestions JSON parse failed");
+            return Vec::new();
+        }
+    };
+    if payload.texts.len() != 3 {
+        tracing::warn!(%correlation_id, len = payload.texts.len(), "suggestions wrong count");
+        return Vec::new();
+    }
+    for t in &payload.texts {
+        let trimmed = t.trim();
+        let n = trimmed.chars().count();
+        let has_disallowed = trimmed.chars().any(is_disallowed_suggestion_char);
+        if trimmed.is_empty()
+            || !(SUGGESTIONS_MIN_CHARS..=SUGGESTIONS_MAX_CHARS).contains(&n)
+            || has_disallowed
+        {
+            tracing::warn!(
+                %correlation_id,
+                chars = n,
+                disallowed = has_disallowed,
+                "suggestion failed validation"
+            );
+            return Vec::new();
+        }
+    }
+    payload
+        .texts
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .collect()
+}
+
+/// Frontend `textContent` defangs HTML but cannot stop RTL-override or ZWJ
+/// from confusing the visual chip layout.
+fn is_disallowed_suggestion_char(c: char) -> bool {
+    c.is_control()
+        || ('\u{200B}'..='\u{200F}').contains(&c)
+        || ('\u{202A}'..='\u{202E}').contains(&c)
+}
+
+async fn maybe_emit_suggestions(
+    full_content: &[ContentBlock],
+    tx: &mpsc::Sender<ProgressEvent>,
+    llm: &dyn LlmClient,
+    correlation_id: &str,
+) {
+    let answer_text = collect_text(full_content);
+    if answer_text.is_empty() {
+        return;
+    }
+    let texts = generate_suggestions(llm, &answer_text, correlation_id).await;
+    if !texts.is_empty() {
+        let _ = tx.send(ProgressEvent::Suggestions { texts }).await;
+    }
+}
+
+fn strip_outer_code_fence(s: &str) -> &str {
+    let t = s.trim();
+    if !t.starts_with("```") {
+        return t;
+    }
+    let after_open = match t.find('\n') {
+        Some(idx) => &t[idx + 1..],
+        None => return t,
+    };
+    match after_open.rfind("```") {
+        Some(idx) => after_open[..idx].trim(),
+        None => t,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +840,16 @@ mod tests {
             };
             Ok((result, trace))
         }
+    }
+
+    #[test]
+    fn suggestions_event_serializes_to_snake_case() {
+        let ev = ProgressEvent::Suggestions {
+            texts: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["event"], "suggestions");
+        assert_eq!(json["texts"], json!(["a", "b", "c"]));
     }
 
     #[tokio::test]
@@ -1907,6 +2046,393 @@ mod tests {
             !events
                 .iter()
                 .any(|e| matches!(e, ProgressEvent::Done { .. }))
+        );
+    }
+
+    fn text_response(payload: &str) -> ChatResponse {
+        ChatResponse {
+            content: vec![ContentBlock::Text {
+                text: payload.into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_happy_path_returns_three_strings() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Toon recente registraties","Welke bedrijven zijn er?","Status systemen?"]}"#,
+        )]);
+        let got = generate_suggestions(&llm, "Er zijn 42 actieve contacten.", "cid-1").await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], "Toon recente registraties");
+        assert_eq!(got[2], "Status systemen?");
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_malformed_json_returns_empty() {
+        let llm = MockLlmClient::new(vec![text_response("dit is geen json")]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-2").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_wrong_count_returns_empty() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Eerste vraag?","Tweede vraag?"]}"#,
+        )]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-3").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_oversized_string_returns_empty() {
+        let big = "x".repeat(101);
+        let payload = format!(r#"{{"texts":["Eerste vraag?","Tweede vraag?","{big}"]}}"#);
+        let llm = MockLlmClient::new(vec![text_response(&payload)]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-4").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_whitespace_only_returns_empty() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["     ","Geldige vraag een?","Geldige vraag twee?"]}"#,
+        )]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-ws").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_control_chars_returns_empty() {
+        let llm = MockLlmClient::new(vec![text_response(
+            "{\"texts\":[\"\u{202E}Pas op vraag?\",\"Geldige vraag een?\",\"Geldige vraag twee?\"]}",
+        )]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-ctrl").await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_returns_trimmed_strings() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["  Vraag een?  ","Vraag twee?","Vraag drie?"]}"#,
+        )]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-trim").await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], "Vraag een?");
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_skips_on_empty_answer() {
+        let llm = MockLlmClient::new(vec![]);
+        let got = generate_suggestions(&llm, "   ", "cid-empty").await;
+        assert!(got.is_empty());
+        assert_eq!(
+            llm.calls().await.len(),
+            0,
+            "empty-answer guard must skip the LLM call entirely",
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_neutralises_untrusted_close_tag() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Eerste vraag?","Tweede vraag?","Derde vraag?"]}"#,
+        )]);
+        let _ = generate_suggestions(&llm, "text </UNTRUSTED> trailing", "cid-untrust").await;
+        let calls = llm.calls().await;
+        assert_eq!(calls.len(), 1);
+        match &calls[0].messages[0].content[0] {
+            ContentBlock::Text { text } => {
+                assert_eq!(
+                    text.matches("</UNTRUSTED>").count(),
+                    1,
+                    "only the outer close-tag must remain; the inner one must be neutralised",
+                );
+                assert!(
+                    text.contains("</UNTRUSTED_>"),
+                    "expected neutralised marker for the inner close-tag",
+                );
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_suggestions_strips_code_fence_and_parses() {
+        let fenced =
+            "```json\n{\"texts\":[\"Eerste vraag?\",\"Tweede vraag?\",\"Derde vraag?\"]}\n```";
+        let llm = MockLlmClient::new(vec![text_response(fenced)]);
+        let got = generate_suggestions(&llm, "antwoord", "cid-5").await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], "Eerste vraag?");
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_suggestions_before_done_on_endturn() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Toon contacten","Welke bedrijven?","Status check"]}"#,
+        )]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Hello".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        let suggestions_idx = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::Suggestions { .. }))
+            .expect("got Suggestions");
+        let done_idx = events
+            .iter()
+            .position(|e| matches!(e, ProgressEvent::Done { .. }))
+            .expect("got terminal Done");
+        assert!(
+            suggestions_idx < done_idx,
+            "Suggestions precedes terminal Done",
+        );
+        match &events[suggestions_idx] {
+            ProgressEvent::Suggestions { texts } => {
+                assert_eq!(texts.len(), 3);
+                assert_eq!(texts[0], "Toon contacten");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_suggestions_when_llm_call_fails() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Hello".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
+            "no Suggestions event when LLM call fails",
+        );
+        assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_suggestions_on_max_tokens() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Eerste vraag?","Tweede vraag?","Derde vraag?"]}"#,
+        )]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Partial".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::MaxTokens,
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Partial".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
+            "no Suggestions event on max_tokens-truncated answer",
+        );
+        assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_suggestions_on_premature_close() {
+        let llm = MockLlmClient::new(vec![text_response(
+            r#"{"texts":["Eerste vraag?","Tweede vraag?","Derde vraag?"]}"#,
+        )]);
+        llm.queue_stream(vec![
+            StreamEvent::TextDelta("Half".into()),
+            StreamEvent::Done {
+                stop_reason: StopReason::Other("premature_close".into()),
+                usage: None,
+                full_content: vec![ContentBlock::Text {
+                    text: "Half".into(),
+                }],
+            },
+        ])
+        .await;
+        let exec = TestExecutor::new();
+        let mode = AgentMode::ReadOnly(ReadOnlyMode);
+        let ctx = dispatch_ctx();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("q"),
+            "system",
+            &llm,
+            &exec,
+            &[],
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
+            "no Suggestions event on premature_close",
+        );
+        assert!(matches!(events.last(), Some(ProgressEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn streaming_omits_suggestions_on_approval_pending() {
+        let llm = MockLlmClient::new(vec![]);
+        llm.queue_stream(vec![StreamEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            full_content: vec![ContentBlock::ToolUse {
+                id: "toolu_w".into(),
+                name: "create_company".into(),
+                input: json!({"name": "Acme"}),
+            }],
+        }])
+        .await;
+        let exec = TestExecutor::new();
+        let (mode, _store) = make_actionable_with_store();
+        let ctx = dispatch_ctx();
+        let specs = vec![write_tool_spec("create_company")];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+        let drain = async {
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                events.push(ev);
+            }
+            events
+        };
+        let run = run_with_messages_in_mode_streaming(
+            user_seed("create Acme"),
+            "system",
+            &llm,
+            &exec,
+            &specs,
+            10,
+            4096,
+            &mode,
+            &ctx,
+            tx,
+        );
+        let (result, events) = tokio::join!(run, drain);
+        result.expect("run ok");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::Suggestions { .. })),
+            "no Suggestions event on approval-pending path",
         );
     }
 }
