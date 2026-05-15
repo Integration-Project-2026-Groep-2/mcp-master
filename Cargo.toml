@@ -53,6 +53,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Stream-trait combinators (StreamExt::next) for lapin's Consumer.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# Lock-free concurrent utilities for in-memory vector store (mock backend).
+parking_lot = "0.12"
+
 # Server-Sent Events parser layered on top of a byte stream. Used to
 # consume Anthropic's text/event-stream responses without hand-rolling
 # the `event:`/`data:` line-grouping protocol.
