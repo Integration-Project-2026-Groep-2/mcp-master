@@ -24,6 +24,7 @@ use crate::{
     agent::orchestrator::{self, McpExecutor, ProgressEvent, ToolCallTrace},
     agent::prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     gateway::approval::types::ApprovalError,
+    memory::{MemoryInteraction, MemoryService, MemorySource},
     mcp::McpPool,
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     teams::{TeamsConfig, publish_to_teams},
@@ -65,6 +66,7 @@ pub struct AppState {
     pub pool: McpPool,
     pub tool_specs: Vec<ToolSpec>,
     pub publisher: Option<Arc<Publisher>>,
+    pub memory: Option<Arc<MemoryService>>,
     /// Wired into chat() in commit 2 (mode dispatch) and chat_approve/reject
     /// in commits 3+4. Held as Arc so the cleanup task holds Arc<ApprovalStore>
     /// (not Arc<AppState>) — keeps `Arc::try_unwrap` clean at shutdown.
@@ -306,10 +308,21 @@ async fn chat(
         scope,
     };
 
+    let system_prompt = match state.memory.as_deref() {
+        Some(memory) => memory
+            .augment_system_prompt(SETUP_PROMPT, &messages)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                SETUP_PROMPT.to_string()
+            }),
+        None => SETUP_PROMPT.to_string(),
+    };
+
     let started = std::time::Instant::now();
     let outcome = orchestrator::run_with_messages_in_mode(
         messages,
-        SETUP_PROMPT,
+        &system_prompt,
         &state.llm,
         &state.pool,
         &state.tool_specs,
@@ -348,6 +361,21 @@ async fn chat(
         if let Err(e) = publisher.publish_event("chat_completed", payload).await {
             tracing::warn!("failed to publish chat_completed event: {e:#}");
         }
+    }
+
+    if let Some(memory) = state.memory.as_deref()
+        && let Err(e) = memory
+            .remember_interaction(MemoryInteraction::new(
+                "default",
+                MemorySource::Chat,
+                correlation_id.clone(),
+                Some(ctx.user_id.clone()),
+                prompt,
+                &outcome.answer,
+            ))
+            .await
+    {
+        tracing::warn!("memory ingestion failed: {e:#}");
     }
 
     Ok(Json(ChatResponse {
@@ -571,6 +599,19 @@ async fn chat_stream(
         user_id,
         scope,
     };
+    let memory_for_ingest = state.memory.clone();
+    let user_id_for_ingest = ctx.user_id.clone();
+
+    let system_prompt = match state.memory.as_deref() {
+        Some(memory) => memory
+            .augment_system_prompt(SETUP_PROMPT, &messages)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                SETUP_PROMPT.to_string()
+            }),
+        None => SETUP_PROMPT.to_string(),
+    };
 
     let (sse_tx, mut sse_rx) = mpsc::channel::<ProgressEvent>(64);
 
@@ -590,7 +631,7 @@ async fn chat_stream(
         let orch_handle = tokio::spawn(async move {
             orchestrator::run_with_messages_in_mode_streaming(
                 messages,
-                SETUP_PROMPT,
+                &system_prompt,
                 &state_for_orch.llm,
                 &state_for_orch.pool,
                 &specs_for_orch,
@@ -719,6 +760,22 @@ async fn chat_stream(
             if let Err(e) = publisher.publish_event("chat_completed", payload).await {
                 tracing::warn!("failed to publish chat_completed event from stream: {e:#}");
             }
+        }
+
+        if succeeded
+            && let Some(memory) = memory_for_ingest.as_deref()
+            && let Err(e) = memory
+                .remember_interaction(MemoryInteraction::new(
+                    "default",
+                    MemorySource::Chat,
+                    correlation_id_pub.clone(),
+                    Some(user_id_for_ingest.clone()),
+                    prompt_pub.as_str(),
+                    &answer,
+                ))
+                .await
+        {
+            tracing::warn!("memory ingestion failed: {e:#}");
         }
     });
 
@@ -916,9 +973,25 @@ async fn handle_scheduled(
     teams: Option<&TeamsConfig>,
     key: (u32, u32),
 ) -> anyhow::Result<()> {
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: ANALYZE_CONTROLROOM_PROMPT.to_string(),
+        }],
+    }];
+    let system_prompt = match state.memory.as_deref() {
+        Some(memory) => memory
+            .augment_system_prompt(SETUP_PROMPT, &messages)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                SETUP_PROMPT.to_string()
+            }),
+        None => SETUP_PROMPT.to_string(),
+    };
     let outcome = orchestrator::run(
         ANALYZE_CONTROLROOM_PROMPT.to_string(),
-        SETUP_PROMPT,
+        &system_prompt,
         &state.llm,
         &state.pool,
         &state.tool_specs,
@@ -928,6 +1001,21 @@ async fn handle_scheduled(
     .await
     .context("scheduled analyze prompt")?;
     let answer = outcome.answer;
+
+    if let Some(memory) = state.memory.as_deref()
+        && let Err(e) = memory
+            .remember_interaction(MemoryInteraction::new(
+                "default",
+                MemorySource::ScheduledSummary,
+                format!("{key:?}"),
+                None::<String>,
+                ANALYZE_CONTROLROOM_PROMPT,
+                &answer,
+            ))
+            .await
+    {
+        tracing::warn!("memory ingestion failed: {e:#}");
+    }
 
     if let Some(teams) = teams {
         publish_to_teams(teams, &answer).await?;
@@ -956,6 +1044,7 @@ pub async fn serve(
     teams_config: Option<TeamsConfig>,
     tool_specs: Vec<ToolSpec>,
     rabbitmq: Option<(Publisher, RabbitMqConfig)>,
+    memory: Option<Arc<MemoryService>>,
 ) -> anyhow::Result<()> {
     let (publisher_arc, consumer_config) = match rabbitmq {
         Some((p, c)) => (Some(Arc::new(p)), Some(c)),
@@ -990,6 +1079,7 @@ pub async fn serve(
         pool,
         tool_specs,
         publisher: publisher_arc,
+        memory,
         approval_flow: approval_flow.clone(),
     });
     let teams_config = teams_config.map(Arc::new);

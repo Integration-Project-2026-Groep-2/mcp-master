@@ -1,7 +1,9 @@
 mod agent;
+mod debug_client;
 mod gateway;
 mod http_api;
 mod incident;
+mod memory;
 mod mcp;
 mod rabbitmq;
 mod retry;
@@ -13,7 +15,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::agent::llm::ToolSpec;
 use crate::agent::llm::anthropic::AnthropicClient;
+use crate::memory::{MemoryInteraction, MemoryService, MemorySource};
 use crate::teams::TeamsConfig;
+use uuid::Uuid;
 
 const MAX_ITERATIONS: usize = 10;
 const MAX_TOKENS: u32 = 8192;
@@ -23,18 +27,36 @@ async fn run_prompt(
     llm: &AnthropicClient,
     pool: &mcp::McpPool,
     tool_specs: &[ToolSpec],
-) -> Result<String> {
-    let outcome = agent::orchestrator::run(
+    memory: Option<&MemoryService>,
+) -> Result<agent::orchestrator::RunOutcome> {
+    let messages = vec![agent::llm::Message {
+        role: agent::llm::Role::User,
+        content: vec![agent::llm::ContentBlock::Text {
+            text: prompt.to_string(),
+        }],
+    }];
+
+    let system_prompt = match memory {
+        Some(memory) => memory
+            .augment_system_prompt(agent::prompts::SETUP_PROMPT, &messages)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                agent::prompts::SETUP_PROMPT.to_string()
+            }),
+        None => agent::prompts::SETUP_PROMPT.to_string(),
+    };
+
+    agent::orchestrator::run(
         prompt.to_string(),
-        agent::prompts::SETUP_PROMPT,
+        &system_prompt,
         llm,
         pool,
         tool_specs,
         MAX_ITERATIONS,
         MAX_TOKENS,
     )
-    .await?;
-    Ok(outcome.answer)
+    .await
 }
 
 pub async fn handle_prompt(
@@ -43,9 +65,26 @@ pub async fn handle_prompt(
     llm: &AnthropicClient,
     pool: &mcp::McpPool,
     tool_specs: &[ToolSpec],
+    memory: Option<&MemoryService>,
 ) -> Result<()> {
-    let answer = run_prompt(prompt, llm, pool, tool_specs).await?;
-    teams::publish_to_teams(teams_config, &answer).await?;
+    let outcome = run_prompt(prompt, llm, pool, tool_specs, memory).await?;
+    teams::publish_to_teams(teams_config, &outcome.answer).await?;
+
+    if let Some(memory) = memory
+        && let Err(e) = memory
+            .remember_interaction(MemoryInteraction::new(
+                "default",
+                MemorySource::Chat,
+                Uuid::new_v4().to_string(),
+                None::<String>,
+                prompt,
+                &outcome.answer,
+            ))
+            .await
+    {
+        tracing::warn!("memory ingestion failed: {e:#}");
+    }
+
     Ok(())
 }
 
@@ -83,7 +122,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let llm = AnthropicClient::from_env()?;
+// NOTE(nasr): trying to reduce the token consumption
+// let llm = AnthropicClient::from_env()?;
+    let llm = AnthropicClient::from_env()?.without_thinking();
     let teams_config = match teams::TeamsConfig::from_env() {
         Ok(c) => Some(c),
         Err(e) => {
@@ -94,8 +135,20 @@ async fn main() -> Result<()> {
 
     let terminal_mode = args.iter().any(|a| a == "--terminal-mode");
     let server_mode = args.iter().any(|a| a == "--server-mode");
+    let debug_client_mode = args.iter().any(|a| a == "--debug-mode");
 
-    if terminal_mode {
+    if debug_client_mode {
+        pool.shutdown().await?;
+        let backend_url = std::env::var("BACKEND_URL")
+            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        tracing::info!("connecting to backend at {}", backend_url);
+        debug_client::run_debug_client(&backend_url).await?;
+        return Ok(());
+    } else if terminal_mode {
+        let memory = MemoryService::from_env().await?;
+        if memory.is_some() {
+            tracing::info!("memory subsystem enabled");
+        }
         let prompt = read_prompt(&args)?;
         if prompt.trim().is_empty() {
             anyhow::bail!("no prompt provided (pass as argv[1] or via stdin)");
@@ -103,11 +156,23 @@ async fn main() -> Result<()> {
         let teams_config = teams_config
             .as_ref()
             .context("--terminal-mode requires TEAMS_ID, CHANNEL_ID, TEAMS_TOKEN")?;
-        handle_prompt(&prompt, teams_config, &llm, &pool, &tool_specs).await?;
+        handle_prompt(
+            &prompt,
+            teams_config,
+            &llm,
+            &pool,
+            &tool_specs,
+            memory.as_deref(),
+        )
+        .await?;
     } else if server_mode {
+        let memory = MemoryService::from_env().await?;
+        if memory.is_some() {
+            tracing::info!("memory subsystem enabled");
+        }
         tracing::info!("starting axum HTTP API on :8080");
         let rabbitmq = bootstrap_rabbitmq().await;
-        http_api::serve(pool, llm, teams_config, tool_specs, rabbitmq).await?;
+        http_api::serve(pool, llm, teams_config, tool_specs, rabbitmq, memory).await?;
         return Ok(());
     } else {
         // No execution mode flag. The previous default — a Teams Graph API
@@ -120,6 +185,7 @@ async fn main() -> Result<()> {
             "no execution mode set; pass one of: \
              --server-mode (production HTTP API), \
              --terminal-mode (one-shot CLI prompt), \
+             --debug-client (interactive CLI client for frontend testing), \
              --list-tools (debug, prints aggregated MCP tools)"
         );
     }

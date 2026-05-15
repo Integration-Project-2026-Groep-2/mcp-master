@@ -10,6 +10,7 @@ use crate::agent::llm::{ContentBlock, LlmClient, Message, Role, ToolSpec};
 use crate::agent::modes::{AgentMode, DispatchContext, ReadOnlyMode};
 use crate::agent::orchestrator::{self, McpExecutor, RunOutcome, ToolCallTrace};
 use crate::http_api::AppState;
+use crate::memory::{MemoryInteraction, MemoryService, MemorySource};
 
 const STEP_A_TOOLS: &[&str] = &["fetch_logs", "fetch_recent_deploys"];
 const STEP_A_MAX_ITERATIONS: usize = 6;
@@ -37,6 +38,7 @@ pub async fn gather_evidence(
     llm: &dyn LlmClient,
     mcp: &dyn McpExecutor,
     tool_specs: &[ToolSpec],
+    memory: Option<&MemoryService>,
 ) -> Result<EvidenceBundle> {
     let restricted = step_a_tool_specs(tool_specs);
     if restricted.is_empty() {
@@ -53,9 +55,20 @@ pub async fn gather_evidence(
         }],
     }];
 
+    let system_prompt = match memory {
+        Some(memory) => memory
+            .augment_system_prompt(STEP_A_SYSTEM_PROMPT, &messages)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                STEP_A_SYSTEM_PROMPT.to_string()
+            }),
+        None => STEP_A_SYSTEM_PROMPT.to_string(),
+    };
+
     let outcome = orchestrator::run_with_messages_in_mode(
         messages,
-        STEP_A_SYSTEM_PROMPT,
+        &system_prompt,
         llm,
         mcp,
         &restricted,
@@ -220,6 +233,7 @@ pub async fn compose_diagnosis(
     event: &IncidentEvent,
     evidence: &EvidenceBundle,
     llm: &dyn LlmClient,
+    memory: Option<&MemoryService>,
 ) -> Result<IncidentDiagnosis> {
     let messages = vec![Message {
         role: Role::User,
@@ -228,8 +242,19 @@ pub async fn compose_diagnosis(
         }],
     }];
 
+    let system_prompt = match memory {
+        Some(memory) => memory
+            .augment_system_prompt(STEP_B_SYSTEM_PROMPT, &messages)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                STEP_B_SYSTEM_PROMPT.to_string()
+            }),
+        None => STEP_B_SYSTEM_PROMPT.to_string(),
+    };
+
     let response = llm
-        .chat(STEP_B_SYSTEM_PROMPT, &messages, &[], STEP_B_MAX_TOKENS)
+        .chat(&system_prompt, &messages, &[], STEP_B_MAX_TOKENS)
         .await
         .context("Step B LLM call failed")?;
 
@@ -282,9 +307,41 @@ impl DiagnosePipeline for DefaultDiagnosePipeline {
             &self.state.llm,
             &self.state.pool,
             &self.state.tool_specs,
+            self.state.memory.as_deref(),
         )
         .await?;
-        compose_diagnosis(event, &evidence, &self.state.llm).await
+        let diagnosis = compose_diagnosis(
+            event,
+            &evidence,
+            &self.state.llm,
+            self.state.memory.as_deref(),
+        )
+        .await?;
+
+        if let Some(memory) = self.state.memory.as_deref() {
+            let prompt = format!(
+                "incident={} severity={:?} summary={} evidence={}",
+                event.payload.component,
+                event.payload.severity,
+                event.payload.summary,
+                evidence.summary
+            );
+            if let Err(e) = memory
+                .remember_interaction(MemoryInteraction::new(
+                    "default",
+                    MemorySource::IncidentDiagnosis,
+                    event.timestamp.to_rfc3339(),
+                    None::<String>,
+                    prompt,
+                    serde_json::to_string(&diagnosis).unwrap_or_else(|_| "{}".to_string()),
+                ))
+                .await
+            {
+                tracing::warn!("memory ingestion failed: {e:#}");
+            }
+        }
+
+        Ok(diagnosis)
     }
 }
 
