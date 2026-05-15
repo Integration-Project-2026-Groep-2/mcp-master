@@ -183,7 +183,7 @@
     async fn gather_evidence_bails_when_no_step_a_tools_available() {
         let llm = MockLlmClient::new(vec![]);
         let mcp = StubMcpExecutor::new();
-        let r = gather_evidence(&sample_event(), &llm, &mcp, &[]).await;
+        let r = gather_evidence(&sample_event(), &llm, &mcp, &[], None).await;
         assert!(r.is_err());
     }
 
@@ -213,7 +213,7 @@
             spec("fetch_recent_deploys", false),
         ];
 
-        let bundle = gather_evidence(&sample_event(), &llm, &mcp, &specs)
+        let bundle = gather_evidence(&sample_event(), &llm, &mcp, &specs, None)
             .await
             .unwrap();
 
@@ -231,7 +231,7 @@
             spec("fetch_recent_deploys", false),
         ];
 
-        let bundle = gather_evidence(&sample_event(), &llm, &mcp, &specs)
+        let bundle = gather_evidence(&sample_event(), &llm, &mcp, &specs, None)
             .await
             .unwrap();
 
@@ -253,7 +253,7 @@
             spec("fetch_recent_deploys", false),
         ];
 
-        let bundle = gather_evidence(&sample_event(), &llm, &mcp, &specs)
+        let bundle = gather_evidence(&sample_event(), &llm, &mcp, &specs, None)
             .await
             .unwrap();
 
@@ -275,7 +275,7 @@
             spec("fetch_recent_deploys", false),
         ];
 
-        let bundle = gather_evidence(&sample_event(), &llm, &mcp, &specs)
+        let bundle = gather_evidence(&sample_event(), &llm, &mcp, &specs, None)
             .await
             .unwrap();
 
@@ -348,7 +348,7 @@
                 "evidence_summary": "47 timeouts since deploy"
             }"#,
         )]);
-        let d = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm)
+        let d = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm, None)
             .await
             .unwrap();
         assert!(d.root_cause.contains("deploy abc123"));
@@ -371,6 +371,7 @@
             &sample_event(),
             &sample_evidence(vec!["elasticsearch", "github_actions"]),
             &llm,
+            None,
         )
         .await
         .unwrap();
@@ -386,14 +387,14 @@
         let llm = MockLlmClient::new(vec![end_turn(
             "```json\n{\"root_cause\":\"x\",\"critical_failure\":\"x\",\"impact\":\"x\",\"confidence\":\"low\",\"evidence_summary\":\"x\"}\n```",
         )]);
-        let r = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm).await;
+        let r = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm, None).await;
         assert!(r.is_ok());
     }
 
     #[tokio::test]
     async fn compose_diagnosis_bails_on_no_json() {
         let llm = MockLlmClient::new(vec![end_turn("just prose, sorry")]);
-        let r = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm).await;
+        let r = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm, None).await;
         assert!(r.is_err());
     }
 
@@ -408,7 +409,7 @@
                 "evidence_summary": "x"
             }"#,
         )]);
-        let r = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm).await;
+        let r = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm, None).await;
         assert!(r.is_err());
     }
 
@@ -417,7 +418,7 @@
         let llm = MockLlmClient::new(vec![end_turn(
             r#"{"root_cause":"x","critical_failure":"x","impact":"x","confidence":"low","evidence_summary":"x"}"#,
         )]);
-        let _ = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm)
+        let _ = compose_diagnosis(&sample_event(), &sample_evidence(vec![]), &llm, None)
             .await
             .unwrap();
         let calls = llm.calls().await;
@@ -474,12 +475,12 @@
         ];
         let event = sample_event();
 
-        let evidence = gather_evidence(&event, &llm, &mcp, &specs).await.unwrap();
+        let evidence = gather_evidence(&event, &llm, &mcp, &specs, None).await.unwrap();
         assert_eq!(evidence.summary, step_a_evidence);
         assert!(evidence.missing_sources.is_empty());
         assert_eq!(evidence.tool_trace.len(), 2);
 
-        let diagnosis = compose_diagnosis(&event, &evidence, &llm).await.unwrap();
+        let diagnosis = compose_diagnosis(&event, &evidence, &llm, None).await.unwrap();
         assert_eq!(
             diagnosis.confidence,
             crate::incident::schema::Confidence::High
@@ -551,7 +552,7 @@
         ];
         let event = sample_event();
 
-        let evidence = gather_evidence(&event, &llm, &mcp, &specs).await.unwrap();
+        let evidence = gather_evidence(&event, &llm, &mcp, &specs, None).await.unwrap();
         assert!(
             evidence
                 .missing_sources
@@ -560,7 +561,7 @@
             evidence.missing_sources
         );
 
-        let diagnosis = compose_diagnosis(&event, &evidence, &llm).await.unwrap();
+        let diagnosis = compose_diagnosis(&event, &evidence, &llm, None).await.unwrap();
         assert_eq!(
             diagnosis.confidence,
             crate::incident::schema::Confidence::Low
