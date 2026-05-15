@@ -2,3 +2,6 @@
 .env
 .env.local
 
+memory-cache.sqlite3
+memory-cache.sqlite3-shm
+memory-cache.sqlite3-wal
