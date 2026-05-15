@@ -24,7 +24,7 @@ use crate::{
     agent::orchestrator::{self, McpExecutor, ProgressEvent, ToolCallTrace},
     agent::prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     gateway::approval::types::ApprovalError,
-    memory::{MemoryInteraction, MemoryService, MemorySource},
+    memory::{MemoryInteraction, MemoryService, MemorySource, SqliteMemory},
     mcp::McpPool,
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     teams::{TeamsConfig, publish_to_teams},
@@ -66,6 +66,7 @@ pub struct AppState {
     pub pool: McpPool,
     pub tool_specs: Vec<ToolSpec>,
     pub publisher: Option<Arc<Publisher>>,
+    pub cache: Option<Arc<SqliteMemory>>,
     pub memory: Option<Arc<MemoryService>>,
     /// Wired into chat() in commit 2 (mode dispatch) and chat_approve/reject
     /// in commits 3+4. Held as Arc so the cleanup task holds Arc<ApprovalStore>
@@ -198,6 +199,7 @@ impl ChatRequest {
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
     pub answer: String,
+    pub cached: bool,
     pub tool_trace: Vec<ToolCallTrace>,
     pub tokens: TokenUsage,
     pub iterations: u32,
@@ -308,6 +310,26 @@ async fn chat(
         scope,
     };
 
+    if let Some(cache) = state.cache.as_ref()
+    {
+        match cache.lookup_response(&prompt) {
+            Ok(Some(answer)) => {
+                tracing::info!(correlation_id = %correlation_id, "chat cache hit");
+                return Ok(Json(ChatResponse {
+                    answer,
+                    cached: true,
+                    tool_trace: Vec::new(),
+                    tokens: TokenUsage::default(),
+                    iterations: 0,
+                    correlation_id,
+                    suggestions: Vec::new(),
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(AppError(e).into_response()),
+        }
+    }
+
     let system_prompt = match state.memory.as_deref() {
         Some(memory) => memory
             .augment_system_prompt(SETUP_PROMPT, &messages)
@@ -370,7 +392,7 @@ async fn chat(
                 MemorySource::Chat,
                 correlation_id.clone(),
                 Some(ctx.user_id.clone()),
-                prompt,
+                &prompt,
                 &outcome.answer,
             ))
             .await
@@ -378,8 +400,15 @@ async fn chat(
         tracing::warn!("memory ingestion failed: {e:#}");
     }
 
+    if let Some(cache) = state.cache.as_ref()
+        && let Err(e) = cache.store_response(&prompt, &outcome.answer)
+    {
+        tracing::warn!("response cache store failed: {e:#}");
+    }
+
     Ok(Json(ChatResponse {
         answer: outcome.answer,
+        cached: false,
         tool_trace: outcome.tool_trace,
         tokens: outcome.tokens,
         iterations: outcome.iterations,
@@ -469,6 +498,7 @@ async fn chat_approve(
 
     Json(ChatResponse {
         answer: result,
+        cached: false,
         tool_trace: vec![trace],
         tokens: TokenUsage::default(),
         iterations: 0,
@@ -519,6 +549,7 @@ async fn chat_reject(
     let reason_text = body.reason.unwrap_or_else(|| "no reason given".to_string());
     Json(ChatResponse {
         answer: format!("Action rejected: {reason_text}"),
+        cached: false,
         tool_trace: Vec::new(),
         tokens: TokenUsage::default(),
         iterations: 0,
@@ -1044,6 +1075,7 @@ pub async fn serve(
     teams_config: Option<TeamsConfig>,
     tool_specs: Vec<ToolSpec>,
     rabbitmq: Option<(Publisher, RabbitMqConfig)>,
+    cache: Option<Arc<SqliteMemory>>,
     memory: Option<Arc<MemoryService>>,
 ) -> anyhow::Result<()> {
     let (publisher_arc, consumer_config) = match rabbitmq {
@@ -1079,6 +1111,7 @@ pub async fn serve(
         pool,
         tool_specs,
         publisher: publisher_arc,
+        cache,
         memory,
         approval_flow: approval_flow.clone(),
     });

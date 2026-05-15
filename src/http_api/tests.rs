@@ -560,6 +560,7 @@
         // `const { answer } = res.json()` destructure must keep working.
         let resp = ChatResponse {
             answer: "ok".into(),
+            cached: false,
             tool_trace: vec![ToolCallTrace {
                 tool: "count_contacts".into(),
                 server: "crm".into(),
@@ -603,6 +604,7 @@
     fn chat_response_serializes_suggestions_when_present() {
         let resp = ChatResponse {
             answer: "ok".into(),
+            cached: true,
             tool_trace: Vec::new(),
             tokens: TokenUsage::default(),
             iterations: 1,
