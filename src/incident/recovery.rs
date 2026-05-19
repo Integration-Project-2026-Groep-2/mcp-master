@@ -33,6 +33,8 @@ use super::schema::IncidentEvent;
 use crate::rabbitmq::config::RabbitMqConfig;
 use crate::rabbitmq::publisher::Publisher;
 use crate::retry::backoff_with_jitter;
+use quick_xml::de::from_str as xml_from_str;
+use serde::Deserialize;
 
 const QUEUE_NAME: &str = "mcp-master.recoveries";
 const ROUTING_KEY: &str = "event.heartbeat_succeeded";
@@ -151,7 +153,9 @@ async fn consume_session(
                 }
             }
             delivery = consumer.next() => match delivery {
-                Some(Ok(msg)) => match handle_recovery(&msg.data, publisher).await {
+                Some(Ok(msg)) => {
+                    let content_type = msg.properties.content_type().as_ref().map(|s| s.as_str());
+                    match handle_recovery_with_content(&msg.data, publisher, content_type).await {
                     Ok(()) => {
                         if let Err(e) = msg.ack(BasicAckOptions::default()).await {
                             tracing::warn!("recovery ack failed: {e:#}");
@@ -169,7 +173,8 @@ async fn consume_session(
                             tracing::warn!("recovery nack failed: {nack_err:#}");
                         }
                     }
-                },
+                    }
+                }
                 Some(Err(e)) => {
                     return Err(anyhow::Error::from(e).context("recovery consumer delivery error"));
                 }
@@ -181,11 +186,86 @@ async fn consume_session(
     }
 }
 
-async fn handle_recovery(body: &[u8], publisher: Option<&Arc<Publisher>>) -> Result<()> {
+async fn handle_recovery_with_content(
+    body: &[u8],
+    publisher: Option<&Arc<Publisher>>,
+    content_type: Option<&str>,
+) -> Result<()> {
     let correlation_id = Uuid::new_v4().to_string();
 
-    let evt: IncidentEvent =
-        serde_json::from_slice(body).context("decoding recovery IncidentEvent envelope")?;
+    let evt: IncidentEvent = if matches!(content_type, Some(ct) if ct.contains("json")) {
+        serde_json::from_slice(body).context("decoding recovery IncidentEvent JSON envelope")?
+    } else if matches!(content_type, Some(ct) if ct.contains("xml")) || (!body.is_empty() && body[0] == b'<') {
+        #[derive(Debug, Deserialize)]
+        struct XmlHeartbeatCustomDetails {
+            #[serde(rename = "HeartbeatCountLast60s")]
+            heartbeat_count_last_60s: f64,
+            #[serde(rename = "Threshold")]
+            threshold: Option<i64>,
+            #[serde(rename = "LastCheckAt")]
+            last_check_at: Option<String>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct XmlHeartbeatPayload {
+            #[serde(rename = "Summary")]
+            summary: String,
+            #[serde(rename = "Severity")]
+            severity: String,
+            #[serde(rename = "Component")]
+            component: String,
+            #[serde(rename = "Group")]
+            group: Option<String>,
+            #[serde(rename = "Class")]
+            class: Option<String>,
+            #[serde(rename = "CustomDetails")]
+            custom_details: XmlHeartbeatCustomDetails,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct XmlHeartbeatEvent {
+            #[serde(rename = "Event")]
+            event: String,
+            #[serde(rename = "Source")]
+            source: String,
+            #[serde(rename = "Timestamp")]
+            timestamp: chrono::DateTime<chrono::Utc>,
+            #[serde(rename = "Payload")]
+            payload: XmlHeartbeatPayload,
+        }
+
+        let s = std::str::from_utf8(body).context("utf8 from xml body")?;
+        let xml_evt: XmlHeartbeatEvent = xml_from_str(s).context("decoding Controlroom XML heartbeat")?;
+
+        // Map to IncidentEvent
+        let payload = crate::incident::schema::IncidentPayload {
+            summary: xml_evt.payload.summary,
+            severity: match xml_evt.payload.severity.to_lowercase().as_str() {
+                "critical" => crate::incident::schema::Severity::Critical,
+                "error" => crate::incident::schema::Severity::Error,
+                "warning" => crate::incident::schema::Severity::Warning,
+                "info" => crate::incident::schema::Severity::Info,
+                other => anyhow::bail!("unknown severity: {other}"),
+            },
+            component: xml_evt.payload.component,
+            group: xml_evt.payload.group,
+            class: xml_evt.payload.class,
+            custom_details: serde_json::json!({
+                "heartbeat_count_last_60s": xml_evt.payload.custom_details.heartbeat_count_last_60s,
+                "threshold": xml_evt.payload.custom_details.threshold,
+                "last_check_at": xml_evt.payload.custom_details.last_check_at,
+            }),
+        };
+
+        IncidentEvent {
+            event: xml_evt.event,
+            source: xml_evt.source,
+            timestamp: xml_evt.timestamp,
+            payload,
+        }
+    } else {
+        serde_json::from_slice(body).context("decoding recovery IncidentEvent envelope")?
+    };
 
     if evt.event != EXPECTED_BODY_EVENT {
         tracing::warn!(
@@ -230,6 +310,11 @@ async fn handle_recovery(body: &[u8], publisher: Option<&Arc<Publisher>>) -> Res
     }
 
     Ok(())
+}
+
+// Backwards-compatible wrapper for callers that don't provide content_type
+async fn handle_recovery(body: &[u8], publisher: Option<&Arc<Publisher>>) -> Result<()> {
+    handle_recovery_with_content(body, publisher, None).await
 }
 
 fn scrub_summary(s: &str) -> String {

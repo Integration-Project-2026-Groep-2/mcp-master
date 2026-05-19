@@ -20,6 +20,8 @@ use super::diagnose::DiagnosePipeline;
 use super::schema::{IncidentDiagnosis, IncidentEvent};
 use crate::rabbitmq::config::RabbitMqConfig;
 use crate::rabbitmq::publisher::Publisher;
+use quick_xml::de::from_str as xml_from_str;
+use serde::Deserialize;
 use crate::retry::backoff_with_jitter;
 
 const QUEUE_NAME: &str = "mcp-master.incidents";
@@ -173,22 +175,22 @@ async fn consume_session(
                 }
             }
             delivery = consumer.next() => match delivery {
-                Some(Ok(msg)) => match handle_delivery(&msg.data, debouncer, budget, publisher, pipeline).await {
-                    Ok(()) => {
-                        if let Err(e) = msg.ack(BasicAckOptions::default()).await {
-                            tracing::warn!("incident ack failed: {e:#}");
+                Some(Ok(msg)) => {
+                    let content_type = msg.properties.content_type().as_ref().map(|s| s.as_str());
+                    match handle_delivery_with_content(&msg.data, debouncer, budget, publisher, pipeline, content_type).await {
+                        Ok(()) => {
+                            if let Err(e) = msg.ack(BasicAckOptions::default()).await {
+                                tracing::warn!("incident ack failed: {e:#}");
+                            }
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!("incident handler failed: {e:#}");
-                        if let Err(nack_err) = msg
-                            .nack(BasicNackOptions {
-                                requeue: false,
-                                multiple: false,
-                            })
-                            .await
-                        {
-                            tracing::warn!("incident nack failed: {nack_err:#}");
+                        Err(e) => {
+                            tracing::error!("incident handler failed: {e:#}");
+                            if let Err(nack_err) = msg
+                                .nack(BasicNackOptions { requeue: false, multiple: false })
+                                .await
+                            {
+                                tracing::warn!("incident nack failed: {nack_err:#}");
+                            }
                         }
                     }
                 },
@@ -203,18 +205,95 @@ async fn consume_session(
     }
 }
 
-async fn handle_delivery(
+async fn handle_delivery_with_content(
     body: &[u8],
     debouncer: &Debouncer,
     budget: &Budget,
     publisher: Option<&Arc<Publisher>>,
     pipeline: Option<&Arc<dyn DiagnosePipeline>>,
+    content_type: Option<&str>,
 ) -> Result<()> {
     let received_at = Instant::now();
     let correlation_id = Uuid::new_v4().to_string();
 
-    let evt: IncidentEvent =
-        serde_json::from_slice(body).context("decoding IncidentEvent envelope")?;
+    // Try JSON first (legacy), then XML (Controlroom refactor). Prefer
+    // JSON when content-type is application/json; otherwise attempt XML
+    // when content-type indicates XML or body looks like XML.
+    let evt: IncidentEvent = if matches!(content_type, Some(ct) if ct.contains("json")) {
+        serde_json::from_slice(body).context("decoding IncidentEvent JSON envelope")?
+    } else if matches!(content_type, Some(ct) if ct.contains("xml")) || (!body.is_empty() && body[0] == b'<') {
+        #[derive(Debug, Deserialize)]
+        struct XmlHeartbeatCustomDetails {
+            #[serde(rename = "HeartbeatCountLast60s")]
+            heartbeat_count_last_60s: f64,
+            #[serde(rename = "Threshold")]
+            threshold: Option<i64>,
+            #[serde(rename = "LastCheckAt")]
+            last_check_at: Option<String>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct XmlHeartbeatPayload {
+            #[serde(rename = "Summary")]
+            summary: String,
+            #[serde(rename = "Severity")]
+            severity: String,
+            #[serde(rename = "Component")]
+            component: String,
+            #[serde(rename = "Group")]
+            group: Option<String>,
+            #[serde(rename = "Class")]
+            class: Option<String>,
+            #[serde(rename = "CustomDetails")]
+            custom_details: XmlHeartbeatCustomDetails,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct XmlHeartbeatEvent {
+            #[serde(rename = "Event")]
+            event: String,
+            #[serde(rename = "Source")]
+            source: String,
+            #[serde(rename = "Timestamp")]
+            timestamp: chrono::DateTime<chrono::Utc>,
+            #[serde(rename = "Payload")]
+            payload: XmlHeartbeatPayload,
+        }
+
+        let s = std::str::from_utf8(body).context("utf8 from xml body")?;
+        let xml_evt: XmlHeartbeatEvent = xml_from_str(s).context("decoding Controlroom XML heartbeat")?;
+
+        // Map XML heartbeat event into IncidentEvent shape expected downstream
+        let payload = crate::incident::schema::IncidentPayload {
+            summary: xml_evt.payload.summary,
+            severity: match xml_evt.payload.severity.to_lowercase().as_str() {
+                "critical" => crate::incident::schema::Severity::Critical,
+                "error" => crate::incident::schema::Severity::Error,
+                "warning" => crate::incident::schema::Severity::Warning,
+                "info" => crate::incident::schema::Severity::Info,
+                other => {
+                    anyhow::bail!("unknown severity: {other}")
+                }
+            },
+            component: xml_evt.payload.component,
+            group: xml_evt.payload.group,
+            class: xml_evt.payload.class,
+            custom_details: serde_json::json!({
+                "heartbeat_count_last_60s": xml_evt.payload.custom_details.heartbeat_count_last_60s,
+                "threshold": xml_evt.payload.custom_details.threshold,
+                "last_check_at": xml_evt.payload.custom_details.last_check_at,
+            }),
+        };
+
+        IncidentEvent {
+            event: xml_evt.event,
+            source: xml_evt.source,
+            timestamp: xml_evt.timestamp,
+            payload,
+        }
+    } else {
+        serde_json::from_slice(body).context("decoding IncidentEvent envelope")?
+    };
 
     if !evt.payload.severity.is_actionable() {
         tracing::info!(
@@ -294,6 +373,19 @@ async fn handle_delivery(
     }
 
     Ok(())
+}
+
+// Backwards-compatible wrapper for existing call-sites (tests and other
+// modules) that don't provide `content_type`. For runtime code that does
+// inspect AMQP properties we call `handle_delivery_with_content` directly.
+async fn handle_delivery(
+    body: &[u8],
+    debouncer: &Debouncer,
+    budget: &Budget,
+    publisher: Option<&Arc<Publisher>>,
+    pipeline: Option<&Arc<dyn DiagnosePipeline>>,
+) -> Result<()> {
+    handle_delivery_with_content(body, debouncer, budget, publisher, pipeline, None).await
 }
 
 async fn publish_skip(

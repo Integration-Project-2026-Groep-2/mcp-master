@@ -1784,6 +1784,7 @@ dependencies = [
  "jsonwebtoken",
  "lapin",
  "parking_lot",
+ "quick-xml",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmcp",
@@ -2191,6 +2192,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81b9228215d82c7b61490fec1de287136b5de6f5700f6e58ea9ad61a7964ca51"
+dependencies = [
+ "memchr",
+ "serde",
 ]
 
 [[package]]

@@ -82,6 +82,9 @@ jsonschema = { version = "0.30", default-features = false }
 # when multiple instances all hit a 429 at the same wallclock).
 rand = "0.8"
 
+# XML deserialization for Controlroom watchdog publisher
+quick-xml = { version = "0.29", features = ["serialize"] }
+
 # JWT decode for AuthScope extractor. HS256 only (default features); no
 # `ring`/`openssl` pulled in.
 jsonwebtoken = { version = "9", default-features = false }
