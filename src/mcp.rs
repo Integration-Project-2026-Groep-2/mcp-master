@@ -391,6 +391,7 @@ impl McpExecutor for McpPool {
 
     async fn call(&self, name: &str, arguments: Value) -> anyhow::Result<(String, ToolCallTrace)> {
         validate_args_against_schema(&self.tool_specs, name, &arguments)?;
+
         let map = arguments
             .as_object()
             .cloned()

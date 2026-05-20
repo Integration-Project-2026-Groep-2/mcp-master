@@ -4,6 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const RESPONSE_CACHE_TTL_MS: i64 = 60_000;
+
 /// Very small memory representation.
 pub struct Memory {
     pub id: i64,
@@ -82,6 +84,7 @@ impl SqliteMemory {
     pub fn lookup_response(&self, prompt: &str) -> Result<Option<String>> {
         let norm = Self::normalize_prompt(prompt);
         let key = Self::hash_prompt(&norm);
+        let now = now_unix_ms();
         let conn = self.conn.lock().expect("sqlite cache mutex poisoned");
         let row: Option<(String, i64)> = conn
             .query_row(
@@ -92,7 +95,15 @@ impl SqliteMemory {
             .optional()
             .context("querying response cache")?;
 
-        Ok(row.map(|(resp, _)| resp))
+        match row {
+            Some((resp, created_at)) if now - created_at <= RESPONSE_CACHE_TTL_MS => Ok(Some(resp)),
+            Some((_resp, _created_at)) => {
+                conn.execute("DELETE FROM responses WHERE prompt_hash = ?1", params![key])
+                    .context("evicting stale response cache entry")?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Store exact response mapping for a prompt.
@@ -203,6 +214,35 @@ mod tests {
         db.store_response(prompt, "Answer 1").unwrap();
         let got = db.lookup_response("Hello World").unwrap().unwrap();
         assert_eq!(got, "Answer 1");
+    }
+
+    #[test]
+    fn cache_expires_after_one_minute() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = SqliteMemory::open(tmp.path().to_str().unwrap()).unwrap();
+        let prompt = "cache me";
+        db.store_response(prompt, "fresh").unwrap();
+
+        let key = SqliteMemory::hash_prompt(&SqliteMemory::normalize_prompt(prompt));
+        let conn = db.conn.lock().expect("sqlite cache mutex poisoned");
+        conn.execute(
+            "UPDATE responses SET created_at = ?1 WHERE prompt_hash = ?2",
+            params![now_unix_ms() - RESPONSE_CACHE_TTL_MS - 1, key],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(db.lookup_response(prompt).unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_keeps_entries_within_ttl() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = SqliteMemory::open(tmp.path().to_str().unwrap()).unwrap();
+        let prompt = "still fresh";
+        db.store_response(prompt, "fresh").unwrap();
+
+        assert_eq!(db.lookup_response(prompt).unwrap().as_deref(), Some("fresh"));
     }
 
     #[test]
