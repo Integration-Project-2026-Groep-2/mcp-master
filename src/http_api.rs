@@ -1132,6 +1132,11 @@ async fn forget_memory(
         let body = Json(serde_json::json!({ "error": "forbidden" }));
         return Err((StatusCode::FORBIDDEN, body).into_response());
     }
+    // Response cache isn't keyed by user; clear it wholesale so no cached
+    // answer outlives the erasure. It's ephemeral and rebuilds in seconds.
+    if let Some(cache) = state.cache.as_ref() {
+        cache.clear().map_err(|e| AppError(e).into_response())?;
+    }
     match state.memory.as_deref() {
         Some(memory) => {
             memory

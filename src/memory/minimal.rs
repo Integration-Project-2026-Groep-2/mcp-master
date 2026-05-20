@@ -112,6 +112,13 @@ impl SqliteMemory {
             .context("purging expired response cache entries")?;
         Ok(removed)
     }
+
+    pub fn clear(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("sqlite cache mutex poisoned");
+        conn.execute("DELETE FROM responses", [])
+            .context("clearing response cache")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +189,18 @@ mod tests {
         assert_eq!(db.purge_expired().unwrap(), 1);
         assert_eq!(db.lookup_response("fresh").unwrap().as_deref(), Some("f"));
         assert!(db.lookup_response("stale").unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_empties_cache() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = SqliteMemory::open(tmp.path().to_str().unwrap()).unwrap();
+        db.store_response("a", "1").unwrap();
+        db.store_response("b", "2").unwrap();
+
+        db.clear().unwrap();
+
+        assert!(db.lookup_response("a").unwrap().is_none());
+        assert!(db.lookup_response("b").unwrap().is_none());
     }
 }
