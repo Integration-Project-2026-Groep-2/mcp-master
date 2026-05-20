@@ -205,8 +205,14 @@ impl VectorStore for QdrantVectorStore {
 fn point_payload_to_map(payload: MemoryPayload) -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("namespace".into(), Value::String(payload.namespace));
-    map.insert("source".into(), Value::String(payload.source.as_str().into()));
-    map.insert("correlation_id".into(), Value::String(payload.correlation_id));
+    map.insert(
+        "source".into(),
+        Value::String(payload.source.as_str().into()),
+    );
+    map.insert(
+        "correlation_id".into(),
+        Value::String(payload.correlation_id),
+    );
     if let Some(user_id) = payload.user_id {
         map.insert("user_id".into(), Value::String(user_id));
     }

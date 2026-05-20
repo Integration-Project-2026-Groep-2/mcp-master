@@ -3,8 +3,8 @@ mod debug_client;
 mod gateway;
 mod http_api;
 mod incident;
-mod memory;
 mod mcp;
+mod memory;
 mod rabbitmq;
 mod retry;
 mod teams;
@@ -122,8 +122,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-// NOTE(nasr): trying to reduce the token consumption
-// let llm = AnthropicClient::from_env()?;
+    // NOTE(nasr): trying to reduce the token consumption
+    // let llm = AnthropicClient::from_env()?;
     let llm = AnthropicClient::from_env()?.without_thinking();
     let teams_config = match teams::TeamsConfig::from_env() {
         Ok(c) => Some(c),
@@ -139,8 +139,8 @@ async fn main() -> Result<()> {
 
     if debug_client_mode {
         pool.shutdown().await?;
-        let backend_url = std::env::var("BACKEND_URL")
-            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let backend_url =
+            std::env::var("BACKEND_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
         tracing::info!("connecting to backend at {}", backend_url);
         debug_client::run_debug_client(&backend_url).await?;
         return Ok(());
@@ -170,7 +170,9 @@ async fn main() -> Result<()> {
         if memory.is_some() {
             tracing::info!("memory subsystem enabled");
         }
-        let cache = Some(std::sync::Arc::new(SqliteMemory::open("memory-cache.sqlite3")?));
+        let cache = Some(std::sync::Arc::new(SqliteMemory::open(
+            "memory-cache.sqlite3",
+        )?));
         tracing::info!("starting axum HTTP API on :8080");
         let rabbitmq = bootstrap_rabbitmq().await;
         http_api::serve(pool, llm, teams_config, tool_specs, rabbitmq, cache, memory).await?;

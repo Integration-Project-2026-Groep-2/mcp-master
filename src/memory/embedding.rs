@@ -46,7 +46,11 @@ impl EmbeddingClient for HttpEmbeddingClient {
             return Ok(Vec::new());
         }
 
-        let url = format!("{}{}", self.base_url.trim_end_matches('/'), self.endpoint_path.as_str());
+        let url = format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            self.endpoint_path.as_str()
+        );
         let body = EmbeddingsRequest {
             model: &self.model,
             input: texts,
@@ -73,7 +77,10 @@ impl EmbeddingClient for HttpEmbeddingClient {
         vectors.sort_by_key(|item| item.index);
         let vectors: Vec<Vec<f32>> = vectors.into_iter().map(|item| item.embedding).collect();
 
-        if vectors.iter().any(|embedding| embedding.len() != self.dimension) {
+        if vectors
+            .iter()
+            .any(|embedding| embedding.len() != self.dimension)
+        {
             anyhow::bail!(
                 "embedding dimension mismatch: expected {}, got {:?}",
                 self.dimension,

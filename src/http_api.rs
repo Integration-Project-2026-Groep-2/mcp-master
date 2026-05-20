@@ -24,8 +24,8 @@ use crate::{
     agent::orchestrator::{self, McpExecutor, ProgressEvent, ToolCallTrace},
     agent::prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     gateway::approval::types::ApprovalError,
-    memory::{MemoryInteraction, MemoryService, MemorySource, SqliteMemory},
     mcp::McpPool,
+    memory::{MemoryInteraction, MemoryService, MemorySource, SqliteMemory},
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     teams::{TeamsConfig, publish_to_teams},
 };

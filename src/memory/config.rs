@@ -37,8 +37,8 @@ impl MemoryConfig {
         }
 
         let namespace = env_string("MEMORY_NAMESPACE").unwrap_or_else(|_| "default".to_string());
-        let collection = env_string("MEMORY_COLLECTION")
-            .unwrap_or_else(|_| "mcp_master_memory".to_string());
+        let collection =
+            env_string("MEMORY_COLLECTION").unwrap_or_else(|_| "mcp_master_memory".to_string());
 
         let retrieval_top_k = env_usize("MEMORY_TOP_K", 5)?;
         let chunk_chars = env_usize("MEMORY_CHUNK_CHARS", 1200)?;
@@ -72,8 +72,7 @@ impl MemoryConfig {
 impl EmbeddingConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            base_url: env_string("MEMORY_EMBEDDING_URL")
-                .context("MEMORY_EMBEDDING_URL not set")?,
+            base_url: env_string("MEMORY_EMBEDDING_URL").context("MEMORY_EMBEDDING_URL not set")?,
             model: env_string("MEMORY_EMBEDDING_MODEL")
                 .context("MEMORY_EMBEDDING_MODEL not set")?,
             api_key: env_optional_string("MEMORY_EMBEDDING_API_KEY"),
@@ -99,7 +98,9 @@ fn env_string(name: &str) -> Result<String> {
 }
 
 fn env_optional_string(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn env_usize(name: &str, default: usize) -> Result<usize> {
