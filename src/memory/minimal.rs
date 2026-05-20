@@ -100,6 +100,15 @@ impl SqliteMemory {
         )?;
         Ok(())
     }
+
+    pub fn purge_expired(&self) -> Result<usize> {
+        let cutoff = now_unix_ms() - RESPONSE_CACHE_TTL_MS;
+        let conn = self.conn.lock().expect("sqlite cache mutex poisoned");
+        let removed = conn
+            .execute("DELETE FROM responses WHERE created_at < ?1", params![cutoff])
+            .context("purging expired response cache entries")?;
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +154,27 @@ mod tests {
         db.store_response(prompt, "fresh").unwrap();
 
         assert_eq!(db.lookup_response(prompt).unwrap().as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn purge_expired_removes_only_stale_rows() {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = SqliteMemory::open(tmp.path().to_str().unwrap()).unwrap();
+        db.store_response("fresh", "f").unwrap();
+        db.store_response("stale", "s").unwrap();
+
+        let key = SqliteMemory::hash_prompt(&SqliteMemory::normalize_prompt("stale"));
+        {
+            let conn = db.conn.lock().expect("sqlite cache mutex poisoned");
+            conn.execute(
+                "UPDATE responses SET created_at = ?1 WHERE prompt_hash = ?2",
+                params![now_unix_ms() - RESPONSE_CACHE_TTL_MS - 1, key],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(db.purge_expired().unwrap(), 1);
+        assert_eq!(db.lookup_response("fresh").unwrap().as_deref(), Some("f"));
+        assert!(db.lookup_response("stale").unwrap().is_none());
     }
 }

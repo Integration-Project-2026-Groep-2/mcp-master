@@ -250,6 +250,35 @@ impl IntoResponse for AppError {
     }
 }
 
+const CACHE_SWEEP_INTERVAL_SECONDS: u64 = 60;
+
+async fn run_cache_sweeper(cache: Arc<SqliteMemory>, mut shutdown_rx: watch::Receiver<bool>) {
+    let mut ticker =
+        tokio::time::interval(std::time::Duration::from_secs(CACHE_SWEEP_INTERVAL_SECONDS));
+    ticker.tick().await; // skip immediate first fire
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::info!("response cache sweeper shutting down");
+                    return;
+                }
+            }
+            _ = ticker.tick() => {
+                let cache = Arc::clone(&cache);
+                match tokio::task::spawn_blocking(move || cache.purge_expired()).await {
+                    Ok(Ok(n)) if n > 0 => tracing::debug!(count = n, "swept expired response cache"),
+                    Ok(Err(e)) => tracing::warn!("response cache sweep failed: {e:#}"),
+                    Err(e) => tracing::warn!("response cache sweep task panicked: {e:#}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -1156,6 +1185,11 @@ pub async fn serve(
         shutdown_rx.clone(),
     ));
 
+    let cache_sweeper_handle = state
+        .cache
+        .clone()
+        .map(|cache| tokio::spawn(run_cache_sweeper(cache, shutdown_rx.clone())));
+
     let incident_pipeline: Arc<dyn crate::incident::diagnose::DiagnosePipeline> = Arc::new(
         crate::incident::diagnose::DefaultDiagnosePipeline::new(state.clone()),
     );
@@ -1277,6 +1311,15 @@ pub async fn serve(
         Err(_) => tracing::warn!(
             "approval cleanup task didn't drain in 2s — task detached, runtime drop will reclaim"
         ),
+    }
+    if let Some(h) = cache_sweeper_handle {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), h).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("response cache sweeper join error: {e:#}"),
+            Err(_) => tracing::warn!(
+                "response cache sweeper didn't drain in 2s — task detached, runtime drop will reclaim"
+            ),
+        }
     }
     if let Some(h) = consumer_handle {
         // The consumer task uses `tokio::select!` against `shutdown_rx`, but
