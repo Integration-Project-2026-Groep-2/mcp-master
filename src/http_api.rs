@@ -258,6 +258,29 @@ async fn metrics() -> (StatusCode, &'static str) {
     (StatusCode::NOT_IMPLEMENTED, "not implemented")
 }
 
+/// Keys over the whole conversation, not just the last turn, so two chats
+/// ending in the same message don't collide. None when nothing is cacheable.
+fn conversation_cache_key(messages: &[Message]) -> Option<String> {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    let mut has_text = false;
+    for message in messages {
+        let role = match message.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        for block in &message.content {
+            if let ContentBlock::Text { text } = block {
+                let _ = writeln!(buf, "{role}: {text}");
+                if !text.trim().is_empty() {
+                    has_text = true;
+                }
+            }
+        }
+    }
+    has_text.then_some(buf)
+}
+
 async fn chat(
     scope: crate::gateway::auth::AuthScope,
     State(state): State<Arc<AppState>>,
@@ -278,6 +301,7 @@ async fn chat(
         _ => String::new(),
     };
     let conversation_length = messages.len();
+    let cache_key = conversation_cache_key(&messages);
     // Don't log the prompt body — it routinely contains GDPR-flagged CRM data
     // (names, emails, BTW numbers) and occasional accidental secrets pasted by
     // users. The full prompt+answer still rides on the RabbitMQ
@@ -310,9 +334,8 @@ async fn chat(
         scope,
     };
 
-    if let Some(cache) = state.cache.as_ref()
-    {
-        match cache.lookup_response(&prompt) {
+    if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
+        match cache.lookup_response(key) {
             Ok(Some(answer)) => {
                 tracing::info!(correlation_id = %correlation_id, "chat cache hit");
                 return Ok(Json(ChatResponse {
@@ -400,8 +423,10 @@ async fn chat(
         tracing::warn!("memory ingestion failed: {e:#}");
     }
 
-    if let Some(cache) = state.cache.as_ref()
-        && let Err(e) = cache.store_response(&prompt, &outcome.answer)
+    // Skip tool-backed answers: they embed live data that goes stale within the TTL.
+    if outcome.tool_trace.is_empty()
+        && let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref())
+        && let Err(e) = cache.store_response(key, &outcome.answer)
     {
         tracing::warn!("response cache store failed: {e:#}");
     }

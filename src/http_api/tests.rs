@@ -694,3 +694,35 @@
             "CR/LF in comment would prematurely terminate the SSE frame",
         );
     }
+
+    #[test]
+    fn cache_key_distinguishes_conversations_with_same_last_turn() {
+        let a = parse(
+            r#"{"messages":[
+                {"role":"user","content":"how many open incidents"},
+                {"role":"assistant","content":"three"},
+                {"role":"user","content":"en de tweede?"}
+            ]}"#,
+        )
+        .into_messages()
+        .unwrap();
+        let b = parse(
+            r#"{"messages":[
+                {"role":"user","content":"list crm contacts"},
+                {"role":"assistant","content":"done"},
+                {"role":"user","content":"en de tweede?"}
+            ]}"#,
+        )
+        .into_messages()
+        .unwrap();
+
+        let ka = conversation_cache_key(&a).expect("conversation has text");
+        let kb = conversation_cache_key(&b).expect("conversation has text");
+        assert_ne!(ka, kb, "different histories must not share a cache key");
+        assert_eq!(conversation_cache_key(&a).as_deref(), Some(ka.as_str()));
+    }
+
+    #[test]
+    fn cache_key_none_when_no_text() {
+        assert!(conversation_cache_key(&[]).is_none());
+    }
