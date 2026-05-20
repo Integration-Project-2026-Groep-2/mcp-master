@@ -137,7 +137,7 @@ impl MemoryService {
             .enumerate()
         {
             let embeddings = self.runtime.embedder.embed_texts(batch).await?;
-            for (offset, (text, vector)) in batch.iter().zip(embeddings.into_iter()).enumerate() {
+            for (offset, (text, vector)) in batch.iter().zip(embeddings).enumerate() {
                 let chunk_index = (batch_index * self.config.embedding_batch_size + offset) as u32;
                 points.push(VectorPoint {
                     id: Uuid::new_v4().to_string(),
