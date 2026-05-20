@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
 
     let terminal_mode = args.iter().any(|a| a == "--terminal-mode");
     let server_mode = args.iter().any(|a| a == "--server-mode");
-    let debug_client_mode = args.iter().any(|a| a == "--debug-mode");
+    let debug_client_mode = args.iter().any(|a| a == "--debug-client");
 
     if debug_client_mode {
         pool.shutdown().await?;
