@@ -3,13 +3,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
     response::{
         IntoResponse, Response,
         sse::{Event as SseEvent, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use chrono::{NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -1123,6 +1123,30 @@ async fn handle_scheduled(
     Ok(())
 }
 
+async fn forget_memory(
+    scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, Response> {
+    if scope != crate::gateway::auth::AuthScope::ReadAndAct {
+        let body = Json(serde_json::json!({ "error": "forbidden" }));
+        return Err((StatusCode::FORBIDDEN, body).into_response());
+    }
+    match state.memory.as_deref() {
+        Some(memory) => {
+            memory
+                .forget_user(&user_id)
+                .await
+                .map_err(|e| AppError(e).into_response())?;
+            tracing::info!(user_id = %user_id, "erased memory for user");
+            Ok(Json(serde_json::json!({ "forgotten": user_id })))
+        }
+        None => Ok(Json(
+            serde_json::json!({ "forgotten": user_id, "memory_enabled": false }),
+        )),
+    }
+}
+
 pub async fn serve(
     pool: McpPool,
     llm: AnthropicClient,
@@ -1223,6 +1247,7 @@ pub async fn serve(
     let mut approve_route = post(chat_approve);
     let mut reject_route = post(chat_reject);
     let mut stream_route = post(chat_stream);
+    let mut forget_route = delete(forget_memory);
     if let Some(ref token) = bearer_token {
         tracing::info!(
             "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject + /chat/stream"
@@ -1235,6 +1260,8 @@ pub async fn serve(
             reject_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
         stream_route =
             stream_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        forget_route =
+            forget_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
     } else {
         tracing::warn!(
             "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject + /chat/stream accept \
@@ -1261,6 +1288,7 @@ pub async fn serve(
         .route("/chat", chat_route)
         .route("/chat/approve", approve_route)
         .route("/chat/reject", reject_route)
+        .route("/memory/user/{user_id}", forget_route)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS),

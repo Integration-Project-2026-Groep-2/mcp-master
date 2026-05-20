@@ -106,6 +106,13 @@ impl VectorStore for InMemoryVectorStore {
         hits.truncate(top_k);
         Ok(hits)
     }
+
+    async fn delete_by_user(&self, _collection: &str, user_id: &str) -> Result<()> {
+        self.points
+            .write()
+            .retain(|p| p.payload.user_id.as_deref() != Some(user_id));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +163,41 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].text, "hello world");
         assert!(results[0].score > 0.99);
+    }
+
+    #[tokio::test]
+    async fn delete_by_user_removes_only_that_user() {
+        let store = InMemoryVectorStore::new();
+        let point = |id: &str, user: &str| VectorPoint {
+            id: id.into(),
+            vector: vec![1.0, 0.0, 0.0],
+            payload: MemoryPayload {
+                namespace: "default".into(),
+                source: MemorySource::Chat,
+                correlation_id: "cid".into(),
+                user_id: Some(user.into()),
+                text: "t".into(),
+                chunk_index: 0,
+                chunk_count: 1,
+                created_at_unix_ms: 1,
+            },
+        };
+        store
+            .upsert_points("c", vec![point("1", "alice"), point("2", "bob")])
+            .await
+            .unwrap();
+
+        store.delete_by_user("c", "alice").await.unwrap();
+
+        let alice = store
+            .search_points("c", "default", Some("alice"), &[1.0, 0.0, 0.0], 10)
+            .await
+            .unwrap();
+        let bob = store
+            .search_points("c", "default", Some("bob"), &[1.0, 0.0, 0.0], 10)
+            .await
+            .unwrap();
+        assert!(alice.is_empty());
+        assert_eq!(bob.len(), 1);
     }
 }

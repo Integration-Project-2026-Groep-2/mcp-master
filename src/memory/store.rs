@@ -20,6 +20,7 @@ pub trait VectorStore: Send + Sync {
         vector: &[f32],
         top_k: usize,
     ) -> Result<Vec<MemoryHit>>;
+    async fn delete_by_user(&self, collection: &str, user_id: &str) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +184,21 @@ impl VectorStore for QdrantVectorStore {
             .into_iter()
             .filter_map(|hit| hit.into_memory_hit())
             .collect())
+    }
+
+    async fn delete_by_user(&self, collection: &str, user_id: &str) -> Result<()> {
+        let url = format!("{}/delete?wait=true", self.points_url(collection));
+        let body = serde_json::json!({
+            "filter": { "must": [ { "key": "user_id", "match": { "value": user_id } } ] }
+        });
+        self.request(reqwest::Method::POST, &url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("qdrant delete-by-user request failed for {collection}"))?
+            .error_for_status()
+            .with_context(|| format!("qdrant delete-by-user failed for {collection}"))?;
+        Ok(())
     }
 }
 

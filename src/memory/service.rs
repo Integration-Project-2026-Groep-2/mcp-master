@@ -82,6 +82,13 @@ impl MemoryService {
             .context("queueing memory ingestion job")
     }
 
+    pub async fn forget_user(&self, user_id: &str) -> Result<()> {
+        self.runtime
+            .store
+            .delete_by_user(&self.config.collection, user_id)
+            .await
+    }
+
     async fn retrieve(&self, query: &str, user_id: Option<&str>) -> Result<Vec<MemoryHit>> {
         let query_vector = self
             .runtime
