@@ -6,15 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESPONSE_CACHE_TTL_MS: i64 = 60_000;
 
-/// Very small memory representation.
-pub struct Memory {
-    pub id: i64,
-    pub text: String,
-    pub embedding: Vec<f32>,
-    pub created_at_unix_ms: i64,
-}
-
-/// Compact sqlite-backed cache + semantic memory.
+/// Compact sqlite-backed response cache.
 pub struct SqliteMemory {
     conn: Mutex<Connection>,
 }
@@ -33,21 +25,11 @@ impl SqliteMemory {
         conn.pragma_update(None, "journal_mode", &"wal")?;
 
         conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE IF NOT EXISTS responses (
+            "CREATE TABLE IF NOT EXISTS responses (
                prompt_hash TEXT PRIMARY KEY,
-               prompt_norm TEXT NOT NULL,
                response TEXT NOT NULL,
                created_at INTEGER NOT NULL
-             );
-
-             CREATE TABLE IF NOT EXISTS memories (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               text TEXT NOT NULL,
-               embedding BLOB NOT NULL,
-               created_at INTEGER NOT NULL
-             );
-             COMMIT;",
+             );",
         )?;
 
         Ok(Self {
@@ -113,90 +95,10 @@ impl SqliteMemory {
         let now = now_unix_ms();
         let conn = self.conn.lock().expect("sqlite cache mutex poisoned");
         conn.execute(
-            "INSERT OR REPLACE INTO responses (prompt_hash, prompt_norm, response, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![key, norm, response, now],
+            "INSERT OR REPLACE INTO responses (prompt_hash, response, created_at) VALUES (?1, ?2, ?3)",
+            params![key, response, now],
         )?;
         Ok(())
-    }
-
-    /// Add a semantic memory entry. Embedding is stored as little-endian f32 bytes.
-    pub fn add_memory(&self, text: &str, embedding: &[f32]) -> Result<i64> {
-        let blob = f32_slice_to_bytes(embedding);
-        let now = now_unix_ms();
-        let conn = self.conn.lock().expect("sqlite cache mutex poisoned");
-        conn.execute(
-            "INSERT INTO memories (text, embedding, created_at) VALUES (?1, ?2, ?3)",
-            params![text, blob, now],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// Return top-k memories by cosine similarity with the provided embedding.
-    pub fn query_similar(&self, embedding: &[f32], top_k: usize) -> Result<Vec<(Memory, f32)>> {
-        let conn = self.conn.lock().expect("sqlite cache mutex poisoned");
-        let mut stmt = conn
-            .prepare("SELECT id, text, embedding, created_at FROM memories")?;
-        let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let text: String = row.get(1)?;
-            let blob: Vec<u8> = row.get(2)?;
-            let created: i64 = row.get(3)?;
-            let emb = bytes_to_f32_vec(&blob);
-            Ok((id, text, emb, created))
-        })?;
-
-        let mut scored = Vec::new();
-        for r in rows {
-            let (id, text, emb, created) = r?;
-            if emb.len() != embedding.len() {
-                continue;
-            }
-            let score = cosine_similarity(embedding, &emb);
-            scored.push((Memory { id, text, embedding: emb, created_at_unix_ms: created }, score));
-        }
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        if scored.len() > top_k {
-            scored.truncate(top_k);
-        }
-        Ok(scored)
-    }
-}
-
-fn f32_slice_to_bytes(slice: &[f32]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(slice.len() * 4);
-    for &f in slice {
-        v.extend_from_slice(&f.to_le_bytes());
-    }
-    v
-}
-
-fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    let mut v = Vec::with_capacity(bytes.len() / 4);
-    let mut i = 0;
-    while i + 4 <= bytes.len() {
-        let b = [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]];
-        v.push(f32::from_le_bytes(b));
-        i += 4;
-    }
-    v
-}
-
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-fn norm(a: &[f32]) -> f32 {
-    dot(a, a).sqrt()
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let na = norm(a);
-    let nb = norm(b);
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot(a, b) / (na * nb)
     }
 }
 
@@ -243,18 +145,5 @@ mod tests {
         db.store_response(prompt, "fresh").unwrap();
 
         assert_eq!(db.lookup_response(prompt).unwrap().as_deref(), Some("fresh"));
-    }
-
-    #[test]
-    fn memory_store_and_query() {
-        let tmp = NamedTempFile::new().unwrap();
-        let db = SqliteMemory::open(tmp.path().to_str().unwrap()).unwrap();
-        let a = vec![1.0f32, 0.0, 0.0];
-        let b = vec![0.0f32, 1.0, 0.0];
-        db.add_memory("hello", &a).unwrap();
-        db.add_memory("goodbye", &b).unwrap();
-        let res = db.query_similar(&a, 2).unwrap();
-        assert_eq!(res.len(), 2);
-        assert!(res[0].1 > res[1].1);
     }
 }
