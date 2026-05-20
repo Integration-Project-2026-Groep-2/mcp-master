@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use blake3::Hasher;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,7 +22,7 @@ impl SqliteMemory {
     /// Open a sqlite file and ensure tables exist.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).context("opening sqlite file")?;
-        conn.pragma_update(None, "journal_mode", &"wal")?;
+        conn.pragma_update(None, "journal_mode", "wal")?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS responses (
@@ -105,7 +105,10 @@ impl SqliteMemory {
         let cutoff = now_unix_ms() - RESPONSE_CACHE_TTL_MS;
         let conn = self.conn.lock().expect("sqlite cache mutex poisoned");
         let removed = conn
-            .execute("DELETE FROM responses WHERE created_at < ?1", params![cutoff])
+            .execute(
+                "DELETE FROM responses WHERE created_at < ?1",
+                params![cutoff],
+            )
             .context("purging expired response cache entries")?;
         Ok(removed)
     }
@@ -153,7 +156,10 @@ mod tests {
         let prompt = "still fresh";
         db.store_response(prompt, "fresh").unwrap();
 
-        assert_eq!(db.lookup_response(prompt).unwrap().as_deref(), Some("fresh"));
+        assert_eq!(
+            db.lookup_response(prompt).unwrap().as_deref(),
+            Some("fresh")
+        );
     }
 
     #[test]

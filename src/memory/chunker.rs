@@ -34,7 +34,7 @@ pub fn chunk_ranges(text: &str, chunk_chars: usize, overlap_chars: usize) -> Vec
     ranges
 }
 
-pub fn chunk_text<'a>(text: &'a str, chunk_chars: usize, overlap_chars: usize) -> Vec<&'a str> {
+pub fn chunk_text(text: &str, chunk_chars: usize, overlap_chars: usize) -> Vec<&str> {
     chunk_ranges(text, chunk_chars, overlap_chars)
         .into_iter()
         .map(|range| &text[range])

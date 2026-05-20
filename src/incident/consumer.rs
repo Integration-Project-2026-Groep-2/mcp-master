@@ -20,9 +20,9 @@ use super::diagnose::DiagnosePipeline;
 use super::schema::{IncidentDiagnosis, IncidentEvent};
 use crate::rabbitmq::config::RabbitMqConfig;
 use crate::rabbitmq::publisher::Publisher;
+use crate::retry::backoff_with_jitter;
 use quick_xml::de::from_str as xml_from_str;
 use serde::Deserialize;
-use crate::retry::backoff_with_jitter;
 
 const QUEUE_NAME: &str = "mcp-master.incidents";
 const ROUTING_KEY: &str = "event.heartbeat_failed";
@@ -221,7 +221,9 @@ async fn handle_delivery_with_content(
     // when content-type indicates XML or body looks like XML.
     let evt: IncidentEvent = if matches!(content_type, Some(ct) if ct.contains("json")) {
         serde_json::from_slice(body).context("decoding IncidentEvent JSON envelope")?
-    } else if matches!(content_type, Some(ct) if ct.contains("xml")) || (!body.is_empty() && body[0] == b'<') {
+    } else if matches!(content_type, Some(ct) if ct.contains("xml"))
+        || (!body.is_empty() && body[0] == b'<')
+    {
         #[derive(Debug, Deserialize)]
         struct XmlHeartbeatCustomDetails {
             #[serde(rename = "HeartbeatCountLast60s")]
@@ -261,7 +263,8 @@ async fn handle_delivery_with_content(
         }
 
         let s = std::str::from_utf8(body).context("utf8 from xml body")?;
-        let xml_evt: XmlHeartbeatEvent = xml_from_str(s).context("decoding Controlroom XML heartbeat")?;
+        let xml_evt: XmlHeartbeatEvent =
+            xml_from_str(s).context("decoding Controlroom XML heartbeat")?;
 
         // Map XML heartbeat event into IncidentEvent shape expected downstream
         let payload = crate::incident::schema::IncidentPayload {
@@ -375,9 +378,8 @@ async fn handle_delivery_with_content(
     Ok(())
 }
 
-// Backwards-compatible wrapper for existing call-sites (tests and other
-// modules) that don't provide `content_type`. For runtime code that does
-// inspect AMQP properties we call `handle_delivery_with_content` directly.
+// Test-only wrapper; runtime calls handle_delivery_with_content directly.
+#[cfg(test)]
 async fn handle_delivery(
     body: &[u8],
     debouncer: &Debouncer,

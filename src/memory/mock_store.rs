@@ -16,7 +16,6 @@ pub struct InMemoryVectorStore {
 }
 
 struct StoredPoint {
-    id: String,
     vector: Vec<f32>,
     payload: MemoryPayload,
 }
@@ -28,8 +27,8 @@ impl InMemoryVectorStore {
         }
     }
 
-    /// Returns the count of stored points (for testing/debugging).
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn point_count(&self) -> usize {
         self.points.read().len()
     }
 
@@ -60,7 +59,6 @@ impl VectorStore for InMemoryVectorStore {
         let mut store = self.points.write();
         for point in points {
             store.push(StoredPoint {
-                id: point.id,
                 vector: point.vector,
                 payload: point.payload,
             });
@@ -102,7 +100,11 @@ impl VectorStore for InMemoryVectorStore {
             })
             .collect();
 
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(top_k);
         Ok(hits)
     }
@@ -154,7 +156,7 @@ mod tests {
             },
         ];
         store.upsert_points("test", points).await.unwrap();
-        assert_eq!(store.len(), 2);
+        assert_eq!(store.point_count(), 2);
 
         let results = store
             .search_points("test", "default", None, &[1.0, 0.0, 0.0], 1)

@@ -29,7 +29,8 @@ impl MemoryService {
             return Ok(None);
         };
 
-        let embedder = Arc::new(HttpEmbeddingClient::new(&config.embedding)?) as Arc<dyn EmbeddingClient>;
+        let embedder =
+            Arc::new(HttpEmbeddingClient::new(&config.embedding)?) as Arc<dyn EmbeddingClient>;
         let store: Arc<dyn VectorStore> = if should_use_mock_store() {
             tracing::info!("using in-memory mock vector store (for testing only)");
             Arc::new(InMemoryVectorStore::new())
@@ -49,7 +50,11 @@ impl MemoryService {
             runtime: runtime.clone(),
             ingest_tx,
         });
-        tokio::spawn(run_ingest_worker(service.config.clone(), runtime, ingest_rx));
+        tokio::spawn(run_ingest_worker(
+            service.config.clone(),
+            runtime,
+            ingest_rx,
+        ));
         Ok(Some(service))
     }
 
@@ -126,7 +131,9 @@ impl MemoryService {
         let chunk_strings: Vec<String> = chunks.into_iter().map(ToString::to_string).collect();
 
         let mut points = Vec::with_capacity(chunk_strings.len());
-        for (batch_index, batch) in chunk_strings.chunks(self.config.embedding_batch_size).enumerate()
+        for (batch_index, batch) in chunk_strings
+            .chunks(self.config.embedding_batch_size)
+            .enumerate()
         {
             let embeddings = self.runtime.embedder.embed_texts(batch).await?;
             for (offset, (text, vector)) in batch.iter().zip(embeddings.into_iter()).enumerate() {
@@ -198,7 +205,11 @@ fn render_interaction_document(interaction: &MemoryInteraction) -> String {
     if let Some(user_id) = &interaction.user_id {
         let _ = writeln!(&mut text, "user_id: {}", user_id);
     }
-    let _ = writeln!(&mut text, "created_at_unix_ms: {}", interaction.created_at_unix_ms);
+    let _ = writeln!(
+        &mut text,
+        "created_at_unix_ms: {}",
+        interaction.created_at_unix_ms
+    );
     let _ = writeln!(&mut text);
     let _ = writeln!(&mut text, "### Prompt");
     let _ = writeln!(&mut text, "{}", interaction.prompt.trim());
@@ -215,7 +226,20 @@ fn render_augmented_prompt(base_prompt: &str, results: &[MemoryHit]) -> String {
 
     for (index, hit) in results.iter().enumerate() {
         use std::fmt::Write;
-        let _ = writeln!(rendered, "{}. score={:.3} source={} chunk={}/{} correlation_id={}{}", index + 1, hit.score, hit.source, hit.chunk_index + 1, hit.chunk_count, hit.correlation_id, hit.user_id.as_ref().map(|id| format!(" user_id={id}")).unwrap_or_default());
+        let _ = writeln!(
+            rendered,
+            "{}. score={:.3} source={} chunk={}/{} correlation_id={}{}",
+            index + 1,
+            hit.score,
+            hit.source,
+            hit.chunk_index + 1,
+            hit.chunk_count,
+            hit.correlation_id,
+            hit.user_id
+                .as_ref()
+                .map(|id| format!(" user_id={id}"))
+                .unwrap_or_default()
+        );
         let _ = writeln!(rendered, "   {}", hit.text.trim());
     }
 
@@ -227,6 +251,20 @@ fn truncate_to_char_boundary(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     text.chars().take(max_chars).collect()
+}
+
+fn should_use_mock_store() -> bool {
+    std::env::var("MEMORY_MOCK_STORE")
+        .ok()
+        .and_then(|val| {
+            let normalized = val.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -284,18 +322,4 @@ mod tests {
         assert!(rendered.contains("Memory context (untrusted data"));
         assert!(rendered.contains("Prompt"));
     }
-}
-
-fn should_use_mock_store() -> bool {
-    std::env::var("MEMORY_MOCK_STORE")
-        .ok()
-        .and_then(|val| {
-            let normalized = val.trim().to_ascii_lowercase();
-            match normalized.as_str() {
-                "1" | "true" | "yes" | "on" => Some(true),
-                "0" | "false" | "no" | "off" => Some(false),
-                _ => None,
-            }
-        })
-        .unwrap_or(false)
 }

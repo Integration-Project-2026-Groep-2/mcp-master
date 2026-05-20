@@ -195,7 +195,9 @@ async fn handle_recovery_with_content(
 
     let evt: IncidentEvent = if matches!(content_type, Some(ct) if ct.contains("json")) {
         serde_json::from_slice(body).context("decoding recovery IncidentEvent JSON envelope")?
-    } else if matches!(content_type, Some(ct) if ct.contains("xml")) || (!body.is_empty() && body[0] == b'<') {
+    } else if matches!(content_type, Some(ct) if ct.contains("xml"))
+        || (!body.is_empty() && body[0] == b'<')
+    {
         #[derive(Debug, Deserialize)]
         struct XmlHeartbeatCustomDetails {
             #[serde(rename = "HeartbeatCountLast60s")]
@@ -235,7 +237,8 @@ async fn handle_recovery_with_content(
         }
 
         let s = std::str::from_utf8(body).context("utf8 from xml body")?;
-        let xml_evt: XmlHeartbeatEvent = xml_from_str(s).context("decoding Controlroom XML heartbeat")?;
+        let xml_evt: XmlHeartbeatEvent =
+            xml_from_str(s).context("decoding Controlroom XML heartbeat")?;
 
         // Map to IncidentEvent
         let payload = crate::incident::schema::IncidentPayload {
@@ -312,7 +315,8 @@ async fn handle_recovery_with_content(
     Ok(())
 }
 
-// Backwards-compatible wrapper for callers that don't provide content_type
+// Test-only wrapper; runtime calls handle_recovery_with_content directly.
+#[cfg(test)]
 async fn handle_recovery(body: &[u8], publisher: Option<&Arc<Publisher>>) -> Result<()> {
     handle_recovery_with_content(body, publisher, None).await
 }

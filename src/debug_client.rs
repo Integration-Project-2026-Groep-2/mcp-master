@@ -1,7 +1,7 @@
 //! CLI debug client that emulates the frontend for testing without spinning up the UI.
 //! Handles HTTP requests to /chat endpoint and streams responses to stdout.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
@@ -139,10 +139,17 @@ fn display_response(response: &ChatResponse) {
 
     // Tool trace
     if !response.tool_trace.is_empty() {
-        println!("Tool calls ({} calls, {} iterations):", response.tool_trace.len(), response.iterations);
-        for (_i, trace) in response.tool_trace.iter().enumerate() {
+        println!(
+            "Tool calls ({} calls, {} iterations):",
+            response.tool_trace.len(),
+            response.iterations
+        );
+        for trace in &response.tool_trace {
             let status = if trace.ok { "ok" } else { "error" };
-            println!("- [{}] {}/{} - {} ms", status, trace.server, trace.tool, trace.ms);
+            println!(
+                "- [{}] {}/{} - {} ms",
+                status, trace.server, trace.tool, trace.ms
+            );
             if let Some(err) = &trace.error {
                 println!("  Error: {}", err);
             }
@@ -151,7 +158,10 @@ fn display_response(response: &ChatResponse) {
     }
 
     // Token usage
-    println!("Tokens: input={}, output={}", response.tokens.input, response.tokens.output);
+    println!(
+        "Tokens: input={}, output={}",
+        response.tokens.input, response.tokens.output
+    );
 
     if let Some(cache_creation) = response.tokens.cache_creation_input {
         println!("Cache creation: {}", cache_creation);
