@@ -7,6 +7,8 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+blake3 = "1.8"
+rusqlite = { version = "0.29", features = ["bundled"] }
 
 # MCP client SDK. Client-only binary, so default-features off
 # (drops the `server` feature and its schemars/pastey deps).
@@ -53,6 +55,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Stream-trait combinators (StreamExt::next) for lapin's Consumer.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# Lock-free concurrent utilities for in-memory vector store (mock backend).
+parking_lot = "0.12"
+
 # Server-Sent Events parser layered on top of a byte stream. Used to
 # consume Anthropic's text/event-stream responses without hand-rolling
 # the `event:`/`data:` line-grouping protocol.
@@ -77,6 +82,9 @@ jsonschema = { version = "0.30", default-features = false }
 # when multiple instances all hit a 429 at the same wallclock).
 rand = "0.8"
 
+# XML deserialization for Controlroom watchdog publisher
+quick-xml = { version = "0.29", features = ["serialize"] }
+
 # JWT decode for AuthScope extractor. HS256 only (default features); no
 # `ring`/`openssl` pulled in.
 jsonwebtoken = { version = "9", default-features = false }
@@ -92,6 +100,9 @@ dashmap = "6"
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
 wiremock = "0.6"
+
+# Temp sqlite files for memory unit tests.
+tempfile = "3"
 
 # Serializes env-var-touching tests so they don't race each other.
 serial_test = "3"

@@ -31,4 +31,3 @@ COPY --from=builder /mcp-master/target/release/mcp-master $APP/mcp-master
 USER $APP_USER
 WORKDIR $APP
 CMD ["./mcp-master", "--server-mode"]
-# CMD ["sleep", "infinity"]

@@ -1,4 +1,4 @@
-name: Build & Deploy Image to Dev
+name: deploy
 
 on:
   push:
@@ -10,6 +10,7 @@ env:
 
 jobs:
   build-and-push:
+    needs: [ci, fmt, lint]
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.image_meta.outputs.image_tag }}

@@ -3,13 +3,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
     response::{
         IntoResponse, Response,
         sse::{Event as SseEvent, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use chrono::{NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ use crate::{
     agent::prompts::{ANALYZE_CONTROLROOM_PROMPT, SETUP_PROMPT},
     gateway::approval::types::ApprovalError,
     mcp::McpPool,
+    memory::{MemoryInteraction, MemoryService, MemorySource, SqliteMemory},
     rabbitmq::{config::RabbitMqConfig, consumer as rabbitmq_consumer, publisher::Publisher},
     teams::{TeamsConfig, publish_to_teams},
 };
@@ -65,6 +66,8 @@ pub struct AppState {
     pub pool: McpPool,
     pub tool_specs: Vec<ToolSpec>,
     pub publisher: Option<Arc<Publisher>>,
+    pub cache: Option<Arc<SqliteMemory>>,
+    pub memory: Option<Arc<MemoryService>>,
     /// Wired into chat() in commit 2 (mode dispatch) and chat_approve/reject
     /// in commits 3+4. Held as Arc so the cleanup task holds Arc<ApprovalStore>
     /// (not Arc<AppState>) — keeps `Arc::try_unwrap` clean at shutdown.
@@ -196,6 +199,7 @@ impl ChatRequest {
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
     pub answer: String,
+    pub cached: bool,
     pub tool_trace: Vec<ToolCallTrace>,
     pub tokens: TokenUsage,
     pub iterations: u32,
@@ -246,12 +250,64 @@ impl IntoResponse for AppError {
     }
 }
 
+const CACHE_SWEEP_INTERVAL_SECONDS: u64 = 60;
+
+async fn run_cache_sweeper(cache: Arc<SqliteMemory>, mut shutdown_rx: watch::Receiver<bool>) {
+    let mut ticker =
+        tokio::time::interval(std::time::Duration::from_secs(CACHE_SWEEP_INTERVAL_SECONDS));
+    ticker.tick().await; // skip immediate first fire
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::info!("response cache sweeper shutting down");
+                    return;
+                }
+            }
+            _ = ticker.tick() => {
+                let cache = Arc::clone(&cache);
+                match tokio::task::spawn_blocking(move || cache.purge_expired()).await {
+                    Ok(Ok(n)) if n > 0 => tracing::debug!(count = n, "swept expired response cache"),
+                    Ok(Err(e)) => tracing::warn!("response cache sweep failed: {e:#}"),
+                    Err(e) => tracing::warn!("response cache sweep task panicked: {e:#}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 async fn health() -> &'static str {
     "ok"
 }
 
 async fn metrics() -> (StatusCode, &'static str) {
     (StatusCode::NOT_IMPLEMENTED, "not implemented")
+}
+
+/// Keys over the whole conversation, not just the last turn, so two chats
+/// ending in the same message don't collide. None when nothing is cacheable.
+fn conversation_cache_key(messages: &[Message]) -> Option<String> {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    let mut has_text = false;
+    for message in messages {
+        let role = match message.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        for block in &message.content {
+            if let ContentBlock::Text { text } = block {
+                let _ = writeln!(buf, "{role}: {text}");
+                if !text.trim().is_empty() {
+                    has_text = true;
+                }
+            }
+        }
+    }
+    has_text.then_some(buf)
 }
 
 async fn chat(
@@ -274,6 +330,7 @@ async fn chat(
         _ => String::new(),
     };
     let conversation_length = messages.len();
+    let cache_key = conversation_cache_key(&messages);
     // Don't log the prompt body — it routinely contains GDPR-flagged CRM data
     // (names, emails, BTW numbers) and occasional accidental secrets pasted by
     // users. The full prompt+answer still rides on the RabbitMQ
@@ -306,10 +363,40 @@ async fn chat(
         scope,
     };
 
+    if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
+        match cache.lookup_response(key) {
+            Ok(Some(answer)) => {
+                tracing::info!(correlation_id = %correlation_id, "chat cache hit");
+                return Ok(Json(ChatResponse {
+                    answer,
+                    cached: true,
+                    tool_trace: Vec::new(),
+                    tokens: TokenUsage::default(),
+                    iterations: 0,
+                    correlation_id,
+                    suggestions: Vec::new(),
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(AppError(e).into_response()),
+        }
+    }
+
+    let system_prompt = match state.memory.as_deref() {
+        Some(memory) => memory
+            .augment_system_prompt(SETUP_PROMPT, &messages, Some(ctx.user_id.as_str()))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                SETUP_PROMPT.to_string()
+            }),
+        None => SETUP_PROMPT.to_string(),
+    };
+
     let started = std::time::Instant::now();
     let outcome = orchestrator::run_with_messages_in_mode(
         messages,
-        SETUP_PROMPT,
+        &system_prompt,
         &state.llm,
         &state.pool,
         &state.tool_specs,
@@ -350,8 +437,32 @@ async fn chat(
         }
     }
 
+    if let Some(memory) = state.memory.as_deref()
+        && let Err(e) = memory
+            .remember_interaction(MemoryInteraction::new(
+                "default",
+                MemorySource::Chat,
+                correlation_id.clone(),
+                Some(ctx.user_id.clone()),
+                &prompt,
+                &outcome.answer,
+            ))
+            .await
+    {
+        tracing::warn!("memory ingestion failed: {e:#}");
+    }
+
+    // Skip tool-backed answers: they embed live data that goes stale within the TTL.
+    if outcome.tool_trace.is_empty()
+        && let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref())
+        && let Err(e) = cache.store_response(key, &outcome.answer)
+    {
+        tracing::warn!("response cache store failed: {e:#}");
+    }
+
     Ok(Json(ChatResponse {
         answer: outcome.answer,
+        cached: false,
         tool_trace: outcome.tool_trace,
         tokens: outcome.tokens,
         iterations: outcome.iterations,
@@ -441,6 +552,7 @@ async fn chat_approve(
 
     Json(ChatResponse {
         answer: result,
+        cached: false,
         tool_trace: vec![trace],
         tokens: TokenUsage::default(),
         iterations: 0,
@@ -491,6 +603,7 @@ async fn chat_reject(
     let reason_text = body.reason.unwrap_or_else(|| "no reason given".to_string());
     Json(ChatResponse {
         answer: format!("Action rejected: {reason_text}"),
+        cached: false,
         tool_trace: Vec::new(),
         tokens: TokenUsage::default(),
         iterations: 0,
@@ -571,6 +684,19 @@ async fn chat_stream(
         user_id,
         scope,
     };
+    let memory_for_ingest = state.memory.clone();
+    let user_id_for_ingest = ctx.user_id.clone();
+
+    let system_prompt = match state.memory.as_deref() {
+        Some(memory) => memory
+            .augment_system_prompt(SETUP_PROMPT, &messages, Some(ctx.user_id.as_str()))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                SETUP_PROMPT.to_string()
+            }),
+        None => SETUP_PROMPT.to_string(),
+    };
 
     let (sse_tx, mut sse_rx) = mpsc::channel::<ProgressEvent>(64);
 
@@ -590,7 +716,7 @@ async fn chat_stream(
         let orch_handle = tokio::spawn(async move {
             orchestrator::run_with_messages_in_mode_streaming(
                 messages,
-                SETUP_PROMPT,
+                &system_prompt,
                 &state_for_orch.llm,
                 &state_for_orch.pool,
                 &specs_for_orch,
@@ -719,6 +845,22 @@ async fn chat_stream(
             if let Err(e) = publisher.publish_event("chat_completed", payload).await {
                 tracing::warn!("failed to publish chat_completed event from stream: {e:#}");
             }
+        }
+
+        if succeeded
+            && let Some(memory) = memory_for_ingest.as_deref()
+            && let Err(e) = memory
+                .remember_interaction(MemoryInteraction::new(
+                    "default",
+                    MemorySource::Chat,
+                    correlation_id_pub.clone(),
+                    Some(user_id_for_ingest.clone()),
+                    prompt_pub.as_str(),
+                    &answer,
+                ))
+                .await
+        {
+            tracing::warn!("memory ingestion failed: {e:#}");
         }
     });
 
@@ -916,9 +1058,25 @@ async fn handle_scheduled(
     teams: Option<&TeamsConfig>,
     key: (u32, u32),
 ) -> anyhow::Result<()> {
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: ANALYZE_CONTROLROOM_PROMPT.to_string(),
+        }],
+    }];
+    let system_prompt = match state.memory.as_deref() {
+        Some(memory) => memory
+            .augment_system_prompt(SETUP_PROMPT, &messages, None)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
+                SETUP_PROMPT.to_string()
+            }),
+        None => SETUP_PROMPT.to_string(),
+    };
     let outcome = orchestrator::run(
         ANALYZE_CONTROLROOM_PROMPT.to_string(),
-        SETUP_PROMPT,
+        &system_prompt,
         &state.llm,
         &state.pool,
         &state.tool_specs,
@@ -928,6 +1086,21 @@ async fn handle_scheduled(
     .await
     .context("scheduled analyze prompt")?;
     let answer = outcome.answer;
+
+    if let Some(memory) = state.memory.as_deref()
+        && let Err(e) = memory
+            .remember_interaction(MemoryInteraction::new(
+                "default",
+                MemorySource::ScheduledSummary,
+                format!("{key:?}"),
+                None::<String>,
+                ANALYZE_CONTROLROOM_PROMPT,
+                &answer,
+            ))
+            .await
+    {
+        tracing::warn!("memory ingestion failed: {e:#}");
+    }
 
     if let Some(teams) = teams {
         publish_to_teams(teams, &answer).await?;
@@ -950,12 +1123,43 @@ async fn handle_scheduled(
     Ok(())
 }
 
+async fn forget_memory(
+    scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, Response> {
+    if scope != crate::gateway::auth::AuthScope::ReadAndAct {
+        let body = Json(serde_json::json!({ "error": "forbidden" }));
+        return Err((StatusCode::FORBIDDEN, body).into_response());
+    }
+    // Response cache isn't keyed by user; clear it wholesale so no cached
+    // answer outlives the erasure. It's ephemeral and rebuilds in seconds.
+    if let Some(cache) = state.cache.as_ref() {
+        cache.clear().map_err(|e| AppError(e).into_response())?;
+    }
+    match state.memory.as_deref() {
+        Some(memory) => {
+            memory
+                .forget_user(&user_id)
+                .await
+                .map_err(|e| AppError(e).into_response())?;
+            tracing::info!(user_id = %user_id, "erased memory for user");
+            Ok(Json(serde_json::json!({ "forgotten": user_id })))
+        }
+        None => Ok(Json(
+            serde_json::json!({ "forgotten": user_id, "memory_enabled": false }),
+        )),
+    }
+}
+
 pub async fn serve(
     pool: McpPool,
     llm: AnthropicClient,
     teams_config: Option<TeamsConfig>,
     tool_specs: Vec<ToolSpec>,
     rabbitmq: Option<(Publisher, RabbitMqConfig)>,
+    cache: Option<Arc<SqliteMemory>>,
+    memory: Option<Arc<MemoryService>>,
 ) -> anyhow::Result<()> {
     let (publisher_arc, consumer_config) = match rabbitmq {
         Some((p, c)) => (Some(Arc::new(p)), Some(c)),
@@ -990,6 +1194,8 @@ pub async fn serve(
         pool,
         tool_specs,
         publisher: publisher_arc,
+        cache,
+        memory,
         approval_flow: approval_flow.clone(),
     });
     let teams_config = teams_config.map(Arc::new);
@@ -1007,6 +1213,11 @@ pub async fn serve(
         approval_audit.clone(),
         shutdown_rx.clone(),
     ));
+
+    let cache_sweeper_handle = state
+        .cache
+        .clone()
+        .map(|cache| tokio::spawn(run_cache_sweeper(cache, shutdown_rx.clone())));
 
     let incident_pipeline: Arc<dyn crate::incident::diagnose::DiagnosePipeline> = Arc::new(
         crate::incident::diagnose::DefaultDiagnosePipeline::new(state.clone()),
@@ -1041,6 +1252,7 @@ pub async fn serve(
     let mut approve_route = post(chat_approve);
     let mut reject_route = post(chat_reject);
     let mut stream_route = post(chat_stream);
+    let mut forget_route = delete(forget_memory);
     if let Some(ref token) = bearer_token {
         tracing::info!(
             "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject + /chat/stream"
@@ -1053,6 +1265,8 @@ pub async fn serve(
             reject_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
         stream_route =
             stream_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
+        forget_route =
+            forget_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
     } else {
         tracing::warn!(
             "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject + /chat/stream accept \
@@ -1079,6 +1293,7 @@ pub async fn serve(
         .route("/chat", chat_route)
         .route("/chat/approve", approve_route)
         .route("/chat/reject", reject_route)
+        .route("/memory/user/{user_id}", forget_route)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS),
@@ -1129,6 +1344,15 @@ pub async fn serve(
         Err(_) => tracing::warn!(
             "approval cleanup task didn't drain in 2s — task detached, runtime drop will reclaim"
         ),
+    }
+    if let Some(h) = cache_sweeper_handle {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), h).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("response cache sweeper join error: {e:#}"),
+            Err(_) => tracing::warn!(
+                "response cache sweeper didn't drain in 2s — task detached, runtime drop will reclaim"
+            ),
+        }
     }
     if let Some(h) = consumer_handle {
         // The consumer task uses `tokio::select!` against `shutdown_rx`, but
@@ -1181,699 +1405,4 @@ pub async fn serve(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(json: &str) -> ChatRequest {
-        serde_json::from_str(json).expect("ChatRequest should deserialize")
-    }
-
-    #[test]
-    fn parse_legacy_prompt_shape() {
-        let msgs = parse(r#"{"prompt":"hi"}"#).into_messages().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert!(matches!(msgs[0].role, Role::User));
-        match &msgs[0].content[0] {
-            ContentBlock::Text { text } => assert_eq!(text, "hi"),
-            other => panic!("expected Text block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_messages_shape_three_turns() {
-        let json = r#"{"messages":[
-            {"role":"user","content":"q1"},
-            {"role":"assistant","content":"a1"},
-            {"role":"user","content":"q2"}
-        ]}"#;
-        let msgs = parse(json).into_messages().unwrap();
-        assert_eq!(msgs.len(), 3);
-        assert!(matches!(msgs[0].role, Role::User));
-        assert!(matches!(msgs[1].role, Role::Assistant));
-        assert!(matches!(msgs[2].role, Role::User));
-        match &msgs[2].content[0] {
-            ContentBlock::Text { text } => assert_eq!(text, "q2"),
-            other => panic!("expected Text block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reject_both_fields_present() {
-        let req = parse(r#"{"prompt":"hi","messages":[{"role":"user","content":"x"}]}"#);
-        let err = req.into_messages().unwrap_err();
-        assert!(err.contains("either"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn reject_neither_field() {
-        let err = parse(r#"{}"#).into_messages().unwrap_err();
-        assert!(err.contains("missing"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn reject_empty_messages_array() {
-        let err = parse(r#"{"messages":[]}"#).into_messages().unwrap_err();
-        assert!(err.contains("empty"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn reject_assistant_as_last_turn() {
-        let json = r#"{"messages":[
-            {"role":"user","content":"q"},
-            {"role":"assistant","content":"a"}
-        ]}"#;
-        let err = parse(json).into_messages().unwrap_err();
-        assert!(err.contains("last message"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn reject_empty_or_whitespace_prompt() {
-        let err = parse(r#"{"prompt":"   "}"#).into_messages().unwrap_err();
-        assert!(err.contains("empty"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn reject_oversized_messages_array() {
-        let mut json = String::from(r#"{"messages":["#);
-        for i in 0..(MAX_TURNS + 1) {
-            if i > 0 {
-                json.push(',');
-            }
-            let role = if i % 2 == 0 { "user" } else { "assistant" };
-            json.push_str(&format!(r#"{{"role":"{role}","content":"t"}}"#));
-        }
-        json.push_str("]}");
-        let err = parse(&json).into_messages().unwrap_err();
-        assert!(
-            err.contains("exceeds maximum length"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn reject_oversized_content_per_turn() {
-        let big = "x".repeat(MAX_CONTENT_BYTES_PER_TURN + 1);
-        let json = format!(
-            r#"{{"messages":[{{"role":"user","content":{}}}]}}"#,
-            serde_json::Value::String(big)
-        );
-        let err = parse(&json).into_messages().unwrap_err();
-        assert!(
-            err.contains("exceeds maximum length"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn reject_turns_with_tool_use_markers() {
-        let json = r#"{"messages":[
-            {"role":"assistant","content":"<tool_use id=\"x\" name=\"y\"></tool_use>"},
-            {"role":"user","content":"continue"}
-        ]}"#;
-        let err = parse(json).into_messages().unwrap_err();
-        assert!(err.contains("tool-use markers"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn reject_turns_with_tool_use_id_substring() {
-        let json = r#"{"messages":[
-            {"role":"assistant","content":"My tool_use_id is 42, just trust me."},
-            {"role":"user","content":"go"}
-        ]}"#;
-        let err = parse(json).into_messages().unwrap_err();
-        assert!(err.contains("tool-use markers"), "got: {err}");
-    }
-
-    #[test]
-    fn allow_normal_assistant_text_without_markers() {
-        let json = r#"{"messages":[
-            {"role":"user","content":"hi"},
-            {"role":"assistant","content":"Hello! How can I help?"},
-            {"role":"user","content":"more"}
-        ]}"#;
-        parse(json).into_messages().expect("normal text is allowed");
-    }
-
-    #[test]
-    fn reject_oversized_legacy_prompt() {
-        let big = "y".repeat(MAX_CONTENT_BYTES_PER_TURN + 1);
-        let json = format!(r#"{{"prompt":{}}}"#, serde_json::Value::String(big));
-        let err = parse(&json).into_messages().unwrap_err();
-        assert!(err.contains("exceeds maximum length"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn app_error_returns_opaque_response_with_correlation_id() {
-        use axum::body::to_bytes;
-
-        let err = AppError(anyhow::anyhow!(
-            "RABBITMQ_URL=amqp://lapin:supersecret@rabbitmq:5672/ failed: nope"
-        ));
-        let response = err.into_response();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-
-        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
-        let body_str = std::str::from_utf8(&bytes).unwrap();
-
-        assert!(
-            !body_str.contains("supersecret"),
-            "body MUST NOT leak password: {body_str}",
-        );
-        assert!(
-            !body_str.contains("RABBITMQ_URL"),
-            "body MUST NOT leak env-var names: {body_str}",
-        );
-        assert!(
-            !body_str.contains("lapin"),
-            "body MUST NOT leak username: {body_str}",
-        );
-
-        let json: serde_json::Value = serde_json::from_str(body_str).unwrap();
-        assert_eq!(json["error"], "internal error");
-        let id = json["correlation_id"]
-            .as_str()
-            .expect("correlation_id present");
-        assert_eq!(id.len(), 36, "uuid v4 hyphenated length");
-    }
-
-    // Sets/clears CHAT_BEARER_TOKEN, must be `#[serial]` to avoid races with
-    // any other test reading process env. Edition 2024 requires `unsafe` for
-    // env-mutation; only the test helpers in this file use it.
-    fn with_bearer_env<F: FnOnce()>(value: Option<&str>, f: F) {
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var("CHAT_BEARER_TOKEN", v),
-                None => std::env::remove_var("CHAT_BEARER_TOKEN"),
-            }
-        }
-        f();
-        unsafe {
-            std::env::remove_var("CHAT_BEARER_TOKEN");
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auth_token_from_env_returns_some_when_set() {
-        with_bearer_env(Some("abc"), || {
-            assert_eq!(auth_token_from_env().as_deref(), Some("abc"));
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auth_token_from_env_returns_none_when_empty_or_whitespace() {
-        with_bearer_env(Some("   "), || {
-            assert_eq!(auth_token_from_env(), None);
-        });
-        with_bearer_env(Some(""), || {
-            assert_eq!(auth_token_from_env(), None);
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn auth_token_from_env_returns_none_when_unset() {
-        with_bearer_env(None, || {
-            assert_eq!(auth_token_from_env(), None);
-        });
-    }
-
-    fn with_approval_ttl_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
-        let prev = std::env::var("CHAT_APPROVAL_TTL_SECONDS").ok();
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var("CHAT_APPROVAL_TTL_SECONDS", v),
-                None => std::env::remove_var("CHAT_APPROVAL_TTL_SECONDS"),
-            }
-        }
-        let r = f();
-        unsafe {
-            match prev {
-                Some(p) => std::env::set_var("CHAT_APPROVAL_TTL_SECONDS", p),
-                None => std::env::remove_var("CHAT_APPROVAL_TTL_SECONDS"),
-            }
-        }
-        r
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn approval_ttl_defaults_to_900_seconds() {
-        with_approval_ttl_env(None, || {
-            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn approval_ttl_parses_env_override() {
-        with_approval_ttl_env(Some("60"), || {
-            assert_eq!(approval_ttl(), std::time::Duration::from_secs(60));
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn approval_ttl_falls_back_on_garbage_value() {
-        with_approval_ttl_env(Some("not-a-number"), || {
-            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
-        });
-        with_approval_ttl_env(Some("0"), || {
-            // zero is a sentinel for "unparseable" — fallback applies
-            assert_eq!(approval_ttl(), std::time::Duration::from_secs(900));
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn chat_suggestions_enabled_defaults_true_when_unset() {
-        unsafe {
-            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
-        }
-        assert!(chat_suggestions_enabled());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn chat_suggestions_enabled_disables_on_false() {
-        unsafe {
-            std::env::set_var("CHAT_SUGGESTIONS_ENABLED", "false");
-        }
-        assert!(!chat_suggestions_enabled());
-        unsafe {
-            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn chat_suggestions_enabled_trims_and_case_insensitive() {
-        for v in ["FALSE", "False", " false ", "\tfalse\n"] {
-            unsafe {
-                std::env::set_var("CHAT_SUGGESTIONS_ENABLED", v);
-            }
-            assert!(!chat_suggestions_enabled(), "expected disabled for {v:?}");
-        }
-        for v in ["0", "no", "off", "true", "", "anything"] {
-            unsafe {
-                std::env::set_var("CHAT_SUGGESTIONS_ENABLED", v);
-            }
-            assert!(chat_suggestions_enabled(), "expected enabled for {v:?}");
-        }
-        unsafe {
-            std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
-        }
-    }
-
-    async fn ok_handler() -> &'static str {
-        "ok"
-    }
-
-    fn bearer_test_app(token: &str) -> Router {
-        Router::new()
-            .route("/test", post(ok_handler))
-            .route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)))
-    }
-
-    #[tokio::test]
-    async fn bearer_layer_accepts_correct_token() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let app = bearer_test_app("secret");
-        let req = Request::builder()
-            .method("POST")
-            .uri("/test")
-            .header("Authorization", "Bearer secret")
-            .body(Body::empty())
-            .unwrap();
-
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn bearer_layer_rejects_missing_header() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let app = bearer_test_app("secret");
-        let req = Request::builder()
-            .method("POST")
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
-
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn bearer_layer_rejects_wrong_token() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt;
-
-        let app = bearer_test_app("secret");
-        let req = Request::builder()
-            .method("POST")
-            .uri("/test")
-            .header("Authorization", "Bearer wrong")
-            .body(Body::empty())
-            .unwrap();
-
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn cors_lax_no_allowlist_falls_back_to_permissive() {
-        assert!(parse_cors_allow_list(false, None).is_ok());
-    }
-
-    #[test]
-    fn cors_strict_no_allowlist_bails() {
-        let err = parse_cors_allow_list(true, None).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("requires CHAT_ALLOWED_ORIGINS"),
-            "unexpected error: {msg}",
-        );
-    }
-
-    #[test]
-    fn cors_strict_with_valid_allowlist_returns_layer() {
-        assert!(parse_cors_allow_list(true, Some("https://shift.my.be")).is_ok());
-    }
-
-    #[test]
-    fn cors_strict_parse_fail_bails() {
-        // Internal \n survives trim() but fails HeaderValue parse
-        // (control bytes < 0x20 are rejected).
-        let err = parse_cors_allow_list(true, Some("foo\nbar")).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("parse failed"), "unexpected error: {msg}");
-    }
-
-    #[test]
-    fn cors_lax_parse_fail_falls_back_to_permissive() {
-        assert!(parse_cors_allow_list(false, Some("foo\nbar")).is_ok());
-    }
-
-    #[test]
-    fn cors_strict_empty_after_trim_bails() {
-        let err = parse_cors_allow_list(true, Some(", , ,  ")).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("no usable origins"), "unexpected error: {msg}");
-    }
-
-    #[tokio::test]
-    async fn concurrency_layer_caps_in_flight_at_max() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
-
-        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-        static PEAK: AtomicUsize = AtomicUsize::new(0);
-        IN_FLIGHT.store(0, Ordering::SeqCst);
-        PEAK.store(0, Ordering::SeqCst);
-
-        async fn slow_handler() -> &'static str {
-            let cur = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-            PEAK.fetch_max(cur, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-            "ok"
-        }
-
-        let app: Router = Router::new()
-            .route("/test", post(slow_handler))
-            .route_layer(tower::limit::GlobalConcurrencyLimitLayer::new(
-                MAX_CONCURRENT_CHAT,
-            ));
-
-        let mut joinset = tokio::task::JoinSet::new();
-        for _ in 0..20 {
-            let app_clone = app.clone();
-            joinset.spawn(async move {
-                use axum::body::Body;
-                use axum::http::Request;
-                use tower::ServiceExt;
-
-                let req = Request::builder()
-                    .method("POST")
-                    .uri("/test")
-                    .body(Body::empty())
-                    .unwrap();
-                app_clone.oneshot(req).await.unwrap()
-            });
-        }
-
-        while let Some(res) = joinset.join_next().await {
-            assert_eq!(res.unwrap().status(), StatusCode::OK);
-        }
-
-        let observed = PEAK.load(Ordering::SeqCst);
-        assert!(
-            observed <= MAX_CONCURRENT_CHAT,
-            "peak in-flight={observed} exceeded MAX_CONCURRENT_CHAT={MAX_CONCURRENT_CHAT}"
-        );
-        assert!(
-            observed >= 2,
-            "peak should exercise parallelism (>=2), got {observed}"
-        );
-    }
-
-    #[test]
-    fn approve_body_deserializes_action_id() {
-        let body: ApproveBody =
-            serde_json::from_str(r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000"}"#)
-                .unwrap();
-        assert_eq!(
-            body.action_id.to_string(),
-            "550e8400-e29b-41d4-a716-446655440000"
-        );
-    }
-
-    #[test]
-    fn approve_body_rejects_non_uuid_action_id() {
-        let err = serde_json::from_str::<ApproveBody>(r#"{"action_id":"not-a-uuid"}"#)
-            .expect_err("bad uuid must reject");
-        assert!(err.to_string().to_lowercase().contains("uuid"));
-    }
-
-    #[tokio::test]
-    async fn approval_error_response_maps_status_codes() {
-        use crate::gateway::approval::types::{ApprovalError, ApprovalStatus};
-        use chrono::Utc;
-        use uuid::Uuid;
-
-        assert_eq!(
-            approval_error_response(ApprovalError::NotFound(Uuid::new_v4())).status(),
-            StatusCode::NOT_FOUND,
-        );
-        assert_eq!(
-            approval_error_response(ApprovalError::AlreadyDecided(ApprovalStatus::Approved))
-                .status(),
-            StatusCode::CONFLICT,
-        );
-        assert_eq!(
-            approval_error_response(ApprovalError::WrongUser {
-                proposer: "alice".into(),
-                caller: "mallory".into(),
-            })
-            .status(),
-            StatusCode::FORBIDDEN,
-        );
-        assert_eq!(
-            approval_error_response(ApprovalError::Expired(Utc::now())).status(),
-            StatusCode::GONE,
-        );
-    }
-
-    #[tokio::test]
-    async fn approval_error_body_does_not_leak_proposer_id() {
-        use axum::body::to_bytes;
-
-        let response = approval_error_response(ApprovalError::WrongUser {
-            proposer: "drupal-uid-42".into(),
-            caller: "drupal-uid-99".into(),
-        });
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
-        let body = std::str::from_utf8(&bytes).unwrap();
-        assert!(
-            !body.contains("drupal-uid-42"),
-            "must not leak proposer id: {body}"
-        );
-        assert!(
-            !body.contains("drupal-uid-99"),
-            "must not leak caller id: {body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn scope_required_returns_403() {
-        let response = scope_required_response();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[test]
-    fn reject_body_deserializes_with_reason() {
-        let body: RejectBody = serde_json::from_str(
-            r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000","reason":"vendor mismatch"}"#,
-        )
-        .unwrap();
-        assert_eq!(body.reason.as_deref(), Some("vendor mismatch"));
-    }
-
-    #[test]
-    fn reject_body_deserializes_without_reason() {
-        let body: RejectBody =
-            serde_json::from_str(r#"{"action_id":"550e8400-e29b-41d4-a716-446655440000"}"#)
-                .unwrap();
-        assert!(body.reason.is_none());
-    }
-
-    #[test]
-    fn chat_response_serializes_with_v1_4_fields() {
-        // Pin the wire shape Drupal/jarvis_chat sees on success: answer +
-        // additive tool_trace/tokens/iterations/correlation_id. Drupal's
-        // `const { answer } = res.json()` destructure must keep working.
-        let resp = ChatResponse {
-            answer: "ok".into(),
-            tool_trace: vec![ToolCallTrace {
-                tool: "count_contacts".into(),
-                server: "crm".into(),
-                ms: 412,
-                ok: true,
-                error: None,
-                args: None,
-                status: None,
-                action_id: None,
-            }],
-            tokens: TokenUsage {
-                input: 100,
-                output: 50,
-                cache_creation_input: None,
-                cache_read_input: None,
-            },
-            iterations: 2,
-            correlation_id: "abc-123".into(),
-            suggestions: Vec::new(),
-        };
-        let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["answer"], "ok");
-        assert_eq!(v["tool_trace"][0]["tool"], "count_contacts");
-        assert_eq!(v["tool_trace"][0]["server"], "crm");
-        assert_eq!(v["tool_trace"][0]["ms"], 412);
-        assert_eq!(v["tool_trace"][0]["ok"], true);
-        assert!(v["tool_trace"][0].get("args").is_none());
-        assert!(v["tool_trace"][0].get("error").is_none());
-        assert_eq!(v["tokens"]["input"], 100);
-        assert_eq!(v["tokens"]["output"], 50);
-        assert!(v["tokens"].get("cache_creation_input").is_none());
-        assert_eq!(v["iterations"], 2);
-        assert_eq!(v["correlation_id"], "abc-123");
-        assert!(
-            v.get("suggestions").is_none(),
-            "empty Vec must skip serialization for v1.4 backwards-compat",
-        );
-    }
-
-    #[test]
-    fn chat_response_serializes_suggestions_when_present() {
-        let resp = ChatResponse {
-            answer: "ok".into(),
-            tool_trace: Vec::new(),
-            tokens: TokenUsage::default(),
-            iterations: 1,
-            correlation_id: "cid".into(),
-            suggestions: vec![
-                "Vraag een?".into(),
-                "Vraag twee?".into(),
-                "Vraag drie?".into(),
-            ],
-        };
-        let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["suggestions"][0], "Vraag een?");
-        assert_eq!(v["suggestions"].as_array().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn progress_event_names_match_serde_tags() {
-        // SSE event-name = serde tag (snake_case of variant). Pin the
-        // mapping so a future variant rename can't silently desync the
-        // wire-format from the helper.
-        use crate::agent::llm::{StopReason, TokenUsage};
-        let cases: &[(ProgressEvent, &str)] = &[
-            (ProgressEvent::Thinking { text: "".into() }, "thinking"),
-            (ProgressEvent::TextChunk { text: "".into() }, "text_chunk"),
-            (
-                ProgressEvent::ToolCallStarted {
-                    name: "x".into(),
-                    server: None,
-                },
-                "tool_call_started",
-            ),
-            (
-                ProgressEvent::ToolCallCompleted {
-                    name: "x".into(),
-                    ok: true,
-                    ms: 0,
-                    status: None,
-                    action_id: None,
-                },
-                "tool_call_completed",
-            ),
-            (
-                ProgressEvent::ApprovalPending {
-                    action_id: "a".into(),
-                    tool: "t".into(),
-                    server: "s".into(),
-                },
-                "approval_pending",
-            ),
-            (
-                ProgressEvent::Done {
-                    tokens: TokenUsage::default(),
-                    iterations: 0,
-                    correlation_id: "c".into(),
-                },
-                "done",
-            ),
-            (
-                ProgressEvent::Error {
-                    message: "boom".into(),
-                    correlation_id: "c".into(),
-                },
-                "error",
-            ),
-        ];
-        // Reference unused — keep compiler happy without leaking StopReason.
-        let _ = std::any::type_name::<StopReason>();
-        for (ev, name) in cases {
-            assert_eq!(progress_event_name(ev), *name);
-            // Serde tag inside the JSON payload should match exactly.
-            let v = serde_json::to_value(ev).unwrap();
-            assert_eq!(v["event"].as_str(), Some(*name));
-        }
-    }
-
-    #[test]
-    fn cloudflare_pad_comment_crosses_cf_buffer_threshold() {
-        let pad = cloudflare_pad_comment();
-        assert!(
-            pad.len() >= 4096,
-            "pad must be >= 4096 bytes to defeat Cloudflare buffering, got {}",
-            pad.len(),
-        );
-        assert!(pad.is_ascii(), "pad must be ASCII to avoid encoding issues");
-        assert!(
-            !pad.contains('\n') && !pad.contains('\r'),
-            "CR/LF in comment would prematurely terminate the SSE frame",
-        );
-    }
-}
+mod tests;
