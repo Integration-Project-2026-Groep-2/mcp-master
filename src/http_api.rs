@@ -384,7 +384,7 @@ async fn chat(
 
     let system_prompt = match state.memory.as_deref() {
         Some(memory) => memory
-            .augment_system_prompt(SETUP_PROMPT, &messages)
+            .augment_system_prompt(SETUP_PROMPT, &messages, Some(ctx.user_id.as_str()))
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
@@ -689,7 +689,7 @@ async fn chat_stream(
 
     let system_prompt = match state.memory.as_deref() {
         Some(memory) => memory
-            .augment_system_prompt(SETUP_PROMPT, &messages)
+            .augment_system_prompt(SETUP_PROMPT, &messages, Some(ctx.user_id.as_str()))
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
@@ -1066,7 +1066,7 @@ async fn handle_scheduled(
     }];
     let system_prompt = match state.memory.as_deref() {
         Some(memory) => memory
-            .augment_system_prompt(SETUP_PROMPT, &messages)
+            .augment_system_prompt(SETUP_PROMPT, &messages, None)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");

@@ -202,4 +202,34 @@ mod tests {
         assert!(alice.is_empty());
         assert_eq!(bob.len(), 1);
     }
+
+    #[tokio::test]
+    async fn search_scopes_results_to_user_id() {
+        let store = InMemoryVectorStore::new();
+        let point = |id: &str, user: &str| VectorPoint {
+            id: id.into(),
+            vector: vec![1.0, 0.0, 0.0],
+            payload: MemoryPayload {
+                namespace: "default".into(),
+                source: MemorySource::Chat,
+                correlation_id: "cid".into(),
+                user_id: Some(user.into()),
+                text: format!("secret of {user}"),
+                chunk_index: 0,
+                chunk_count: 1,
+                created_at_unix_ms: 1,
+            },
+        };
+        store
+            .upsert_points("c", vec![point("1", "alice"), point("2", "bob")])
+            .await
+            .unwrap();
+
+        let bob = store
+            .search_points("c", "default", Some("bob"), &[1.0, 0.0, 0.0], 10)
+            .await
+            .unwrap();
+        assert_eq!(bob.len(), 1);
+        assert_eq!(bob[0].user_id.as_deref(), Some("bob"));
+    }
 }

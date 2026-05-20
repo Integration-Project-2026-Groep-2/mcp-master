@@ -38,7 +38,7 @@ async fn run_prompt(
 
     let system_prompt = match memory {
         Some(memory) => memory
-            .augment_system_prompt(agent::prompts::SETUP_PROMPT, &messages)
+            .augment_system_prompt(agent::prompts::SETUP_PROMPT, &messages, None)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");

@@ -62,6 +62,7 @@ impl MemoryService {
         &self,
         base_prompt: &str,
         messages: &[Message],
+        user_id: Option<&str>,
     ) -> Result<String> {
         let Some(query) = latest_user_text(messages) else {
             return Ok(base_prompt.to_string());
@@ -72,7 +73,7 @@ impl MemoryService {
             return Ok(base_prompt.to_string());
         }
 
-        let results = self.retrieve(&query, None).await?;
+        let results = self.retrieve(&query, user_id).await?;
         if results.is_empty() {
             return Ok(base_prompt.to_string());
         }

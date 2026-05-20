@@ -57,7 +57,7 @@ pub async fn gather_evidence(
 
     let system_prompt = match memory {
         Some(memory) => memory
-            .augment_system_prompt(STEP_A_SYSTEM_PROMPT, &messages)
+            .augment_system_prompt(STEP_A_SYSTEM_PROMPT, &messages, None)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
@@ -244,7 +244,7 @@ pub async fn compose_diagnosis(
 
     let system_prompt = match memory {
         Some(memory) => memory
-            .augment_system_prompt(STEP_B_SYSTEM_PROMPT, &messages)
+            .augment_system_prompt(STEP_B_SYSTEM_PROMPT, &messages, None)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("memory retrieval failed; falling back to base prompt: {e:#}");
