@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use blake3::Hasher;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RESPONSE_CACHE_TTL_MS: i64 = 60_000;
@@ -19,9 +20,18 @@ fn now_unix_ms() -> i64 {
 }
 
 impl SqliteMemory {
-    /// Open a sqlite file and ensure tables exist.
-    pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path).context("opening sqlite file")?;
+    /// Open a sqlite file and ensure tables exist. Creates the parent dir if
+    /// missing so a configured path under a fresh directory just works.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating cache dir {}", parent.display()))?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening sqlite file {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "wal")?;
 
         conn.execute_batch(
@@ -121,6 +131,38 @@ impl SqliteMemory {
     }
 }
 
+const CACHE_FILENAME: &str = "memory-cache.sqlite3";
+
+/// Configured cache path (`RESPONSE_CACHE_PATH`) or a writable temp-dir default.
+/// The default avoids assuming a writable CWD — the container runs non-root with
+/// a root-owned WORKDIR — and the short TTL makes an ephemeral file fine.
+fn cache_path_or_default(env_value: Option<String>) -> PathBuf {
+    match env_value {
+        Some(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => std::env::temp_dir().join("mcp-master").join(CACHE_FILENAME),
+    }
+}
+
+/// Open the cache at `path`, degrading to `None` on failure — a best-effort
+/// cache must never abort startup.
+fn open_or_disabled(path: impl AsRef<Path>) -> Option<Arc<SqliteMemory>> {
+    let path = path.as_ref();
+    match SqliteMemory::open(path) {
+        Ok(cache) => Some(Arc::new(cache)),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), "response cache disabled: {e:#}");
+            None
+        }
+    }
+}
+
+/// Open the response cache at the configured-or-default path.
+pub fn open_response_cache() -> Option<Arc<SqliteMemory>> {
+    open_or_disabled(cache_path_or_default(
+        std::env::var("RESPONSE_CACHE_PATH").ok(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +244,42 @@ mod tests {
 
         assert!(db.lookup_response("a").unwrap().is_none());
         assert!(db.lookup_response("b").unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_path_uses_env_override() {
+        let p = cache_path_or_default(Some("custom/dir/cache.sqlite3".to_string()));
+        assert_eq!(p, PathBuf::from("custom/dir/cache.sqlite3"));
+    }
+
+    #[test]
+    fn cache_path_defaults_to_temp_dir_when_unset_or_blank() {
+        for v in [None, Some("   ".to_string())] {
+            let p = cache_path_or_default(v);
+            assert!(p.starts_with(std::env::temp_dir()));
+            assert!(p.ends_with("memory-cache.sqlite3"));
+        }
+    }
+
+    #[test]
+    fn open_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b").join("cache.sqlite3");
+        let db = SqliteMemory::open(&nested).unwrap();
+        db.store_response("k", "v").unwrap();
+        assert_eq!(db.lookup_response("k").unwrap().as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn open_or_disabled_degrades_to_none_on_bad_path() {
+        let file = NamedTempFile::new().unwrap();
+        let bad = file.path().join("cache.sqlite3");
+        assert!(open_or_disabled(&bad).is_none());
+    }
+
+    #[test]
+    fn open_or_disabled_returns_some_on_good_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(open_or_disabled(dir.path().join("cache.sqlite3")).is_some());
     }
 }
