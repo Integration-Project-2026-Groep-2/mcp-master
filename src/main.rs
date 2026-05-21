@@ -15,7 +15,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::agent::llm::ToolSpec;
 use crate::agent::llm::anthropic::AnthropicClient;
-use crate::memory::{MemoryInteraction, MemoryService, MemorySource, SqliteMemory};
+use crate::memory::{MemoryInteraction, MemoryService, MemorySource};
 use crate::teams::TeamsConfig;
 use uuid::Uuid;
 
@@ -170,9 +170,7 @@ async fn main() -> Result<()> {
         if memory.is_some() {
             tracing::info!("memory subsystem enabled");
         }
-        let cache = Some(std::sync::Arc::new(SqliteMemory::open(
-            "memory-cache.sqlite3",
-        )?));
+        let cache = memory::open_response_cache();
         tracing::info!("starting axum HTTP API on :8080");
         let rabbitmq = bootstrap_rabbitmq().await;
         http_api::serve(pool, llm, teams_config, tool_specs, rabbitmq, cache, memory).await?;
