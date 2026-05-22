@@ -1,21 +1,20 @@
-//! JWT-derived auth scope for the `/chat` route.
+//! JWT-derived auth scope for the chat routes — the single auth gate.
 //!
-//! Currently a parking-lot type — PR-4 wires it into the axum router. The
-//! module-level `dead_code` allow below is dropped at the same time.
-//!
-//! Decode-order:
-//! 1. Bearer header missing → 401.
-//! 2. `CHAT_JWT_SECRET` set → decode HS256 JWT; on success, parse `scope`
-//!    claim (`"read"` → [`AuthScope::Read`], `"read+act"` / `"read act"`
-//!    → [`AuthScope::ReadAndAct`]; else 403).
-//! 3. JWT decode failed OR `CHAT_JWT_SECRET` unset → fallback to legacy
-//!    `CHAT_BEARER_TOKEN` bytewise-equality (matches v1.3 contract). Match
-//!    → [`AuthScope::Read`]. Mismatch → 401.
-//! 4. Both env-vars unset → log WARN once at startup, return [`AuthScope::Read`]
+//! Resolve-order (the `Bearer ` prefix is stripped first; missing → 401):
+//! 1. `CHAT_JWT_SECRET` set and the token is a valid HS256 JWT → use its
+//!    `scope` claim (`"read"` → [`AuthScope::Read`], `"read+act"` / `"read act"`
+//!    → [`AuthScope::ReadAndAct`]; unknown value → [`AuthScope::Read`]).
+//! 2. else `CHAT_BEARER_TOKEN` set and the token matches it bytewise →
+//!    [`AuthScope::Read`] (legacy static-token credential).
+//! 3. else, if either secret is set → 401 (closed-by-default: an unknown token
+//!    is rejected, not silently granted read).
+//! 4. both secrets unset → log WARN once, return [`AuthScope::Read`]
 //!    (dev-only skip-warn pattern).
 //!
-//! HS256 is hardcoded; `exp` validation is required. Rotating
-//! `CHAT_JWT_SECRET` requires a container restart (matches `CHAT_BEARER_TOKEN`).
+//! This OR-composes a JWT and the static token in one extractor, so
+//! `CHAT_BEARER_TOKEN` and per-user JWTs both work without a separate dominant
+//! middleware. HS256 hardcoded; `exp` required. Rotating either secret needs a
+//! container restart.
 
 #![allow(dead_code)]
 
@@ -47,7 +46,7 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthScope {
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let token = bearer_token(parts).ok_or(StatusCode::UNAUTHORIZED)?;
-        Ok(resolve_scope(&token))
+        resolve_scope(&token)
     }
 }
 
@@ -57,21 +56,30 @@ fn bearer_token(parts: &Parts) -> Option<String> {
     header_str.strip_prefix("Bearer ").map(str::to_string)
 }
 
-fn resolve_scope(token: &str) -> AuthScope {
-    if let Some(secret) = jwt_secret_from_env()
-        && let Ok(claims) = decode_claims(token, &secret)
+fn resolve_scope(token: &str) -> Result<AuthScope, StatusCode> {
+    let jwt_secret = jwt_secret_from_env();
+    let legacy = bearer_token_from_env();
+
+    if let Some(secret) = jwt_secret.as_deref()
+        && let Ok(claims) = decode_claims(token, secret)
     {
-        return parse_scope(&claims.scope).unwrap_or(AuthScope::Read);
+        return Ok(parse_scope(&claims.scope).unwrap_or(AuthScope::Read));
     }
 
-    if let Some(legacy) = bearer_token_from_env()
-        && legacy == token
+    if let Some(expected) = legacy.as_deref()
+        && expected == token
     {
-        return AuthScope::Read;
+        return Ok(AuthScope::Read);
+    }
+
+    // A secret is configured but the token matched neither a JWT nor the
+    // static token → reject instead of silently granting read.
+    if jwt_secret.is_some() || legacy.is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     log_skip_warn_once();
-    AuthScope::Read
+    Ok(AuthScope::Read)
 }
 
 /// Re-decode the JWT sub claim from the request headers. Returns `None` for
