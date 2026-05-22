@@ -95,6 +95,27 @@ fn confidence_snake_case_wire_format() {
 }
 
 #[test]
+fn confidence_as_str_matches_serde_wire_format() {
+    for c in [
+        Confidence::InsufficientEvidence,
+        Confidence::Low,
+        Confidence::Medium,
+        Confidence::High,
+    ] {
+        let wire = serde_json::to_string(&c).unwrap();
+        assert_eq!(
+            c.as_str(),
+            wire.trim_matches('"'),
+            "as_str drifted for {c:?}"
+        );
+    }
+    assert_eq!(
+        Confidence::InsufficientEvidence.as_str(),
+        "insufficient_evidence"
+    );
+}
+
+#[test]
 fn incident_diagnosis_round_trips_with_suggested_action() {
     let d = IncidentDiagnosis {
         root_cause: "deploy abc123 broke DB pool sizing".into(),

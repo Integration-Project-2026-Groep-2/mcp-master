@@ -365,10 +365,7 @@ async fn handle_delivery_with_content(
                 total_ms,
                 "incident diagnosed"
             );
-            crate::metrics::record_incident(
-                "diagnosed",
-                &format!("{:?}", diagnosis.confidence).to_ascii_lowercase(),
-            );
+            crate::metrics::record_incident("diagnosed", diagnosis.confidence.as_str());
             crate::metrics::record_incident_pipeline_ms(pipeline_ms);
             publish_diagnosis(publisher, &evt, &correlation_id, &diagnosis).await;
         }
