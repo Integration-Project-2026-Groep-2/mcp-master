@@ -410,7 +410,10 @@ async fn chat(
         &ctx,
     )
     .await
-    .map_err(|e| AppError(e).into_response())?;
+    .map_err(|e| {
+        crate::metrics::record_chat("sync", "error", &TokenUsage::default());
+        AppError(e).into_response()
+    })?;
     let duration_ms = started.elapsed().as_millis() as u64;
     crate::metrics::record_chat("sync", "ok", &outcome.tokens);
 
