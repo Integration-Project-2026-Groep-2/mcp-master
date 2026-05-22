@@ -1,7 +1,7 @@
 //! Prometheus metrics: install the global recorder once at startup and hold the
 //! render handle that the `/metrics` endpoint serves. Call-sites elsewhere
-//! record through the `metrics::{counter,histogram,gauge}!` macros, so only this
-//! module and the endpoint touch the exporter directly.
+//! record through the `record_*` helpers here (or the `metrics::*!` macros), so
+//! metric names live in one place and only this module touches the exporter.
 
 use std::time::Instant;
 
@@ -50,6 +50,24 @@ pub async fn track_http(req: Request, next: Next) -> Response {
     metrics::histogram!("http_request_duration_seconds", "route" => route)
         .record(start.elapsed().as_secs_f64());
     response
+}
+
+/// Record one MCP tool dispatch — called from `McpPool::call` next to the
+/// `tool_called` event so metrics work even without a broker.
+pub fn record_tool_call(tool: &str, server: &str, ok: bool, duration_ms: u64) {
+    metrics::counter!(
+        "mcp_tool_calls_total",
+        "tool" => tool.to_string(),
+        "server" => server.to_string(),
+        "ok" => ok.to_string(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "mcp_tool_call_duration_seconds",
+        "tool" => tool.to_string(),
+        "server" => server.to_string(),
+    )
+    .record(duration_ms as f64 / 1000.0);
 }
 
 #[cfg(test)]
@@ -103,5 +121,21 @@ mod tests {
         let out = handle.render();
         assert!(out.contains("http_requests_total"), "render:\n{out}");
         assert!(out.contains("route=\"/ping\""), "render:\n{out}");
+    }
+
+    #[test]
+    fn record_tool_call_emits_counter_and_histogram() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        with_local_recorder(&recorder, || {
+            record_tool_call("count_contacts", "crm", true, 412);
+        });
+        let out = handle.render();
+        assert!(out.contains("mcp_tool_calls_total"), "render:\n{out}");
+        assert!(out.contains("tool=\"count_contacts\""), "render:\n{out}");
+        assert!(
+            out.contains("mcp_tool_call_duration_seconds"),
+            "render:\n{out}"
+        );
     }
 }

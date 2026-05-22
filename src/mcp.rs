@@ -421,6 +421,8 @@ impl McpExecutor for McpPool {
             }
         }
 
+        crate::metrics::record_tool_call(name, &server_label, success, duration_ms);
+
         // Args in trace are gated by env-flag — default off so BTW/email-shaped
         // values stay out of response bodies and AMQP audit events.
         let args_for_trace = if trace_args_enabled() {
