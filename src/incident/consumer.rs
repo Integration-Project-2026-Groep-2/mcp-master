@@ -305,6 +305,7 @@ async fn handle_delivery_with_content(
             severity = ?evt.payload.severity,
             "incident skipped (severity_too_low)"
         );
+        crate::metrics::record_incident("skipped", "severity_too_low");
         publish_skip(publisher, &evt, &correlation_id, "severity_too_low", None).await;
         return Ok(());
     }
@@ -316,6 +317,7 @@ async fn handle_delivery_with_content(
             elapsed_s = elapsed.as_secs(),
             "incident skipped (debounced)"
         );
+        crate::metrics::record_incident("skipped", "debounced");
         publish_skip(publisher, &evt, &correlation_id, "debounced", Some(elapsed)).await;
         return Ok(());
     }
@@ -328,6 +330,7 @@ async fn handle_delivery_with_content(
             reset_in_s,
             "incident circuit open — skipping diagnosis (budget exhausted)"
         );
+        crate::metrics::record_incident("circuit_open", "budget");
         publish_circuit_open(publisher, &evt, &correlation_id, reset_in_s).await;
         return Ok(());
     }
@@ -362,6 +365,8 @@ async fn handle_delivery_with_content(
                 total_ms,
                 "incident diagnosed"
             );
+            crate::metrics::record_incident("diagnosed", diagnosis.confidence.as_str());
+            crate::metrics::record_incident_pipeline_ms(pipeline_ms);
             publish_diagnosis(publisher, &evt, &correlation_id, &diagnosis).await;
         }
         Err(e) => {
@@ -372,6 +377,7 @@ async fn handle_delivery_with_content(
                 pipeline_ms,
                 "diagnose pipeline failed: {e:#}"
             );
+            crate::metrics::record_incident("failed", "pipeline_error");
         }
     }
 

@@ -43,7 +43,7 @@ dotenvy = "0.15"
 lapin = "2"
 chrono = "0.4.44"
 
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "matched-path"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout"] }
 tower = { version = "0.5", default-features = false, features = ["util", "limit"] }
 
@@ -96,6 +96,13 @@ thiserror = "1"
 # atomic compare-and-swap via `entry().and_modify()` — needed for the
 # double-confirm race-guard.
 dashmap = "6"
+
+# Prometheus metrics. The `metrics` facade lets call-sites record via macros
+# without threading a registry; `metrics-exporter-prometheus` renders the text
+# exposition. default-features off drops its built-in HTTP listener — we serve
+# /metrics via axum.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.

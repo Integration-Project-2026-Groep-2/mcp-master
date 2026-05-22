@@ -21,6 +21,17 @@ pub enum Confidence {
     High,
 }
 
+impl Confidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InsufficientEvidence => "insufficient_evidence",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct IncidentEvent {
     pub event: String,

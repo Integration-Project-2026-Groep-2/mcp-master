@@ -65,6 +65,8 @@ pub struct AppState {
     pub publisher: Option<Arc<Publisher>>,
     pub cache: Option<Arc<SqliteMemory>>,
     pub memory: Option<Arc<MemoryService>>,
+    /// Prometheus render handle served by the `/metrics` endpoint.
+    pub metrics_handle: crate::metrics::Handle,
     /// Wired into chat() in commit 2 (mode dispatch) and chat_approve/reject
     /// in commits 3+4. Held as Arc so the cleanup task holds Arc<ApprovalStore>
     /// (not Arc<AppState>) — keeps `Arc::try_unwrap` clean at shutdown.
@@ -280,8 +282,12 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn metrics() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented")
+async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // 0.0.4 is the Prometheus text-exposition version tag scrapers expect.
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics_handle.render(),
+    )
 }
 
 /// Keys over the whole conversation, not just the last turn, so two chats
@@ -364,6 +370,7 @@ async fn chat(
         match cache.lookup_response(key) {
             Ok(Some(answer)) => {
                 tracing::info!(correlation_id = %correlation_id, "chat cache hit");
+                crate::metrics::record_chat("sync", "cache_hit", &TokenUsage::default());
                 return Ok(Json(ChatResponse {
                     answer,
                     cached: true,
@@ -403,8 +410,12 @@ async fn chat(
         &ctx,
     )
     .await
-    .map_err(|e| AppError(e).into_response())?;
+    .map_err(|e| {
+        crate::metrics::record_chat("sync", "error", &TokenUsage::default());
+        AppError(e).into_response()
+    })?;
     let duration_ms = started.elapsed().as_millis() as u64;
+    crate::metrics::record_chat("sync", "ok", &outcome.tokens);
 
     let suggestions = if chat_suggestions_enabled() {
         crate::agent::orchestrator::generate_suggestions(
@@ -822,6 +833,9 @@ async fn chat_stream(
             succeeded = false;
         }
 
+        let chat_outcome = if succeeded { "ok" } else { "error" };
+        crate::metrics::record_chat("stream", chat_outcome, &tokens);
+
         if let Some(publisher) = publisher {
             let duration_ms = started.elapsed().as_millis() as u64;
             let payload = serde_json::json!({
@@ -1138,6 +1152,8 @@ pub async fn serve(
         approval_ttl(),
     ));
 
+    let metrics_handle = crate::metrics::install()?;
+
     let state = Arc::new(AppState {
         llm,
         pool,
@@ -1145,6 +1161,7 @@ pub async fn serve(
         publisher: publisher_arc,
         cache,
         memory,
+        metrics_handle,
         approval_flow: approval_flow.clone(),
     });
     let teams_config = teams_config.map(Arc::new);
@@ -1246,6 +1263,8 @@ pub async fn serve(
         .route("/chat/stream", stream_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        // route_layer (not layer): runs after routing so MatchedPath is set.
+        .route_layer(axum::middleware::from_fn(crate::metrics::track_http))
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(build_cors_layer()?)
