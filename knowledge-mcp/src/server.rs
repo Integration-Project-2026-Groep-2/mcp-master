@@ -70,11 +70,36 @@ impl ServerHandler for DocsServer {
     }
 }
 
+fn build_config() -> StreamableHttpServerConfig {
+    // Pure request/response tool server — stateless avoids per-session task/alloc.
+    let config = StreamableHttpServerConfig::default().with_stateful_mode(false);
+    match std::env::var("ALLOWED_HOSTS") {
+        Ok(v) if !v.trim().is_empty() => {
+            let hosts: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            eprintln!("knowledge-mcp: ALLOWED_HOSTS = {hosts:?}");
+            config.with_allowed_hosts(hosts)
+        }
+        // rmcp's default Host allow-list is a browser DNS-rebinding guard; this is an
+        // internal server-to-server service, so the network policy is the control and
+        // the default localhost-only list would 403 every in-cluster request.
+        _ => {
+            eprintln!(
+                "knowledge-mcp: ALLOWED_HOSTS unset — Host check disabled (network policy is the boundary)"
+            );
+            config.disable_allowed_hosts()
+        }
+    }
+}
+
 pub async fn serve(index: Arc<HybridIndex>, port: u16) -> anyhow::Result<()> {
     let service = StreamableHttpService::new(
         move || Ok::<_, std::io::Error>(DocsServer::new(index.clone())),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        build_config(),
     );
     let app = axum::Router::new().nest_service("/mcp", service);
     let addr = format!("0.0.0.0:{port}");
