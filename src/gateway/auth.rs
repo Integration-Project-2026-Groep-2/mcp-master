@@ -16,8 +16,6 @@
 //! middleware. HS256 hardcoded; `exp` required. Rotating either secret needs a
 //! container restart.
 
-#![allow(dead_code)]
-
 use std::sync::OnceLock;
 
 use axum::extract::FromRequestParts;
@@ -37,7 +35,9 @@ struct Claims {
     sub: String,
     /// Single-string scope: `"read"` or `"read+act"` / `"read act"`.
     scope: String,
-    /// Required by validation — token expiry as unix timestamp.
+    /// Required by validation — token expiry as unix timestamp. jsonwebtoken
+    /// reads it from the raw payload; our code never touches the field.
+    #[allow(dead_code)]
     exp: usize,
 }
 
