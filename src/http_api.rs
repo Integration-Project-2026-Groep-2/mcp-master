@@ -14,10 +14,7 @@ use axum::{
 use chrono::{NaiveTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
-use tower_http::{
-    cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer,
-    validate_request::ValidateRequestHeaderLayer,
-};
+use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::{
     agent::llm::{ContentBlock, Message, Role, TokenUsage, ToolSpec, anthropic::AnthropicClient},
@@ -76,7 +73,7 @@ pub struct AppState {
 }
 
 /// Read `CHAT_APPROVAL_TTL_SECONDS` env-var; fall back to 900s (15min) on
-/// missing or unparseable values. Skip-warn matches `auth_token_from_env`.
+/// missing or unparseable values.
 fn approval_ttl() -> std::time::Duration {
     const DEFAULT_SECS: u64 = 900;
     match std::env::var("CHAT_APPROVAL_TTL_SECONDS") {
@@ -879,59 +876,11 @@ async fn chat_stream(
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
-/// Read `CHAT_BEARER_TOKEN` from env. Whitespace-only or unset → `None`,
-/// so the bearer layer can be conditionally applied with a skip-warn.
-fn auth_token_from_env() -> Option<String> {
-    std::env::var("CHAT_BEARER_TOKEN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
 fn chat_suggestions_enabled() -> bool {
     std::env::var("CHAT_SUGGESTIONS_ENABLED")
         .ok()
         .map(|s| !s.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(true)
-}
-
-/// Validates `Authorization: Bearer <token>` against a fixed expected value.
-/// Own impl rather than tower-http's deprecated `bearer()` helper, which
-/// emits a "too basic" warning that breaks `clippy -D warnings`. For our
-/// use-case (single shared secret) the bytewise compare is exactly what's
-/// needed; per-user tokens / JWT live behind a future v2 auth design.
-#[derive(Clone)]
-struct BearerAuth {
-    expected_header: String,
-}
-
-impl BearerAuth {
-    fn new(token: &str) -> Self {
-        Self {
-            expected_header: format!("Bearer {token}"),
-        }
-    }
-}
-
-impl<B> tower_http::validate_request::ValidateRequest<B> for BearerAuth {
-    type ResponseBody = axum::body::Body;
-
-    fn validate(
-        &mut self,
-        request: &mut axum::http::Request<B>,
-    ) -> Result<(), axum::http::Response<Self::ResponseBody>> {
-        let header = request
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
-        if header == Some(self.expected_header.as_str()) {
-            Ok(())
-        } else {
-            Err(axum::http::Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(axum::body::Body::empty())
-                .expect("static UNAUTHORIZED response builds"))
-        }
-    }
 }
 
 /// Build the CORS layer from `CHAT_ALLOWED_ORIGINS` (comma-separated origins).
@@ -1242,7 +1191,22 @@ pub async fn serve(
     let consumer_handle =
         consumer_config.map(|cfg| tokio::spawn(rabbitmq_consumer::run(cfg, shutdown_rx.clone())));
 
-    let bearer_token = auth_token_from_env();
+    // `AuthScope` (see gateway::auth) gates each chat handler as an extractor,
+    // i.e. inside the concurrency layer — an unauth request briefly holds a
+    // slot until its cheap 401. Acceptable: internal-only, Drupal-proxied.
+    match (
+        std::env::var("CHAT_JWT_SECRET").is_ok_and(|s| !s.trim().is_empty()),
+        std::env::var("CHAT_BEARER_TOKEN").is_ok_and(|s| !s.trim().is_empty()),
+    ) {
+        (false, false) => tracing::warn!(
+            "chat-auth: no CHAT_JWT_SECRET or CHAT_BEARER_TOKEN — all bearer tokens accepted as scope=read (dev-only, NOT for production)"
+        ),
+        (jwt, static_token) => tracing::info!(
+            jwt,
+            static_token,
+            "chat-auth enabled — unknown tokens rejected (401)"
+        ),
+    }
     // One concurrency layer shared across /chat + /chat/approve so both
     // routes draw from the same 8-slot pool. Plan §11.4: "8 concurrent
     // approvals + chats together is plenty for a single eventbeheerder."
@@ -1252,29 +1216,7 @@ pub async fn serve(
     let mut approve_route = post(chat_approve);
     let mut reject_route = post(chat_reject);
     let mut stream_route = post(chat_stream);
-    let mut forget_route = delete(forget_memory);
-    if let Some(ref token) = bearer_token {
-        tracing::info!(
-            "CHAT_BEARER_TOKEN set — bearer-auth enabled on /chat + /chat/approve + /chat/reject + /chat/stream"
-        );
-        chat_route =
-            chat_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
-        approve_route =
-            approve_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
-        reject_route =
-            reject_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
-        stream_route =
-            stream_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
-        forget_route =
-            forget_route.route_layer(ValidateRequestHeaderLayer::custom(BearerAuth::new(token)));
-    } else {
-        tracing::warn!(
-            "CHAT_BEARER_TOKEN unset — /chat + /chat/approve + /chat/reject + /chat/stream accept \
-             unauthenticated requests (dev-only, NOT for production)"
-        );
-    }
-    // Bearer is outer (added first); ConcurrencyLimit is inner (added later).
-    // Unauthenticated requests are rejected before consuming a slot.
+    let forget_route = delete(forget_memory);
     // GlobalConcurrencyLimit shares one Arc<Semaphore> across all per-request
     // service clones; the non-global variant builds a fresh semaphore per
     // Layer::layer() call → no actual capping. /chat/stream shares the same
