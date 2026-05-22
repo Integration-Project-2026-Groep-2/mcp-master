@@ -158,6 +158,22 @@ pub fn record_chat(mode: &str, outcome: &str, tokens: &TokenUsage) {
     .record(compute_cost(p, tokens));
 }
 
+/// Record one incident-pipeline outcome. `detail` carries the skip reason or the
+/// diagnosis confidence — all bounded value sets, so label cardinality is safe.
+pub fn record_incident(event: &str, detail: &str) {
+    metrics::counter!(
+        "incidents_total",
+        "event" => event.to_string(),
+        "detail" => detail.to_string(),
+    )
+    .increment(1);
+}
+
+/// Record the dual-LLM pipeline latency for a diagnosed incident.
+pub fn record_incident_pipeline_ms(duration_ms: u64) {
+    metrics::histogram!("incident_pipeline_duration_seconds").record(duration_ms as f64 / 1000.0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +271,23 @@ mod tests {
             cache_read_input: Some(1_000_000),
         };
         assert!((compute_cost(&p, &cached) - (3.75 + 0.30)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_incident_emits_counter_and_pipeline_histogram() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        with_local_recorder(&recorder, || {
+            record_incident("diagnosed", "high");
+            record_incident_pipeline_ms(24812);
+        });
+        let out = handle.render();
+        assert!(out.contains("incidents_total"), "render:\n{out}");
+        assert!(out.contains("event=\"diagnosed\""), "render:\n{out}");
+        assert!(
+            out.contains("incident_pipeline_duration_seconds"),
+            "render:\n{out}"
+        );
     }
 
     #[test]
