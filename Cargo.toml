@@ -44,7 +44,7 @@ lapin = "2"
 chrono = "0.4.44"
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout", "validate-request"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout"] }
 tower = { version = "0.5", default-features = false, features = ["util", "limit"] }
 
 # Correlation IDs in /chat error responses — full anyhow chain stays in logs,
