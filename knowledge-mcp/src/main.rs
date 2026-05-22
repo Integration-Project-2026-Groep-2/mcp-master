@@ -9,6 +9,14 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `--warm` prefetches the ONNX model into the cache and exits, so the Docker
+    // build can bake it into the image (no runtime download, fast readiness).
+    if std::env::args().any(|a| a == "--warm") {
+        embed::Embedder::new()?;
+        eprintln!("knowledge-mcp: model warmed");
+        return Ok(());
+    }
+
     let corpus_dir = std::env::var("CORPUS_DIR").unwrap_or_else(|_| "corpus".to_string());
     let port: u16 = std::env::var("PORT")
         .ok()
