@@ -78,16 +78,27 @@ async fn legacy_bearer_match_returns_read() {
 
 #[tokio::test]
 #[serial]
-async fn legacy_bearer_mismatch_falls_through_to_skip_warn() {
-    // With CHAT_BEARER_TOKEN set but mismatched, we log skip-warn once
-    // and grant Read — preserves dev-friendliness, mirrors the
-    // documented v1.3 fallback. Production sets CHAT_JWT_SECRET to
-    // make this path unreachable.
+async fn unknown_token_with_secret_set_returns_401() {
+    // A secret (CHAT_BEARER_TOKEN) is configured but the token matches
+    // neither a JWT nor the static token → closed-by-default 401.
     unsafe {
         std::env::remove_var("CHAT_JWT_SECRET");
         std::env::set_var("CHAT_BEARER_TOKEN", TEST_BEARER);
     }
     let mut parts = parts_with_bearer("wrong-token");
+    assert_eq!(extract(&mut parts).await, Err(StatusCode::UNAUTHORIZED));
+}
+
+#[tokio::test]
+#[serial]
+async fn both_secrets_unset_grants_read_dev() {
+    // Pure local dev: no secrets configured → any bearer token resolves to
+    // read via the skip-warn path.
+    unsafe {
+        std::env::remove_var("CHAT_JWT_SECRET");
+        std::env::remove_var("CHAT_BEARER_TOKEN");
+    }
+    let mut parts = parts_with_bearer("anything");
     assert_eq!(extract(&mut parts).await, Ok(AuthScope::Read));
 }
 
@@ -117,12 +128,9 @@ async fn valid_jwt_with_read_and_act_scope() {
 
 #[tokio::test]
 #[serial]
-async fn expired_jwt_falls_back_to_bearer_or_skip_warn() {
-    // Expired JWT decode-fails; with no legacy bearer set, we fall
-    // through to skip-warn and grant Read. Production with
-    // CHAT_BEARER_TOKEN set + non-matching token returns Read via
-    // the same skip-warn fallthrough — acceptable because production
-    // should also set CHAT_JWT_SECRET to make legacy unreachable.
+async fn expired_jwt_with_secret_set_returns_401() {
+    // CHAT_JWT_SECRET is set but the JWT is expired (decode fails) and no
+    // static token matches → closed-by-default 401.
     unsafe {
         std::env::set_var("CHAT_JWT_SECRET", TEST_SECRET);
         std::env::remove_var("CHAT_BEARER_TOKEN");
@@ -130,7 +138,7 @@ async fn expired_jwt_falls_back_to_bearer_or_skip_warn() {
     // -120s is past the jsonwebtoken default 60s leeway window.
     let token = mint_jwt(TEST_SECRET, "read+act", -120);
     let mut parts = parts_with_bearer(&token);
-    assert_eq!(extract(&mut parts).await, Ok(AuthScope::Read));
+    assert_eq!(extract(&mut parts).await, Err(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
