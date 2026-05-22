@@ -6,8 +6,12 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::index::HybridIndex;
+
+const MAX_BODY_BYTES: usize = 1 << 20;
+const MAX_QUERY_CHARS: usize = 8192;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct SearchParams {
@@ -37,6 +41,12 @@ impl DocsServer {
         &self,
         Parameters(SearchParams { query, k }): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if query.len() > MAX_QUERY_CHARS {
+            return Err(ErrorData::invalid_params(
+                format!("query too long (max {MAX_QUERY_CHARS} chars)"),
+                None,
+            ));
+        }
         let k = k.unwrap_or(5).clamp(1, 20);
         let hits = self
             .index
@@ -101,7 +111,9 @@ pub async fn serve(index: Arc<HybridIndex>, port: u16) -> anyhow::Result<()> {
         Arc::new(LocalSessionManager::default()),
         build_config(),
     );
-    let app = axum::Router::new().nest_service("/mcp", service);
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES));
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("knowledge-mcp: serving MCP on http://{addr}/mcp");

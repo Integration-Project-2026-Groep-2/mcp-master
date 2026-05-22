@@ -15,6 +15,7 @@ walkdir = "2"
 fastembed = "5"
 rmcp = { version = "1.6", features = ["server", "macros", "schemars", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 axum = "0.8"
+tower-http = { version = "0.6", features = ["limit"] }
 serde = { version = "1", features = ["derive"] }
 schemars = "1"
 
