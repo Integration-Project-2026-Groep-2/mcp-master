@@ -48,9 +48,11 @@ impl DocsServer {
             ));
         }
         let k = k.unwrap_or(5).clamp(1, 20);
-        let hits = self
-            .index
-            .search(&query, k)
+        let index = self.index.clone();
+        let q = query.clone();
+        let hits = tokio::task::spawn_blocking(move || index.search(&q, k))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("search task failed: {e}"), None))?
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let body = if hits.is_empty() {
             format!("No relevant documentation found for: {query}")
