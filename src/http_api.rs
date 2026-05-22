@@ -370,6 +370,7 @@ async fn chat(
         match cache.lookup_response(key) {
             Ok(Some(answer)) => {
                 tracing::info!(correlation_id = %correlation_id, "chat cache hit");
+                crate::metrics::record_chat("sync", "cache_hit", &TokenUsage::default());
                 return Ok(Json(ChatResponse {
                     answer,
                     cached: true,
@@ -411,6 +412,7 @@ async fn chat(
     .await
     .map_err(|e| AppError(e).into_response())?;
     let duration_ms = started.elapsed().as_millis() as u64;
+    crate::metrics::record_chat("sync", "ok", &outcome.tokens);
 
     let suggestions = if chat_suggestions_enabled() {
         crate::agent::orchestrator::generate_suggestions(
@@ -827,6 +829,9 @@ async fn chat_stream(
         } else if let Ok(Err(_)) = orch_handle.await {
             succeeded = false;
         }
+
+        let chat_outcome = if succeeded { "ok" } else { "error" };
+        crate::metrics::record_chat("stream", chat_outcome, &tokens);
 
         if let Some(publisher) = publisher {
             let duration_ms = started.elapsed().as_millis() as u64;

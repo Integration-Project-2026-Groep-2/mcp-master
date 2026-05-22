@@ -3,6 +3,7 @@
 //! record through the `record_*` helpers here (or the `metrics::*!` macros), so
 //! metric names live in one place and only this module touches the exporter.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::{
@@ -11,6 +12,8 @@ use axum::{
     response::Response,
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
+
+use crate::agent::llm::TokenUsage;
 
 /// Render handle for the `/metrics` exposition. Cheap to clone (Arc inside).
 pub type Handle = metrics_exporter_prometheus::PrometheusHandle;
@@ -70,12 +73,107 @@ pub fn record_tool_call(tool: &str, server: &str, ok: bool, duration_ms: u64) {
     .record(duration_ms as f64 / 1000.0);
 }
 
+/// Per-million-token prices for cost metering. Defaults are Claude Sonnet 4.x
+/// USD list prices; override per-deployment via `LLM_PRICE_*_PER_MTOK` and
+/// `LLM_PRICE_CURRENCY` (e.g. set EUR-adjusted values + `eur`).
+#[derive(Debug, Clone)]
+struct Prices {
+    input: f64,
+    output: f64,
+    cache_write: f64,
+    cache_read: f64,
+    currency: String,
+}
+
+impl Prices {
+    fn from_env() -> Self {
+        let num = |key: &str, default: f64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(default)
+        };
+        Self {
+            input: num("LLM_PRICE_INPUT_PER_MTOK", 3.0),
+            output: num("LLM_PRICE_OUTPUT_PER_MTOK", 15.0),
+            cache_write: num("LLM_PRICE_CACHE_WRITE_PER_MTOK", 3.75),
+            cache_read: num("LLM_PRICE_CACHE_READ_PER_MTOK", 0.30),
+            currency: std::env::var("LLM_PRICE_CURRENCY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "usd".to_string()),
+        }
+    }
+}
+
+fn prices() -> &'static Prices {
+    static P: OnceLock<Prices> = OnceLock::new();
+    P.get_or_init(Prices::from_env)
+}
+
+/// Cost of one request from token counts and per-MTok prices.
+fn compute_cost(p: &Prices, t: &TokenUsage) -> f64 {
+    let part = |n: u32, price: f64| (n as f64) / 1_000_000.0 * price;
+    part(t.input, p.input)
+        + part(t.output, p.output)
+        + part(t.cache_creation_input.unwrap_or(0), p.cache_write)
+        + part(t.cache_read_input.unwrap_or(0), p.cache_read)
+}
+
+fn record_tokens(t: &TokenUsage) {
+    if t.input > 0 {
+        metrics::counter!("llm_tokens_total", "kind" => "input").increment(t.input as u64);
+    }
+    if t.output > 0 {
+        metrics::counter!("llm_tokens_total", "kind" => "output").increment(t.output as u64);
+    }
+    if let Some(c) = t.cache_creation_input
+        && c > 0
+    {
+        metrics::counter!("llm_tokens_total", "kind" => "cache_creation").increment(c as u64);
+    }
+    if let Some(c) = t.cache_read_input
+        && c > 0
+    {
+        metrics::counter!("llm_tokens_total", "kind" => "cache_read").increment(c as u64);
+    }
+}
+
+/// Record one chat request: outcome counter, per-class token counters, and the
+/// per-request cost (histogram → `_sum`/`_count` give total + cost/request).
+pub fn record_chat(mode: &str, outcome: &str, tokens: &TokenUsage) {
+    metrics::counter!(
+        "chat_requests_total",
+        "mode" => mode.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+    record_tokens(tokens);
+    let p = prices();
+    metrics::histogram!(
+        "llm_request_cost",
+        "currency" => p.currency.clone(),
+        "mode" => mode.to_string(),
+    )
+    .record(compute_cost(p, tokens));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{Router, body::Body, http::Request as HttpRequest, routing::get};
     use metrics::with_local_recorder;
     use tower::ServiceExt;
+
+    fn test_prices() -> Prices {
+        Prices {
+            input: 3.0,
+            output: 15.0,
+            cache_write: 3.75,
+            cache_read: 0.30,
+            currency: "usd".to_string(),
+        }
+    }
 
     #[test]
     fn handle_renders_recorded_metric() {
@@ -137,5 +235,43 @@ mod tests {
             out.contains("mcp_tool_call_duration_seconds"),
             "render:\n{out}"
         );
+    }
+
+    #[test]
+    fn compute_cost_sums_token_classes() {
+        let p = test_prices();
+        let one_m = TokenUsage {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_creation_input: None,
+            cache_read_input: None,
+        };
+        assert!((compute_cost(&p, &one_m) - 18.0).abs() < 1e-9);
+
+        let cached = TokenUsage {
+            input: 0,
+            output: 0,
+            cache_creation_input: Some(1_000_000),
+            cache_read_input: Some(1_000_000),
+        };
+        assert!((compute_cost(&p, &cached) - (3.75 + 0.30)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_chat_emits_requests_tokens_and_cost() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let t = TokenUsage {
+            input: 1000,
+            output: 500,
+            cache_creation_input: None,
+            cache_read_input: None,
+        };
+        with_local_recorder(&recorder, || record_chat("sync", "ok", &t));
+        let out = handle.render();
+        assert!(out.contains("chat_requests_total"), "render:\n{out}");
+        assert!(out.contains("llm_tokens_total"), "render:\n{out}");
+        assert!(out.contains("kind=\"input\""), "render:\n{out}");
+        assert!(out.contains("llm_request_cost"), "render:\n{out}");
     }
 }
