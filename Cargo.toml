@@ -97,6 +97,13 @@ thiserror = "1"
 # double-confirm race-guard.
 dashmap = "6"
 
+# Prometheus metrics. The `metrics` facade lets call-sites record via macros
+# without threading a registry; `metrics-exporter-prometheus` renders the text
+# exposition. default-features off drops its built-in HTTP listener — we serve
+# /metrics via axum.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
 [dev-dependencies]
 # Async HTTP mock for unit-testing the Anthropic client without network.
 wiremock = "0.6"

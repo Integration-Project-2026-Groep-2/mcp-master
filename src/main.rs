@@ -5,6 +5,7 @@ mod http_api;
 mod incident;
 mod mcp;
 mod memory;
+mod metrics;
 mod rabbitmq;
 mod retry;
 mod teams;

@@ -65,6 +65,8 @@ pub struct AppState {
     pub publisher: Option<Arc<Publisher>>,
     pub cache: Option<Arc<SqliteMemory>>,
     pub memory: Option<Arc<MemoryService>>,
+    /// Prometheus render handle served by the `/metrics` endpoint.
+    pub metrics_handle: crate::metrics::Handle,
     /// Wired into chat() in commit 2 (mode dispatch) and chat_approve/reject
     /// in commits 3+4. Held as Arc so the cleanup task holds Arc<ApprovalStore>
     /// (not Arc<AppState>) — keeps `Arc::try_unwrap` clean at shutdown.
@@ -280,8 +282,12 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn metrics() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "not implemented")
+async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // 0.0.4 is the Prometheus text-exposition version tag scrapers expect.
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics_handle.render(),
+    )
 }
 
 /// Keys over the whole conversation, not just the last turn, so two chats
@@ -1138,6 +1144,8 @@ pub async fn serve(
         approval_ttl(),
     ));
 
+    let metrics_handle = crate::metrics::install()?;
+
     let state = Arc::new(AppState {
         llm,
         pool,
@@ -1145,6 +1153,7 @@ pub async fn serve(
         publisher: publisher_arc,
         cache,
         memory,
+        metrics_handle,
         approval_flow: approval_flow.clone(),
     });
     let teams_config = teams_config.map(Arc::new);
