@@ -1255,6 +1255,8 @@ pub async fn serve(
         .route("/chat/stream", stream_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        // route_layer (not layer): runs after routing so MatchedPath is set.
+        .route_layer(axum::middleware::from_fn(crate::metrics::track_http))
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(build_cors_layer()?)
