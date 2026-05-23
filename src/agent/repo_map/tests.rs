@@ -70,5 +70,9 @@ fn hints_prompt_lists_explicit_coordinates() {
         assert!(p.contains("owner=Integration-Project-2026-Groep-2"));
         assert!(p.contains("repo=CRM"));
         assert!(p.contains("base=main"));
+        // Scoped internal + base emphasized (review fixes).
+        assert!(p.contains("INTERNAL"));
+        assert!(p.contains("plain business terms"));
+        assert!(p.contains("reference not found"));
     });
 }
