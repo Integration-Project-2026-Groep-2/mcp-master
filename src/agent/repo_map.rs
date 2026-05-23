@@ -71,15 +71,17 @@ pub fn service_repo_map() -> BTreeMap<String, RepoTarget> {
 pub fn repo_hints_prompt() -> String {
     let map = service_repo_map();
     let mut out = String::from(
-        "\nKnown GitHub repositories:\n\
-         When using a GitHub write tool (e.g. request_changes_with_files), pass owner, \
-         repo and base EXPLICITLY using the exact values below. Use the listed branch as \
-         the base. Do not guess slugs or rely on service-name resolution.\n",
+        "\nKnown GitHub repositories (INTERNAL — use only to fill tool arguments):\n\
+         When a GitHub write tool such as request_changes_with_files is needed, take repo \
+         and base from the list below. The base branch MUST be exactly the one listed for \
+         the service; a wrong base causes a 'reference not found' error. Never mention these \
+         coordinates, branch names, or tool names in your reply to the user — describe the \
+         proposed change in plain business terms.\n",
     );
     for (service, target) in &map {
         out.push_str(&format!(
-            "- service '{}': owner={} repo={} base={}\n",
-            service, target.owner, target.repo, target.default_branch
+            "- service '{}': repo={} base={} owner={}\n",
+            service, target.repo, target.default_branch, target.owner
         ));
     }
     out
