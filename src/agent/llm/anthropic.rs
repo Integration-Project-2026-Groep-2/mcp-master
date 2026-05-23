@@ -33,6 +33,15 @@ const DEFAULT_THINKING_BUDGET: u32 = 2048;
 /// retried — they're deterministic and re-trying just wastes Anthropic quota.
 const MAX_RETRIES: u32 = 3;
 
+/// Per-request deadline for the non-streaming `chat` call. Lenient — a single
+/// Anthropic call (even with extended thinking + 8192 max_tokens) stays well
+/// under this; it exists only to turn a hung/half-open connection into an error
+/// the retry loop can act on (it retries on `is_timeout`/`is_connect`, which
+/// never arise without a configured timeout). Applied per-request, NOT on the
+/// shared client, so it can't truncate `stream_chat` — that path's duration is
+/// bounded separately by the orchestrator's wall-clock cap.
+const CHAT_REQUEST_TIMEOUT_SECS: u64 = 180;
+
 /// HTTP client for the Anthropic Messages API.
 pub struct AnthropicClient {
     http: reqwest::Client,
@@ -119,6 +128,7 @@ impl LlmClient for AnthropicClient {
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .json(&req)
+                .timeout(std::time::Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS))
                 .send()
                 .await;
 
