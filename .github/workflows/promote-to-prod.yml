@@ -1,0 +1,132 @@
+name: Promote to Prod
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Short SHA to promote (e.g. a3f9c2b) — leave empty for latest-dev'
+        required: false
+      version:
+        description: 'Version tag (e.g. v1.4.0) — leave empty to auto-generate release-<sha>'
+        required: false
+
+env:
+  IMAGE: ghcr.io/integration-project-2026-groep-2/mcp-master
+
+jobs:
+  promote:
+    environment: production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve trigger source
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+            IMAGE_TAG="${RELEASE_TAG#v}"
+            SHA_FULL="${GITHUB_SHA}"
+            SHA_SHORT="${SHA_FULL::7}"
+            echo "RELEASE_TAG=${RELEASE_TAG}"            >> $GITHUB_ENV
+            echo "IMAGE_TAG=${IMAGE_TAG}"                >> $GITHUB_ENV
+            echo "SOURCE_TAG=sha-${SHA_SHORT}"           >> $GITHUB_ENV
+            echo "SHA=${SHA_SHORT}"                      >> $GITHUB_ENV
+            echo "release_tag=${RELEASE_TAG}"            >> $GITHUB_OUTPUT
+            echo "image_tag=${IMAGE_TAG}"                >> $GITHUB_OUTPUT
+            echo "source_tag=sha-${SHA_SHORT}"           >> $GITHUB_OUTPUT
+            echo "sha=${SHA_SHORT}"                      >> $GITHUB_OUTPUT
+          else
+            if [ -n "${{ inputs.sha }}" ]; then
+              SHA_INPUT="${{ inputs.sha }}"
+              SHA_SHORT="${SHA_INPUT::7}"
+              echo "SOURCE_TAG=sha-${SHA_SHORT}"     >> $GITHUB_ENV
+              echo "SHA=${SHA_SHORT}"                >> $GITHUB_ENV
+              echo "source_tag=sha-${SHA_SHORT}"     >> $GITHUB_OUTPUT
+              echo "sha=${SHA_SHORT}"                >> $GITHUB_OUTPUT
+            else
+              if ! docker pull ${{ env.IMAGE }}:latest-dev; then
+                echo "::error::ghcr.io/integration-project-2026-groep-2/infra:latest-dev not found. Run the dev build on main first."
+                exit 1
+              fi
+              SHA_FULL=$(docker inspect ${{ env.IMAGE }}:latest-dev \
+                --format '{{range .RepoTags}}{{println .}}{{end}}' | grep -oP 'sha-\K[a-f0-9]+' | head -n1)
+              if [ -z "${SHA_FULL}" ]; then
+                echo "::error::Unable to resolve sha tag from latest-dev"
+                exit 1
+              fi
+              SHA_SHORT="${SHA_FULL::7}"
+              echo "SOURCE_TAG=latest-dev"                >> $GITHUB_ENV
+              echo "SHA=${SHA_SHORT}"                      >> $GITHUB_ENV
+              echo "source_tag=latest-dev"                >> $GITHUB_OUTPUT
+              echo "sha=${SHA_SHORT}"                      >> $GITHUB_OUTPUT
+            fi
+            if [ -n "${{ inputs.version }}" ]; then
+              VERSION="${{ inputs.version }}"
+              IMAGE_TAG="${VERSION#v}"
+              echo "RELEASE_TAG=${VERSION}"      >> $GITHUB_ENV
+              echo "IMAGE_TAG=${IMAGE_TAG}"      >> $GITHUB_ENV
+              echo "release_tag=${VERSION}"      >> $GITHUB_OUTPUT
+              echo "image_tag=${IMAGE_TAG}"      >> $GITHUB_OUTPUT
+            else
+              echo "RELEASE_TAG=release-${SHA_SHORT}"           >> $GITHUB_ENV
+              echo "IMAGE_TAG=release-${SHA_SHORT}"             >> $GITHUB_ENV
+              echo "release_tag=release-${SHA_SHORT}"           >> $GITHUB_OUTPUT
+              echo "image_tag=release-${SHA_SHORT}"             >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Check source image exists
+        run: |
+          docker manifest inspect ${{ env.IMAGE }}:${SOURCE_TAG} || \
+            (echo "::error::Image ${SOURCE_TAG} not found" && exit 1)
+
+      - name: Check version not already promoted
+        run: |
+          if docker manifest inspect ${{ env.IMAGE }}:${IMAGE_TAG} > /dev/null 2>&1; then
+            echo "::error::${IMAGE_TAG} already exists — choose a different version"
+            exit 1
+          fi
+
+      - name: Retag and push
+        id: retag
+        run: |
+          docker pull ${{ env.IMAGE }}:${SOURCE_TAG}
+          # Resolve immutable digest for the pulled image
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.IMAGE }}:${SOURCE_TAG} | cut -d'@' -f2)
+          echo "IMAGE_DIGEST=${DIGEST}" >> $GITHUB_ENV
+          echo "image_digest=${DIGEST}" >> $GITHUB_OUTPUT
+          # Tag by digest so the release references an immutable image
+          docker tag ${IMAGE}@${DIGEST} ${{ env.IMAGE }}:${IMAGE_TAG}
+          docker tag ${IMAGE}@${DIGEST} ${{ env.IMAGE }}:latest
+          docker push ${{ env.IMAGE }}:${IMAGE_TAG}
+          docker push ${{ env.IMAGE }}:latest
+
+      - name: Trigger Manifest Repo Update (Prod)
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.MANIFESTS_REPO_PAT }}
+          repository: integration-project-2026-groep-2/k8s-manifests
+          event-type: update-prod-image
+          client-payload: |
+            {
+              "image": "${{ env.IMAGE }}",
+              "tag": "${{ steps.resolve.outputs.release_tag }}",
+              "image_tag": "${{ steps.resolve.outputs.image_tag }}",
+              "digest": "${{ steps.retag.outputs.image_digest }}",
+              "service": "${{ github.event.repository.name }}",
+              "commit": "${{ github.sha }}",
+              "actor": "${{ github.actor }}"
+            }
