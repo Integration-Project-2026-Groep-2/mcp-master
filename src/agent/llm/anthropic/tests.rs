@@ -26,6 +26,16 @@ fn to_wire_tools_drops_requires_approval() {
 }
 
 #[test]
+fn to_wire_system_sets_ephemeral_cache_control() {
+    let wire = to_wire_system("you are jarvis");
+    let value = serde_json::to_value(&wire).unwrap();
+    let expected = json!([
+        { "type": "text", "text": "you are jarvis", "cache_control": { "type": "ephemeral" } }
+    ]);
+    assert_eq!(value, expected);
+}
+
+#[test]
 fn translation_preserves_text_and_tool_use_shapes() {
     let messages = vec![
         Message {
@@ -561,5 +571,76 @@ async fn chat_propagates_non_2xx_with_body() {
     assert!(
         msg.contains("invalid api key"),
         "error should include body: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn chat_request_marks_system_with_ephemeral_cache_control() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "stop_reason": "end_turn"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = AnthropicClient::new("k".into()).with_base_url(server.uri());
+    client.chat("system prompt", &[], &[], 4096).await.unwrap();
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests are recorded");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let system = body["system"]
+        .as_array()
+        .expect("system must serialize as a content-block array");
+    let last = system.last().expect("system has at least one block");
+    assert_eq!(last["type"], "text");
+    assert_eq!(last["text"], "system prompt");
+    assert_eq!(
+        last["cache_control"]["type"], "ephemeral",
+        "system prefix must carry an ephemeral cache breakpoint: {body}"
+    );
+}
+
+#[tokio::test]
+async fn stream_request_marks_system_with_ephemeral_cache_control() {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(&server)
+        .await;
+
+    let client = AnthropicClient::new("k".into()).with_base_url(server.uri());
+    let _stream = client.stream_chat("sys", &[], &[], 4096).await.unwrap();
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("requests are recorded");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let system = body["system"]
+        .as_array()
+        .expect("system must serialize as a content-block array");
+    assert_eq!(
+        system.last().expect("system has at least one block")["cache_control"]["type"],
+        "ephemeral",
+        "stream path must also mark the system prefix: {body}"
     );
 }

@@ -87,7 +87,7 @@ impl LlmClient for AnthropicClient {
         let req = AnthropicRequest {
             model: self.model.clone(),
             max_tokens,
-            system: system.to_string(),
+            system: to_wire_system(system),
             thinking: self.thinking_budget.map(|b| ThinkingConfig {
                 kind: "enabled",
                 budget_tokens: b,
@@ -171,7 +171,7 @@ impl LlmClient for AnthropicClient {
         let req = AnthropicRequest {
             model: self.model.clone(),
             max_tokens,
-            system: system.to_string(),
+            system: to_wire_system(system),
             thinking: self.thinking_budget.map(|b| ThinkingConfig {
                 kind: "enabled",
                 budget_tokens: b,
@@ -587,7 +587,7 @@ where
 struct AnthropicRequest {
     model: String,
     max_tokens: u32,
-    system: String,
+    system: Vec<SystemBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -609,6 +609,25 @@ struct AnthropicTool {
     name: String,
     description: String,
     input_schema: Value,
+}
+
+/// A `system` content block. Anthropic's cache prefix is ordered
+/// tools -> system -> messages, so a `cache_control` breakpoint on the system
+/// block caches the whole static tools+system prefix the tool-loop re-sends
+/// every iteration — not just the system text.
+#[derive(Debug, Serialize)]
+struct SystemBlock {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -718,6 +737,14 @@ fn to_wire_tools(tools: &[ToolSpec]) -> Vec<AnthropicTool> {
             input_schema: t.input_schema.clone(),
         })
         .collect()
+}
+
+fn to_wire_system(system: &str) -> Vec<SystemBlock> {
+    vec![SystemBlock {
+        kind: "text",
+        text: system.to_string(),
+        cache_control: Some(CacheControl { kind: "ephemeral" }),
+    }]
 }
 
 fn from_wire_response(resp: AnthropicResponse) -> ChatResponse {
