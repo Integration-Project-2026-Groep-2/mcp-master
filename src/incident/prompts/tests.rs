@@ -91,3 +91,14 @@ fn seed_prompt_fetches_deploys_before_deep_log_dig() {
     let p = seed_prompt_step_a(&sample_event());
     assert!(p.contains("before the deep log dig"));
 }
+
+#[test]
+fn system_prompt_offers_fetch_recent_commits() {
+    assert!(STEP_A_SYSTEM_PROMPT.contains("fetch_recent_commits"));
+}
+
+#[test]
+fn seed_prompt_correlates_deploy_to_commit() {
+    let p = seed_prompt_step_a(&sample_event());
+    assert!(p.contains("fetch_recent_commits"));
+}

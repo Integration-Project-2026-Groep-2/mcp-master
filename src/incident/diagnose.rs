@@ -12,9 +12,14 @@ use crate::agent::orchestrator::{self, McpExecutor, RunOutcome, ToolCallTrace};
 use crate::http_api::AppState;
 use crate::memory::{MemoryInteraction, MemoryService, MemorySource};
 
-const STEP_A_TOOLS: &[&str] = &["fetch_logs", "error_analysis", "fetch_recent_deploys"];
-// 3 read-only tools incl. an iterative error_analysis dig; a tighter cap can
-// bail before fetch_recent_deploys and publish no diagnosis at all.
+const STEP_A_TOOLS: &[&str] = &[
+    "fetch_logs",
+    "error_analysis",
+    "fetch_recent_deploys",
+    "fetch_recent_commits",
+];
+// 4 read-only tools incl. an iterative error_analysis dig; a tighter cap can
+// bail before the deploy/commit calls and publish no diagnosis at all.
 const STEP_A_MAX_ITERATIONS: usize = 10;
 const STEP_A_MAX_TOKENS: u32 = 8192;
 const STEP_B_MAX_TOKENS: u32 = 8192;
