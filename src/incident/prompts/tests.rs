@@ -74,3 +74,20 @@ fn seed_prompt_directs_escalation_to_error_analysis() {
     let p = seed_prompt_step_a(&sample_event());
     assert!(p.contains("error_analysis"));
 }
+
+#[test]
+fn system_prompt_error_analysis_has_no_time_filter() {
+    assert!(STEP_A_SYSTEM_PROMPT.contains("NO time window"));
+}
+
+#[test]
+fn seed_prompt_bounds_error_analysis_queries() {
+    let p = seed_prompt_step_a(&sample_event());
+    assert!(p.contains("at most two"));
+}
+
+#[test]
+fn seed_prompt_fetches_deploys_before_deep_log_dig() {
+    let p = seed_prompt_step_a(&sample_event());
+    assert!(p.contains("before the deep log dig"));
+}
