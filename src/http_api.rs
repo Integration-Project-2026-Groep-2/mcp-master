@@ -27,8 +27,20 @@ use crate::{
     teams::{TeamsConfig, publish_to_teams},
 };
 
-const MAX_ITERATIONS: usize = 10;
+const READ_ONLY_MAX_ITERATIONS: usize = 10;
+const ACTIONABLE_MAX_ITERATIONS: usize = 20;
 const MAX_TOKENS: u32 = 8192;
+
+/// Tool-loop budget per mode: read-only Q&A converges in a few rounds, while the
+/// Actionable investigate-and-fix flow is inherently multi-step and needs
+/// headroom rather than bailing mid-investigation.
+fn max_iterations_for(mode: &crate::agent::modes::AgentMode) -> usize {
+    use crate::agent::modes::AgentMode;
+    match mode {
+        AgentMode::ReadOnly(_) => READ_ONLY_MAX_ITERATIONS,
+        AgentMode::Actionable(_) => ACTIONABLE_MAX_ITERATIONS,
+    }
+}
 
 // DoS guards. Total request body capped at the axum layer; in addition the
 // per-turn caps in `ChatRequest::into_messages` reject pathological shapes
@@ -90,6 +102,40 @@ fn approval_ttl() -> std::time::Duration {
             }
         },
         Err(_) => std::time::Duration::from_secs(DEFAULT_SECS),
+    }
+}
+
+/// Read `CHAT_STREAM_KEEPALIVE_SECONDS`; default 10s, clamped to 3..=60. The
+/// keep-alive comment must fire faster than any proxy idle-timeout so the SSE
+/// connection is not torn down during silent tool calls.
+fn keepalive_secs() -> u64 {
+    const DEFAULT_SECS: u64 = 10;
+    const MIN_SECS: u64 = 3;
+    const MAX_SECS: u64 = 60;
+    match std::env::var("CHAT_STREAM_KEEPALIVE_SECONDS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => secs.clamp(MIN_SECS, MAX_SECS),
+            Err(_) => {
+                tracing::warn!(
+                    raw = %raw,
+                    "CHAT_STREAM_KEEPALIVE_SECONDS unparseable — falling back to {DEFAULT_SECS}s"
+                );
+                DEFAULT_SECS
+            }
+        },
+        Err(_) => DEFAULT_SECS,
+    }
+}
+
+/// Append the canonical service->repo coordinates to the system prompt when the
+/// mode can use write tools, so the agent passes explicit owner/repo/base to
+/// GitHub write tools instead of guessing slugs.
+fn system_prompt_with_hints(base: String, mode: &crate::agent::modes::AgentMode) -> String {
+    use crate::agent::modes::Mode;
+    if mode.allows_write_tools() {
+        format!("{base}{}", crate::agent::repo_map::repo_hints_prompt())
+    } else {
+        base
     }
 }
 
@@ -396,6 +442,7 @@ async fn chat(
             }),
         None => SETUP_PROMPT.to_string(),
     };
+    let system_prompt = system_prompt_with_hints(system_prompt, &mode);
 
     let started = std::time::Instant::now();
     let outcome = orchestrator::run_with_messages_in_mode(
@@ -404,7 +451,7 @@ async fn chat(
         &state.llm,
         &state.pool,
         &state.tool_specs,
-        MAX_ITERATIONS,
+        max_iterations_for(&mode),
         MAX_TOKENS,
         &mode,
         &ctx,
@@ -706,6 +753,7 @@ async fn chat_stream(
             }),
         None => SETUP_PROMPT.to_string(),
     };
+    let system_prompt = system_prompt_with_hints(system_prompt, &mode);
 
     let (sse_tx, mut sse_rx) = mpsc::channel::<ProgressEvent>(64);
 
@@ -729,7 +777,7 @@ async fn chat_stream(
                 &state_for_orch.llm,
                 &state_for_orch.pool,
                 &specs_for_orch,
-                MAX_ITERATIONS,
+                max_iterations_for(&mode_for_orch),
                 MAX_TOKENS,
                 &mode_for_orch,
                 &ctx_for_orch,
@@ -888,7 +936,8 @@ async fn chat_stream(
         }
     };
 
-    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(event_stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(keepalive_secs()))))
 }
 
 fn chat_suggestions_enabled() -> bool {
@@ -1044,7 +1093,7 @@ async fn handle_scheduled(
         &state.llm,
         &state.pool,
         &state.tool_specs,
-        MAX_ITERATIONS,
+        READ_ONLY_MAX_ITERATIONS,
         MAX_TOKENS,
     )
     .await

@@ -32,6 +32,7 @@ Tool Usage Policy:
   - System state must be queried or modified.
 - Do not use tools for trivial or already-known transformations.
 - Prefer minimal tool usage (lowest number of calls sufficient to complete the task).
+- If a tool keeps returning the same error (for example 'unknown service'), do not retry it with minor variations of the same arguments. Switch to the most direct alternative (prefer tools that take explicit identifiers such as owner/repo over name-resolved ones), or proceed with the evidence you already have and state the gap.
 
 Output Contract (STRICT):
 - Output MUST be a single Markdown code block using triple backticks.

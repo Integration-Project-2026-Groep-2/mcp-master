@@ -219,6 +219,81 @@ fn approval_ttl_falls_back_on_garbage_value() {
 }
 
 #[test]
+fn read_only_mode_gets_ten_iterations() {
+    let mode = crate::agent::modes::AgentMode::ReadOnly(crate::agent::modes::ReadOnlyMode);
+    assert_eq!(max_iterations_for(&mode), 10);
+}
+
+#[test]
+fn actionable_mode_gets_twenty_iterations() {
+    let store = std::sync::Arc::new(crate::gateway::approval::state::ApprovalStore::new(
+        std::time::Duration::from_secs(900),
+    ));
+    let audit = std::sync::Arc::new(crate::gateway::audit::AuditPublisher::new(None));
+    let flow = std::sync::Arc::new(crate::gateway::approval::flow::ApprovalFlow::new(
+        store,
+        audit,
+        std::time::Duration::from_secs(900),
+    ));
+    let mode =
+        crate::agent::modes::AgentMode::Actionable(crate::agent::modes::ActionableMode::new(flow));
+    assert_eq!(max_iterations_for(&mode), 20);
+}
+
+fn with_keepalive_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+    let prev = std::env::var("CHAT_STREAM_KEEPALIVE_SECONDS").ok();
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var("CHAT_STREAM_KEEPALIVE_SECONDS", v),
+            None => std::env::remove_var("CHAT_STREAM_KEEPALIVE_SECONDS"),
+        }
+    }
+    let r = f();
+    unsafe {
+        match prev {
+            Some(p) => std::env::set_var("CHAT_STREAM_KEEPALIVE_SECONDS", p),
+            None => std::env::remove_var("CHAT_STREAM_KEEPALIVE_SECONDS"),
+        }
+    }
+    r
+}
+
+#[test]
+#[serial_test::serial]
+fn keepalive_secs_defaults_to_ten() {
+    with_keepalive_env(None, || {
+        assert_eq!(keepalive_secs(), 10);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn keepalive_secs_parses_env_override() {
+    with_keepalive_env(Some("20"), || {
+        assert_eq!(keepalive_secs(), 20);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn keepalive_secs_clamps_to_sane_range() {
+    with_keepalive_env(Some("1"), || {
+        assert_eq!(keepalive_secs(), 3);
+    });
+    with_keepalive_env(Some("120"), || {
+        assert_eq!(keepalive_secs(), 60);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn keepalive_secs_falls_back_on_garbage_value() {
+    with_keepalive_env(Some("not-a-number"), || {
+        assert_eq!(keepalive_secs(), 10);
+    });
+}
+
+#[test]
 #[serial_test::serial]
 fn chat_suggestions_enabled_defaults_true_when_unset() {
     unsafe {
@@ -257,6 +332,33 @@ fn chat_suggestions_enabled_trims_and_case_insensitive() {
     unsafe {
         std::env::remove_var("CHAT_SUGGESTIONS_ENABLED");
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn system_prompt_hints_only_in_write_mode() {
+    unsafe {
+        std::env::remove_var("SERVICE_REPO_MAP");
+    }
+    let base = "BASE".to_string();
+
+    let read_only = crate::agent::modes::AgentMode::ReadOnly(crate::agent::modes::ReadOnlyMode);
+    assert_eq!(system_prompt_with_hints(base.clone(), &read_only), "BASE");
+
+    let store = std::sync::Arc::new(crate::gateway::approval::state::ApprovalStore::new(
+        std::time::Duration::from_secs(900),
+    ));
+    let audit = std::sync::Arc::new(crate::gateway::audit::AuditPublisher::new(None));
+    let flow = std::sync::Arc::new(crate::gateway::approval::flow::ApprovalFlow::new(
+        store,
+        audit,
+        std::time::Duration::from_secs(900),
+    ));
+    let actionable =
+        crate::agent::modes::AgentMode::Actionable(crate::agent::modes::ActionableMode::new(flow));
+    let out = system_prompt_with_hints(base, &actionable);
+    assert!(out.starts_with("BASE"));
+    assert!(out.contains("repo=CRM"));
 }
 
 #[test]

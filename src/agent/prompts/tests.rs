@@ -1,6 +1,13 @@
 use super::*;
 
 #[test]
+fn setup_prompt_has_tool_failure_resilience_guidance() {
+    let p = SETUP_PROMPT;
+    assert!(p.contains("do not retry"));
+    assert!(p.contains("most direct alternative"));
+}
+
+#[test]
 fn suggestions_prompt_requires_dutch_and_strict_format() {
     let p = SUGGESTIONS_SYSTEM_PROMPT;
     assert!(p.contains("Nederlands"));
