@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 
+/// Lenient deadline on the Teams Graph publish — only catches a hung
+/// connection; a normal post completes well under this.
+const TEAMS_REQUEST_TIMEOUT_SECS: u64 = 60;
+
 pub struct TeamsConfig {
     pub team_id: String,
     pub channel_id: String,
@@ -34,6 +38,7 @@ pub async fn publish_to_teams(config: &TeamsConfig, message: &str) -> Result<()>
         .post(&url)
         .bearer_auth(&config.access_token)
         .json(&body)
+        .timeout(std::time::Duration::from_secs(TEAMS_REQUEST_TIMEOUT_SECS))
         .send()
         .await
         .context("sending message to Teams")?;

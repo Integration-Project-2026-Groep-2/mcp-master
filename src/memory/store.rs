@@ -43,6 +43,10 @@ pub struct MemoryPayload {
     pub created_at_unix_ms: i64,
 }
 
+/// Lenient deadline on Qdrant calls — mirrors the embedding client; only trips
+/// on a hung connection, not on a slow-but-legitimate query.
+const QDRANT_REQUEST_TIMEOUT_SECS: u64 = 60;
+
 #[derive(Clone)]
 pub struct QdrantVectorStore {
     http: reqwest::Client,
@@ -54,6 +58,7 @@ impl QdrantVectorStore {
     pub fn new(config: &QdrantConfig) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(QDRANT_REQUEST_TIMEOUT_SECS))
                 .build()
                 .context("building qdrant HTTP client")?,
             base_url: config.base_url.clone(),

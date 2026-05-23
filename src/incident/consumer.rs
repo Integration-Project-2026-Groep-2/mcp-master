@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use lapin::{
-    Connection, ConnectionProperties, ExchangeKind,
+    ExchangeKind,
     options::{
         BasicAckOptions, BasicConsumeOptions, BasicNackOptions, ExchangeDeclareOptions,
         QueueBindOptions, QueueDeclareOptions,
@@ -28,6 +28,12 @@ const QUEUE_NAME: &str = "mcp-master.incidents";
 const ROUTING_KEY: &str = "event.heartbeat_failed";
 const CONSUMER_TAG: &str = "mcp-master-incident";
 const SKIP_EVENT_NAME: &str = "incident_skipped";
+
+/// Lenient wall-clock cap on the full dual-LLM diagnose pipeline (Step A
+/// tool-loop + Step B). Generous — only fires if the pipeline is truly wedged;
+/// the per-call MCP/LLM timeouts bound each internal step. On elapse the
+/// delivery is ack-dropped (no requeue) to avoid a poison-redelivery loop.
+const DIAGNOSE_TIMEOUT: Duration = Duration::from_secs(600);
 const DIAGNOSED_EVENT_NAME: &str = "incident_diagnosed";
 const CIRCUIT_OPEN_EVENT_NAME: &str = "incident_circuit_open";
 
@@ -107,9 +113,7 @@ async fn consume_session(
     pipeline: Option<&Arc<dyn DiagnosePipeline>>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let conn = Connection::connect(&config.url, ConnectionProperties::default())
-        .await
-        .context("AMQP connection")?;
+    let conn = crate::rabbitmq::connect_with_timeout(&config.url).await?;
     let channel = conn.create_channel().await.context("AMQP channel")?;
 
     channel
@@ -353,8 +357,8 @@ async fn handle_delivery_with_content(
     };
 
     let pipeline_start = Instant::now();
-    match pl.diagnose(&evt).await {
-        Ok(diagnosis) => {
+    match tokio::time::timeout(DIAGNOSE_TIMEOUT, pl.diagnose(&evt)).await {
+        Ok(Ok(diagnosis)) => {
             let pipeline_ms = pipeline_start.elapsed().as_millis() as u64;
             let total_ms = received_at.elapsed().as_millis() as u64;
             tracing::info!(
@@ -369,7 +373,7 @@ async fn handle_delivery_with_content(
             crate::metrics::record_incident_pipeline_ms(pipeline_ms);
             publish_diagnosis(publisher, &evt, &correlation_id, &diagnosis).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let pipeline_ms = pipeline_start.elapsed().as_millis() as u64;
             tracing::error!(
                 correlation_id = %correlation_id,
@@ -378,6 +382,16 @@ async fn handle_delivery_with_content(
                 "diagnose pipeline failed: {e:#}"
             );
             crate::metrics::record_incident("failed", "pipeline_error");
+        }
+        Err(_elapsed) => {
+            let pipeline_ms = pipeline_start.elapsed().as_millis() as u64;
+            tracing::error!(
+                correlation_id = %correlation_id,
+                service = %evt.payload.component,
+                pipeline_ms,
+                "diagnose pipeline timed out after {DIAGNOSE_TIMEOUT:?}"
+            );
+            crate::metrics::record_incident("failed", "timeout");
         }
     }
 

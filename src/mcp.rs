@@ -26,6 +26,12 @@ use crate::agent::llm::ToolSpec;
 use crate::agent::orchestrator::{McpExecutor, ToolCallTrace};
 use crate::rabbitmq::publisher::Publisher;
 
+/// Lenient deadlines on MCP transport calls — large enough that no legitimate
+/// read-only tool call or handshake trips them; they convert a hung (half-open)
+/// session into an error so the reconnect path can recover.
+const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Open a Streamable-HTTP MCP session against the given URL.
 ///
 /// URL must include the full path, e.g. `http://localhost:7001/mcp`.
@@ -38,10 +44,12 @@ pub async fn open_session(url: &str) -> anyhow::Result<RunningService<RoleClient
         ClientCapabilities::default(),
         Implementation::new("mcp-master", env!("CARGO_PKG_VERSION")),
     );
-    let svc = client_info
-        .serve(transport)
-        .await
-        .with_context(|| format!("MCP initialize handshake failed for {url}"))?;
+    let svc = match tokio::time::timeout(CONNECT_TIMEOUT, client_info.serve(transport)).await {
+        Ok(res) => res.with_context(|| format!("MCP initialize handshake failed for {url}"))?,
+        Err(_elapsed) => {
+            anyhow::bail!("MCP connect timed out after {CONNECT_TIMEOUT:?} for {url}")
+        }
+    };
     tracing::info!(%url, server = ?svc.peer_info(), "MCP session initialized");
     Ok(svc)
 }
@@ -490,15 +498,21 @@ async fn call_with_reconnect(
 
     let req = || CallToolRequestParams::new(name.to_string()).with_arguments(args.clone());
 
-    match guard.call_tool(req()).await {
-        Ok(r) => return Ok(r),
-        Err(e) if is_transport_error(&e) => {
+    match tokio::time::timeout(TOOL_CALL_TIMEOUT, guard.call_tool(req())).await {
+        Ok(Ok(r)) => return Ok(r),
+        Ok(Err(e)) if is_transport_error(&e) => {
             tracing::warn!(
                 label = %session.label,
                 "MCP transport error: {e:#} — reopening session"
             );
         }
-        Err(e) => return Err(anyhow::Error::from(e)),
+        Ok(Err(e)) => return Err(anyhow::Error::from(e)),
+        Err(_elapsed) => {
+            tracing::warn!(
+                label = %session.label,
+                "MCP tools/call timed out after {TOOL_CALL_TIMEOUT:?} — reopening session"
+            );
+        }
     }
 
     // Reopen + retry once. If reopen itself fails, propagate — there's no
@@ -509,12 +523,18 @@ async fn call_with_reconnect(
         .with_context(|| format!("reopening MCP session for '{}'", session.label))?;
     *guard = new_svc;
 
-    guard.call_tool(req()).await.map_err(|e| {
-        anyhow::Error::from(e).context(format!(
-            "MCP tools/call retry after reconnect failed for '{name}' on '{}'",
+    match tokio::time::timeout(TOOL_CALL_TIMEOUT, guard.call_tool(req())).await {
+        Ok(res) => res.map_err(|e| {
+            anyhow::Error::from(e).context(format!(
+                "MCP tools/call retry after reconnect failed for '{name}' on '{}'",
+                session.label
+            ))
+        }),
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "MCP tools/call timed out after {TOOL_CALL_TIMEOUT:?} (after reconnect) for '{name}' on '{}'",
             session.label
-        ))
-    })
+        )),
+    }
 }
 
 #[cfg(test)]
