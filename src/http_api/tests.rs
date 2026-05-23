@@ -335,6 +335,33 @@ fn chat_suggestions_enabled_trims_and_case_insensitive() {
 }
 
 #[test]
+#[serial_test::serial]
+fn system_prompt_hints_only_in_write_mode() {
+    unsafe {
+        std::env::remove_var("SERVICE_REPO_MAP");
+    }
+    let base = "BASE".to_string();
+
+    let read_only = crate::agent::modes::AgentMode::ReadOnly(crate::agent::modes::ReadOnlyMode);
+    assert_eq!(system_prompt_with_hints(base.clone(), &read_only), "BASE");
+
+    let store = std::sync::Arc::new(crate::gateway::approval::state::ApprovalStore::new(
+        std::time::Duration::from_secs(900),
+    ));
+    let audit = std::sync::Arc::new(crate::gateway::audit::AuditPublisher::new(None));
+    let flow = std::sync::Arc::new(crate::gateway::approval::flow::ApprovalFlow::new(
+        store,
+        audit,
+        std::time::Duration::from_secs(900),
+    ));
+    let actionable =
+        crate::agent::modes::AgentMode::Actionable(crate::agent::modes::ActionableMode::new(flow));
+    let out = system_prompt_with_hints(base, &actionable);
+    assert!(out.starts_with("BASE"));
+    assert!(out.contains("repo=CRM"));
+}
+
+#[test]
 fn cors_lax_no_allowlist_falls_back_to_permissive() {
     assert!(parse_cors_allow_list(false, None).is_ok());
 }

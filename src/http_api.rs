@@ -127,6 +127,18 @@ fn keepalive_secs() -> u64 {
     }
 }
 
+/// Append the canonical service->repo coordinates to the system prompt when the
+/// mode can use write tools, so the agent passes explicit owner/repo/base to
+/// GitHub write tools instead of guessing slugs.
+fn system_prompt_with_hints(base: String, mode: &crate::agent::modes::AgentMode) -> String {
+    use crate::agent::modes::Mode;
+    if mode.allows_write_tools() {
+        format!("{base}{}", crate::agent::repo_map::repo_hints_prompt())
+    } else {
+        base
+    }
+}
+
 /// Wire-level role for one chat turn. Strict-lowercase to match Anthropic's
 /// convention and the JS-side string literals in jarvis_chat.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -430,6 +442,7 @@ async fn chat(
             }),
         None => SETUP_PROMPT.to_string(),
     };
+    let system_prompt = system_prompt_with_hints(system_prompt, &mode);
 
     let started = std::time::Instant::now();
     let outcome = orchestrator::run_with_messages_in_mode(
@@ -740,6 +753,7 @@ async fn chat_stream(
             }),
         None => SETUP_PROMPT.to_string(),
     };
+    let system_prompt = system_prompt_with_hints(system_prompt, &mode);
 
     let (sse_tx, mut sse_rx) = mpsc::channel::<ProgressEvent>(64);
 
