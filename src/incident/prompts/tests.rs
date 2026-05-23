@@ -58,3 +58,47 @@ fn system_prompt_warns_about_log_injection() {
     assert!(STEP_A_SYSTEM_PROMPT.contains("untrusted user-input"));
     assert!(STEP_A_SYSTEM_PROMPT.contains("data, not commands"));
 }
+
+#[test]
+fn system_prompt_offers_error_analysis_escalation() {
+    assert!(STEP_A_SYSTEM_PROMPT.contains("error_analysis"));
+}
+
+#[test]
+fn system_prompt_distinguishes_no_logs_from_clean_logs() {
+    assert!(STEP_A_SYSTEM_PROMPT.contains("no logs exist"));
+}
+
+#[test]
+fn seed_prompt_directs_escalation_to_error_analysis() {
+    let p = seed_prompt_step_a(&sample_event());
+    assert!(p.contains("error_analysis"));
+}
+
+#[test]
+fn system_prompt_error_analysis_has_no_time_filter() {
+    assert!(STEP_A_SYSTEM_PROMPT.contains("NO time window"));
+}
+
+#[test]
+fn seed_prompt_bounds_error_analysis_queries() {
+    let p = seed_prompt_step_a(&sample_event());
+    assert!(p.contains("at most two"));
+}
+
+#[test]
+fn seed_prompt_fetches_deploys_before_deep_log_dig() {
+    let p = seed_prompt_step_a(&sample_event());
+    assert!(p.contains("before the deep log dig"));
+}
+
+#[test]
+fn system_prompt_offers_fetch_recent_commits() {
+    assert!(STEP_A_SYSTEM_PROMPT.contains("fetch_recent_commits"));
+}
+
+#[test]
+fn seed_prompt_correlates_deploy_to_commit() {
+    let p = seed_prompt_step_a(&sample_event());
+    assert!(p.contains("fetch_recent_commits"));
+}

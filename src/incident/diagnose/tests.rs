@@ -134,12 +134,22 @@ fn step_a_tool_specs_keeps_only_allowed_tools() {
     let all = vec![
         spec("fetch_logs", false),
         spec("count_contacts", false),
+        spec("error_analysis", false),
         spec("fetch_recent_deploys", false),
+        spec("fetch_recent_commits", false),
         spec("create_company", true),
     ];
     let filtered = step_a_tool_specs(&all);
     let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["fetch_logs", "fetch_recent_deploys"]);
+    assert_eq!(
+        names,
+        vec![
+            "fetch_logs",
+            "error_analysis",
+            "fetch_recent_deploys",
+            "fetch_recent_commits"
+        ]
+    );
 }
 
 #[test]
@@ -304,6 +314,26 @@ fn step_b_system_prompt_warns_on_pii() {
 fn step_b_system_prompt_requests_dutch_output() {
     assert!(STEP_B_SYSTEM_PROMPT.contains("Dutch (Nederlands)"));
     assert!(STEP_B_SYSTEM_PROMPT.contains("Keep the JSON keys themselves in"));
+}
+
+#[test]
+fn step_b_system_prompt_demands_brevity() {
+    assert!(STEP_B_SYSTEM_PROMPT.contains("terse"));
+}
+
+#[test]
+fn step_b_system_prompt_rejects_correlation_as_cause() {
+    assert!(STEP_B_SYSTEM_PROMPT.contains("correlation, not a cause"));
+}
+
+#[test]
+fn step_b_system_prompt_forbids_restating_trigger() {
+    assert!(STEP_B_SYSTEM_PROMPT.contains("trigger, not the root cause"));
+}
+
+#[test]
+fn step_b_system_prompt_caps_suggested_action_steps() {
+    assert!(STEP_B_SYSTEM_PROMPT.contains("2-3 concrete steps"));
 }
 
 #[test]
