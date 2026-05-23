@@ -311,6 +311,26 @@ fn step_b_system_prompt_requests_dutch_output() {
 }
 
 #[test]
+fn step_b_system_prompt_demands_brevity() {
+    assert!(STEP_B_SYSTEM_PROMPT.contains("terse"));
+}
+
+#[test]
+fn step_b_system_prompt_rejects_correlation_as_cause() {
+    assert!(STEP_B_SYSTEM_PROMPT.contains("correlation, not a cause"));
+}
+
+#[test]
+fn step_b_system_prompt_forbids_restating_trigger() {
+    assert!(STEP_B_SYSTEM_PROMPT.contains("trigger, not the root cause"));
+}
+
+#[test]
+fn step_b_system_prompt_caps_suggested_action_steps() {
+    assert!(STEP_B_SYSTEM_PROMPT.contains("2-3 concrete steps"));
+}
+
+#[test]
 fn step_b_prompt_wraps_evidence_in_untrusted_tags() {
     let p = compose_step_b_prompt(&sample_event(), &sample_evidence(vec![]));
     assert!(p.contains("<UNTRUSTED_EVIDENCE>"));
