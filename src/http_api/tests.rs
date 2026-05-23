@@ -240,6 +240,59 @@ fn actionable_mode_gets_twenty_iterations() {
     assert_eq!(max_iterations_for(&mode), 20);
 }
 
+fn with_keepalive_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+    let prev = std::env::var("CHAT_STREAM_KEEPALIVE_SECONDS").ok();
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var("CHAT_STREAM_KEEPALIVE_SECONDS", v),
+            None => std::env::remove_var("CHAT_STREAM_KEEPALIVE_SECONDS"),
+        }
+    }
+    let r = f();
+    unsafe {
+        match prev {
+            Some(p) => std::env::set_var("CHAT_STREAM_KEEPALIVE_SECONDS", p),
+            None => std::env::remove_var("CHAT_STREAM_KEEPALIVE_SECONDS"),
+        }
+    }
+    r
+}
+
+#[test]
+#[serial_test::serial]
+fn keepalive_secs_defaults_to_ten() {
+    with_keepalive_env(None, || {
+        assert_eq!(keepalive_secs(), 10);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn keepalive_secs_parses_env_override() {
+    with_keepalive_env(Some("20"), || {
+        assert_eq!(keepalive_secs(), 20);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn keepalive_secs_clamps_to_sane_range() {
+    with_keepalive_env(Some("1"), || {
+        assert_eq!(keepalive_secs(), 3);
+    });
+    with_keepalive_env(Some("120"), || {
+        assert_eq!(keepalive_secs(), 60);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn keepalive_secs_falls_back_on_garbage_value() {
+    with_keepalive_env(Some("not-a-number"), || {
+        assert_eq!(keepalive_secs(), 10);
+    });
+}
+
 #[test]
 #[serial_test::serial]
 fn chat_suggestions_enabled_defaults_true_when_unset() {

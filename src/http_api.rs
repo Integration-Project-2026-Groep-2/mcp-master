@@ -105,6 +105,28 @@ fn approval_ttl() -> std::time::Duration {
     }
 }
 
+/// Read `CHAT_STREAM_KEEPALIVE_SECONDS`; default 10s, clamped to 3..=60. The
+/// keep-alive comment must fire faster than any proxy idle-timeout so the SSE
+/// connection is not torn down during silent tool calls.
+fn keepalive_secs() -> u64 {
+    const DEFAULT_SECS: u64 = 10;
+    const MIN_SECS: u64 = 3;
+    const MAX_SECS: u64 = 60;
+    match std::env::var("CHAT_STREAM_KEEPALIVE_SECONDS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => secs.clamp(MIN_SECS, MAX_SECS),
+            Err(_) => {
+                tracing::warn!(
+                    raw = %raw,
+                    "CHAT_STREAM_KEEPALIVE_SECONDS unparseable — falling back to {DEFAULT_SECS}s"
+                );
+                DEFAULT_SECS
+            }
+        },
+        Err(_) => DEFAULT_SECS,
+    }
+}
+
 /// Wire-level role for one chat turn. Strict-lowercase to match Anthropic's
 /// convention and the JS-side string literals in jarvis_chat.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -900,7 +922,8 @@ async fn chat_stream(
         }
     };
 
-    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(event_stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(keepalive_secs()))))
 }
 
 fn chat_suggestions_enabled() -> bool {
