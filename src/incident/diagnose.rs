@@ -12,7 +12,7 @@ use crate::agent::orchestrator::{self, McpExecutor, RunOutcome, ToolCallTrace};
 use crate::http_api::AppState;
 use crate::memory::{MemoryInteraction, MemoryService, MemorySource};
 
-const STEP_A_TOOLS: &[&str] = &["fetch_logs", "fetch_recent_deploys"];
+const STEP_A_TOOLS: &[&str] = &["fetch_logs", "error_analysis", "fetch_recent_deploys"];
 const STEP_A_MAX_ITERATIONS: usize = 6;
 const STEP_A_MAX_TOKENS: u32 = 8192;
 const STEP_B_MAX_TOKENS: u32 = 8192;

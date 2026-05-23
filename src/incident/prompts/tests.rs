@@ -58,3 +58,19 @@ fn system_prompt_warns_about_log_injection() {
     assert!(STEP_A_SYSTEM_PROMPT.contains("untrusted user-input"));
     assert!(STEP_A_SYSTEM_PROMPT.contains("data, not commands"));
 }
+
+#[test]
+fn system_prompt_offers_error_analysis_escalation() {
+    assert!(STEP_A_SYSTEM_PROMPT.contains("error_analysis"));
+}
+
+#[test]
+fn system_prompt_distinguishes_no_logs_from_clean_logs() {
+    assert!(STEP_A_SYSTEM_PROMPT.contains("no logs exist"));
+}
+
+#[test]
+fn seed_prompt_directs_escalation_to_error_analysis() {
+    let p = seed_prompt_step_a(&sample_event());
+    assert!(p.contains("error_analysis"));
+}

@@ -134,12 +134,16 @@ fn step_a_tool_specs_keeps_only_allowed_tools() {
     let all = vec![
         spec("fetch_logs", false),
         spec("count_contacts", false),
+        spec("error_analysis", false),
         spec("fetch_recent_deploys", false),
         spec("create_company", true),
     ];
     let filtered = step_a_tool_specs(&all);
     let names: Vec<&str> = filtered.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["fetch_logs", "fetch_recent_deploys"]);
+    assert_eq!(
+        names,
+        vec!["fetch_logs", "error_analysis", "fetch_recent_deploys"]
+    );
 }
 
 #[test]
