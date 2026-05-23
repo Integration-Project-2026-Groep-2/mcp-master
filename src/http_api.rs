@@ -421,6 +421,7 @@ async fn chat(
         crate::agent::orchestrator::generate_suggestions(
             &state.llm,
             &outcome.answer,
+            &state.tool_specs,
             &correlation_id,
         )
         .await

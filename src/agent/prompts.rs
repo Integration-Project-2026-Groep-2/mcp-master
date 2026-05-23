@@ -106,10 +106,12 @@ Input (in de user-message): het eindantwoord dat de assistent zojuist gaf, omhul
 
 Taak: produceer EXACT 3 korte vervolg-vragen die een admin als logische volgende stap zou stellen. Elke vraag is een complete Nederlandse zin tussen 5 en 80 tekens.
 
-LANGUAGE: schrijf alle vervolgvragen in het Nederlands. Houd JSON-keys in het Engels.
+Beschikbare tools: onderaan deze prompt staat de lijst met tools die de assistent kan aanroepen (naam + beschrijving). Elke vervolgvraag MOET beantwoordbaar zijn met precies ÉÉN van die tools. Stel nooit een vraag waarvoor geen passende tool bestaat. Vermeld bij elke vraag de exacte tool-naam uit de lijst die ze zou beantwoorden.
+
+LANGUAGE: schrijf alle vervolgvragen in het Nederlands. Houd JSON-keys en tool-namen in het Engels.
 
 Output: één JSON-object, niets ervoor of erna, geen markdown-fences:
-{\"texts\": [\"...\", \"...\", \"...\"]}
+{\"items\": [{\"text\": \"...\", \"tool\": \"<tool_naam>\"}, {\"text\": \"...\", \"tool\": \"<tool_naam>\"}, {\"text\": \"...\", \"tool\": \"<tool_naam>\"}]}
 ";
 
 #[cfg(test)]
