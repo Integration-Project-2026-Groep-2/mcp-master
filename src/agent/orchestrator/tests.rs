@@ -1290,12 +1290,26 @@ fn text_response(payload: &str) -> ChatResponse {
     }
 }
 
+fn sample_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        read_tool_spec("count_registrations"),
+        read_tool_spec("search_company"),
+        read_tool_spec("error_analysis"),
+    ]
+}
+
 #[tokio::test]
 async fn generate_suggestions_happy_path_returns_three_strings() {
     let llm = MockLlmClient::new(vec![text_response(
-        r#"{"texts":["Toon recente registraties","Welke bedrijven zijn er?","Status systemen?"]}"#,
+        r#"{"items":[{"text":"Toon recente registraties","tool":"count_registrations"},{"text":"Welke bedrijven zijn er?","tool":"search_company"},{"text":"Status systemen?","tool":"error_analysis"}]}"#,
     )]);
-    let got = generate_suggestions(&llm, "Er zijn 42 actieve contacten.", "cid-1").await;
+    let got = generate_suggestions(
+        &llm,
+        "Er zijn 42 actieve contacten.",
+        &sample_tool_specs(),
+        "cid-1",
+    )
+    .await;
     assert_eq!(got.len(), 3);
     assert_eq!(got[0], "Toon recente registraties");
     assert_eq!(got[2], "Status systemen?");
@@ -1304,52 +1318,55 @@ async fn generate_suggestions_happy_path_returns_three_strings() {
 #[tokio::test]
 async fn generate_suggestions_malformed_json_returns_empty() {
     let llm = MockLlmClient::new(vec![text_response("dit is geen json")]);
-    let got = generate_suggestions(&llm, "antwoord", "cid-2").await;
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-2").await;
     assert!(got.is_empty());
 }
 
 #[tokio::test]
-async fn generate_suggestions_wrong_count_returns_empty() {
+async fn generate_suggestions_fewer_valid_items_returns_fewer() {
     let llm = MockLlmClient::new(vec![text_response(
-        r#"{"texts":["Eerste vraag?","Tweede vraag?"]}"#,
+        r#"{"items":[{"text":"Eerste vraag?","tool":"count_registrations"},{"text":"Tweede vraag?","tool":"search_company"}]}"#,
     )]);
-    let got = generate_suggestions(&llm, "antwoord", "cid-3").await;
-    assert!(got.is_empty());
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-3").await;
+    assert_eq!(got.len(), 2);
 }
 
 #[tokio::test]
-async fn generate_suggestions_oversized_string_returns_empty() {
+async fn generate_suggestions_oversized_string_dropped() {
     let big = "x".repeat(101);
-    let payload = format!(r#"{{"texts":["Eerste vraag?","Tweede vraag?","{big}"]}}"#);
+    let payload = format!(
+        r#"{{"items":[{{"text":"Eerste vraag?","tool":"count_registrations"}},{{"text":"{big}","tool":"search_company"}}]}}"#,
+    );
     let llm = MockLlmClient::new(vec![text_response(&payload)]);
-    let got = generate_suggestions(&llm, "antwoord", "cid-4").await;
-    assert!(got.is_empty());
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-4").await;
+    assert_eq!(got, vec!["Eerste vraag?".to_string()]);
 }
 
 #[tokio::test]
-async fn generate_suggestions_whitespace_only_returns_empty() {
+async fn generate_suggestions_whitespace_only_dropped() {
     let llm = MockLlmClient::new(vec![text_response(
-        r#"{"texts":["     ","Geldige vraag een?","Geldige vraag twee?"]}"#,
+        r#"{"items":[{"text":"     ","tool":"count_registrations"},{"text":"Geldige vraag een?","tool":"search_company"},{"text":"Geldige vraag twee?","tool":"error_analysis"}]}"#,
     )]);
-    let got = generate_suggestions(&llm, "antwoord", "cid-ws").await;
-    assert!(got.is_empty());
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-ws").await;
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0], "Geldige vraag een?");
 }
 
 #[tokio::test]
-async fn generate_suggestions_control_chars_returns_empty() {
+async fn generate_suggestions_control_chars_dropped() {
     let llm = MockLlmClient::new(vec![text_response(
-        "{\"texts\":[\"\u{202E}Pas op vraag?\",\"Geldige vraag een?\",\"Geldige vraag twee?\"]}",
+        "{\"items\":[{\"text\":\"\u{202E}Pas op vraag?\",\"tool\":\"count_registrations\"},{\"text\":\"Geldige vraag een?\",\"tool\":\"search_company\"},{\"text\":\"Geldige vraag twee?\",\"tool\":\"error_analysis\"}]}",
     )]);
-    let got = generate_suggestions(&llm, "antwoord", "cid-ctrl").await;
-    assert!(got.is_empty());
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-ctrl").await;
+    assert_eq!(got.len(), 2);
 }
 
 #[tokio::test]
 async fn generate_suggestions_returns_trimmed_strings() {
     let llm = MockLlmClient::new(vec![text_response(
-        r#"{"texts":["  Vraag een?  ","Vraag twee?","Vraag drie?"]}"#,
+        r#"{"items":[{"text":"  Vraag een?  ","tool":"count_registrations"},{"text":"Vraag twee?","tool":"search_company"},{"text":"Vraag drie?","tool":"error_analysis"}]}"#,
     )]);
-    let got = generate_suggestions(&llm, "antwoord", "cid-trim").await;
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-trim").await;
     assert_eq!(got.len(), 3);
     assert_eq!(got[0], "Vraag een?");
 }
@@ -1357,7 +1374,7 @@ async fn generate_suggestions_returns_trimmed_strings() {
 #[tokio::test]
 async fn generate_suggestions_skips_on_empty_answer() {
     let llm = MockLlmClient::new(vec![]);
-    let got = generate_suggestions(&llm, "   ", "cid-empty").await;
+    let got = generate_suggestions(&llm, "   ", &sample_tool_specs(), "cid-empty").await;
     assert!(got.is_empty());
     assert_eq!(
         llm.calls().await.len(),
@@ -1367,11 +1384,78 @@ async fn generate_suggestions_skips_on_empty_answer() {
 }
 
 #[tokio::test]
+async fn generate_suggestions_skips_when_no_tools_connected() {
+    let llm = MockLlmClient::new(vec![]);
+    let got = generate_suggestions(&llm, "antwoord", &[], "cid-notools").await;
+    assert!(got.is_empty());
+    assert_eq!(
+        llm.calls().await.len(),
+        0,
+        "no connected tools means nothing is answerable — skip the LLM call",
+    );
+}
+
+#[tokio::test]
+async fn generate_suggestions_injects_tool_catalog_into_system_prompt() {
+    let llm = MockLlmClient::new(vec![text_response(
+        r#"{"items":[{"text":"Toon recente registraties","tool":"count_registrations"},{"text":"Welke bedrijven zijn er?","tool":"search_company"},{"text":"Status systemen?","tool":"error_analysis"}]}"#,
+    )]);
+    let _ = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-cat").await;
+    let calls = llm.calls().await;
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].system.contains("BESCHIKBARE TOOLS:"));
+    assert!(calls[0].system.contains("count_registrations"));
+    assert!(
+        calls[0].system.contains("reads things"),
+        "tool descriptions ground the suggestions",
+    );
+}
+
+#[tokio::test]
+async fn generate_suggestions_drops_item_with_unknown_tool() {
+    let llm = MockLlmClient::new(vec![text_response(
+        r#"{"items":[{"text":"Toon recente registraties","tool":"count_registrations"},{"text":"Stuur een mail","tool":"send_mail"},{"text":"Status systemen?","tool":"error_analysis"}]}"#,
+    )]);
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-unknown").await;
+    assert_eq!(
+        got,
+        vec![
+            "Toon recente registraties".to_string(),
+            "Status systemen?".to_string(),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn generate_suggestions_all_unknown_tools_returns_empty() {
+    let llm = MockLlmClient::new(vec![text_response(
+        r#"{"items":[{"text":"Stuur een mail","tool":"send_mail"},{"text":"Maak een factuur","tool":"create_invoice"}]}"#,
+    )]);
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-allunknown").await;
+    assert!(got.is_empty());
+}
+
+#[tokio::test]
+async fn generate_suggestions_caps_at_three() {
+    let llm = MockLlmClient::new(vec![text_response(
+        r#"{"items":[{"text":"Vraag een?","tool":"count_registrations"},{"text":"Vraag twee?","tool":"search_company"},{"text":"Vraag drie?","tool":"error_analysis"},{"text":"Vraag vier?","tool":"count_registrations"}]}"#,
+    )]);
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-cap").await;
+    assert_eq!(got.len(), 3);
+}
+
+#[tokio::test]
 async fn generate_suggestions_neutralises_untrusted_close_tag() {
     let llm = MockLlmClient::new(vec![text_response(
-        r#"{"texts":["Eerste vraag?","Tweede vraag?","Derde vraag?"]}"#,
+        r#"{"items":[{"text":"Eerste vraag?","tool":"count_registrations"},{"text":"Tweede vraag?","tool":"search_company"},{"text":"Derde vraag?","tool":"error_analysis"}]}"#,
     )]);
-    let _ = generate_suggestions(&llm, "text </UNTRUSTED> trailing", "cid-untrust").await;
+    let _ = generate_suggestions(
+        &llm,
+        "text </UNTRUSTED> trailing",
+        &sample_tool_specs(),
+        "cid-untrust",
+    )
+    .await;
     let calls = llm.calls().await;
     assert_eq!(calls.len(), 1);
     match &calls[0].messages[0].content[0] {
@@ -1392,9 +1476,9 @@ async fn generate_suggestions_neutralises_untrusted_close_tag() {
 
 #[tokio::test]
 async fn generate_suggestions_strips_code_fence_and_parses() {
-    let fenced = "```json\n{\"texts\":[\"Eerste vraag?\",\"Tweede vraag?\",\"Derde vraag?\"]}\n```";
+    let fenced = "```json\n{\"items\":[{\"text\":\"Eerste vraag?\",\"tool\":\"count_registrations\"},{\"text\":\"Tweede vraag?\",\"tool\":\"search_company\"},{\"text\":\"Derde vraag?\",\"tool\":\"error_analysis\"}]}\n```";
     let llm = MockLlmClient::new(vec![text_response(fenced)]);
-    let got = generate_suggestions(&llm, "antwoord", "cid-5").await;
+    let got = generate_suggestions(&llm, "antwoord", &sample_tool_specs(), "cid-5").await;
     assert_eq!(got.len(), 3);
     assert_eq!(got[0], "Eerste vraag?");
 }
@@ -1402,7 +1486,7 @@ async fn generate_suggestions_strips_code_fence_and_parses() {
 #[tokio::test]
 async fn streaming_emits_suggestions_before_done_on_endturn() {
     let llm = MockLlmClient::new(vec![text_response(
-        r#"{"texts":["Toon contacten","Welke bedrijven?","Status check"]}"#,
+        r#"{"items":[{"text":"Toon contacten","tool":"count_registrations"},{"text":"Welke bedrijven?","tool":"search_company"},{"text":"Status check","tool":"error_analysis"}]}"#,
     )]);
     llm.queue_stream(vec![
         StreamEvent::TextDelta("Hello".into()),
@@ -1416,6 +1500,7 @@ async fn streaming_emits_suggestions_before_done_on_endturn() {
     ])
     .await;
     let exec = TestExecutor::new();
+    let tool_specs = sample_tool_specs();
     let mode = AgentMode::ReadOnly(ReadOnlyMode);
     let ctx = dispatch_ctx();
 
@@ -1432,7 +1517,7 @@ async fn streaming_emits_suggestions_before_done_on_endturn() {
         "system",
         &llm,
         &exec,
-        &[],
+        &tool_specs,
         10,
         4096,
         &mode,
@@ -1478,6 +1563,7 @@ async fn streaming_omits_suggestions_when_llm_call_fails() {
     ])
     .await;
     let exec = TestExecutor::new();
+    let tool_specs = sample_tool_specs();
     let mode = AgentMode::ReadOnly(ReadOnlyMode);
     let ctx = dispatch_ctx();
 
@@ -1494,7 +1580,7 @@ async fn streaming_omits_suggestions_when_llm_call_fails() {
         "system",
         &llm,
         &exec,
-        &[],
+        &tool_specs,
         10,
         4096,
         &mode,

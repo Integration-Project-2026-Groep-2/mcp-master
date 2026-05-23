@@ -448,7 +448,8 @@ pub async fn run_with_messages_in_mode_streaming(
 
         match stop_reason {
             StopReason::EndTurn => {
-                maybe_emit_suggestions(&full_content, &tx, llm, &ctx.correlation_id).await;
+                maybe_emit_suggestions(&full_content, &tx, llm, tool_specs, &ctx.correlation_id)
+                    .await;
                 let _ = tx
                     .send(ProgressEvent::Done {
                         tokens,
@@ -640,25 +641,45 @@ fn collect_text(content: &[ContentBlock]) -> String {
 }
 
 #[derive(Deserialize)]
+struct SuggestionItem {
+    text: String,
+    tool: String,
+}
+
+#[derive(Deserialize)]
 struct SuggestionsPayload {
-    texts: Vec<String>,
+    items: Vec<SuggestionItem>,
 }
 
 const SUGGESTIONS_MAX_TOKENS: u32 = 256;
 const SUGGESTIONS_TIMEOUT_SECS: u64 = 15;
 const SUGGESTIONS_MIN_CHARS: usize = 5;
 const SUGGESTIONS_MAX_CHARS: usize = 80;
+const SUGGESTIONS_MAX_RESULTS: usize = 3;
 
 /// Returns `Vec::new()` on any failure so the terminal `Done` event is never
 /// delayed by a stuck inference and the caller can skip the SSE frame.
+///
+/// Grounded in `tool_specs`: the live tool catalogue is injected into the
+/// prompt and every returned item must name a tool present in it. Items naming
+/// an unknown tool are dropped, so each surfaced suggestion maps to something
+/// an MCP server can actually answer. No tools connected = nothing answerable
+/// = no suggestions.
 pub(crate) async fn generate_suggestions(
     llm: &dyn LlmClient,
     final_answer: &str,
+    tool_specs: &[ToolSpec],
     correlation_id: &str,
 ) -> Vec<String> {
-    if final_answer.trim().is_empty() {
+    if final_answer.trim().is_empty() || tool_specs.is_empty() {
         return Vec::new();
     }
+    let catalog = tool_specs
+        .iter()
+        .map(|t| format!("- {}: {}", t.name, t.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system_prompt = format!("{SUGGESTIONS_SYSTEM_PROMPT}\n\nBESCHIKBARE TOOLS:\n{catalog}");
     let safe_answer = final_answer.replace("</UNTRUSTED>", "</UNTRUSTED_>");
     let user_text = format!("<UNTRUSTED>{safe_answer}</UNTRUSTED>\n\nGenereer 3 vervolgvragen.");
     let messages = vec![Message {
@@ -667,12 +688,7 @@ pub(crate) async fn generate_suggestions(
     }];
     let outcome = tokio::time::timeout(
         Duration::from_secs(SUGGESTIONS_TIMEOUT_SECS),
-        llm.chat(
-            SUGGESTIONS_SYSTEM_PROMPT,
-            &messages,
-            &[],
-            SUGGESTIONS_MAX_TOKENS,
-        ),
+        llm.chat(&system_prompt, &messages, &[], SUGGESTIONS_MAX_TOKENS),
     )
     .await;
     let response = match outcome {
@@ -695,32 +711,35 @@ pub(crate) async fn generate_suggestions(
             return Vec::new();
         }
     };
-    if payload.texts.len() != 3 {
-        tracing::warn!(%correlation_id, len = payload.texts.len(), "suggestions wrong count");
-        return Vec::new();
-    }
-    for t in &payload.texts {
-        let trimmed = t.trim();
+    let valid_tools: std::collections::HashSet<&str> =
+        tool_specs.iter().map(|t| t.name.as_str()).collect();
+    let mut out = Vec::new();
+    for item in payload.items {
+        let trimmed = item.text.trim();
         let n = trimmed.chars().count();
         let has_disallowed = trimmed.chars().any(is_disallowed_suggestion_char);
+        let unknown_tool = !valid_tools.contains(item.tool.as_str());
         if trimmed.is_empty()
             || !(SUGGESTIONS_MIN_CHARS..=SUGGESTIONS_MAX_CHARS).contains(&n)
             || has_disallowed
+            || unknown_tool
         {
             tracing::warn!(
                 %correlation_id,
                 chars = n,
                 disallowed = has_disallowed,
-                "suggestion failed validation"
+                unknown_tool,
+                tool = %item.tool,
+                "suggestion dropped"
             );
-            return Vec::new();
+            continue;
+        }
+        out.push(trimmed.to_string());
+        if out.len() == SUGGESTIONS_MAX_RESULTS {
+            break;
         }
     }
-    payload
-        .texts
-        .into_iter()
-        .map(|t| t.trim().to_string())
-        .collect()
+    out
 }
 
 /// Frontend `textContent` defangs HTML but cannot stop RTL-override or ZWJ
@@ -735,13 +754,14 @@ async fn maybe_emit_suggestions(
     full_content: &[ContentBlock],
     tx: &mpsc::Sender<ProgressEvent>,
     llm: &dyn LlmClient,
+    tool_specs: &[ToolSpec],
     correlation_id: &str,
 ) {
     let answer_text = collect_text(full_content);
     if answer_text.is_empty() {
         return;
     }
-    let texts = generate_suggestions(llm, &answer_text, correlation_id).await;
+    let texts = generate_suggestions(llm, &answer_text, tool_specs, correlation_id).await;
     if !texts.is_empty() {
         let _ = tx.send(ProgressEvent::Suggestions { texts }).await;
     }
