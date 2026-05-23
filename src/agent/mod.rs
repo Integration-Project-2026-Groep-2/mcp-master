@@ -7,3 +7,4 @@ pub mod llm;
 pub mod modes;
 pub mod orchestrator;
 pub mod prompts;
+pub mod repo_map;
