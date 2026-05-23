@@ -42,6 +42,14 @@ const MAX_RETRIES: u32 = 3;
 /// bounded separately by the orchestrator's wall-clock cap.
 const CHAT_REQUEST_TIMEOUT_SECS: u64 = 180;
 
+/// Connect-phase deadline on the shared client (applies to BOTH `chat` and
+/// `stream_chat`). Unlike a total request timeout, `connect_timeout` bounds only
+/// TCP+TLS establishment — it never truncates an in-flight stream — so a hung
+/// connect fails fast on the streaming path too. Helps a fresh connect
+/// (post-idle / pool-expiry); a reused-but-dead socket still leans on the
+/// per-request timeout / orchestrator cap.
+const CLIENT_CONNECT_TIMEOUT_SECS: u64 = 30;
+
 /// HTTP client for the Anthropic Messages API.
 pub struct AnthropicClient {
     http: reqwest::Client,
@@ -54,7 +62,10 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     pub fn new(api_key: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(CLIENT_CONNECT_TIMEOUT_SECS))
+                .build()
+                .expect("reqwest client with connect_timeout is statically valid"),
             api_key,
             model: DEFAULT_MODEL.to_string(),
             base_url: DEFAULT_BASE_URL.to_string(),
