@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use lapin::{
-    Connection, ConnectionProperties, ExchangeKind,
+    ExchangeKind,
     options::{BasicConsumeOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions},
     types::FieldTable,
 };
@@ -53,9 +53,7 @@ async fn consume_session(
     config: &RabbitMqConfig,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let conn = Connection::connect(&config.url, ConnectionProperties::default())
-        .await
-        .context("AMQP connection")?;
+    let conn = super::connect_with_timeout(&config.url).await?;
     let channel = conn.create_channel().await.context("AMQP channel")?;
 
     channel

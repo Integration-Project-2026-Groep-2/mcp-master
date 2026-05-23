@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use lapin::{
-    BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
+    BasicProperties, Channel, Connection, ExchangeKind,
     options::{BasicPublishOptions, ExchangeDeclareOptions},
     types::FieldTable,
 };
@@ -42,9 +42,7 @@ impl Publisher {
     /// Connect once, declare the exchange, return the (Conn, Channel) pair.
     /// Used both by `connect` and by the reconnect path inside `publish_event`.
     async fn open_inner(config: &RabbitMqConfig) -> Result<PublisherInner> {
-        let conn = Connection::connect(&config.url, ConnectionProperties::default())
-            .await
-            .context("AMQP connection")?;
+        let conn = super::connect_with_timeout(&config.url).await?;
         let channel = conn.create_channel().await.context("AMQP channel")?;
         channel
             .exchange_declare(

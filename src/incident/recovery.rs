@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use lapin::{
-    Connection, ConnectionProperties, ExchangeKind,
+    ExchangeKind,
     options::{
         BasicAckOptions, BasicConsumeOptions, BasicNackOptions, ExchangeDeclareOptions,
         QueueBindOptions, QueueDeclareOptions,
@@ -85,9 +85,7 @@ async fn consume_session(
     publisher: Option<&Arc<Publisher>>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let conn = Connection::connect(&config.url, ConnectionProperties::default())
-        .await
-        .context("AMQP connection")?;
+    let conn = crate::rabbitmq::connect_with_timeout(&config.url).await?;
     let channel = conn.create_channel().await.context("AMQP channel")?;
 
     channel
