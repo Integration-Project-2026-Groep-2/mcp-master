@@ -27,8 +27,20 @@ use crate::{
     teams::{TeamsConfig, publish_to_teams},
 };
 
-const MAX_ITERATIONS: usize = 10;
+const READ_ONLY_MAX_ITERATIONS: usize = 10;
+const ACTIONABLE_MAX_ITERATIONS: usize = 20;
 const MAX_TOKENS: u32 = 8192;
+
+/// Tool-loop budget per mode: read-only Q&A converges in a few rounds, while the
+/// Actionable investigate-and-fix flow is inherently multi-step and needs
+/// headroom rather than bailing mid-investigation.
+fn max_iterations_for(mode: &crate::agent::modes::AgentMode) -> usize {
+    use crate::agent::modes::AgentMode;
+    match mode {
+        AgentMode::ReadOnly(_) => READ_ONLY_MAX_ITERATIONS,
+        AgentMode::Actionable(_) => ACTIONABLE_MAX_ITERATIONS,
+    }
+}
 
 // DoS guards. Total request body capped at the axum layer; in addition the
 // per-turn caps in `ChatRequest::into_messages` reject pathological shapes
@@ -404,7 +416,7 @@ async fn chat(
         &state.llm,
         &state.pool,
         &state.tool_specs,
-        MAX_ITERATIONS,
+        max_iterations_for(&mode),
         MAX_TOKENS,
         &mode,
         &ctx,
@@ -729,7 +741,7 @@ async fn chat_stream(
                 &state_for_orch.llm,
                 &state_for_orch.pool,
                 &specs_for_orch,
-                MAX_ITERATIONS,
+                max_iterations_for(&mode_for_orch),
                 MAX_TOKENS,
                 &mode_for_orch,
                 &ctx_for_orch,
@@ -1044,7 +1056,7 @@ async fn handle_scheduled(
         &state.llm,
         &state.pool,
         &state.tool_specs,
-        MAX_ITERATIONS,
+        READ_ONLY_MAX_ITERATIONS,
         MAX_TOKENS,
     )
     .await

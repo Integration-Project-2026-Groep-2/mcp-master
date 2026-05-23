@@ -219,6 +219,28 @@ fn approval_ttl_falls_back_on_garbage_value() {
 }
 
 #[test]
+fn read_only_mode_gets_ten_iterations() {
+    let mode = crate::agent::modes::AgentMode::ReadOnly(crate::agent::modes::ReadOnlyMode);
+    assert_eq!(max_iterations_for(&mode), 10);
+}
+
+#[test]
+fn actionable_mode_gets_twenty_iterations() {
+    let store = std::sync::Arc::new(crate::gateway::approval::state::ApprovalStore::new(
+        std::time::Duration::from_secs(900),
+    ));
+    let audit = std::sync::Arc::new(crate::gateway::audit::AuditPublisher::new(None));
+    let flow = std::sync::Arc::new(crate::gateway::approval::flow::ApprovalFlow::new(
+        store,
+        audit,
+        std::time::Duration::from_secs(900),
+    ));
+    let mode =
+        crate::agent::modes::AgentMode::Actionable(crate::agent::modes::ActionableMode::new(flow));
+    assert_eq!(max_iterations_for(&mode), 20);
+}
+
+#[test]
 #[serial_test::serial]
 fn chat_suggestions_enabled_defaults_true_when_unset() {
     unsafe {
