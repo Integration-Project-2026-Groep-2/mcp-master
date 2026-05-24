@@ -2,6 +2,7 @@ mod agent;
 mod debug_client;
 mod fix_flow;
 mod gateway;
+mod heartbeat;
 mod http_api;
 mod incident;
 mod mcp;

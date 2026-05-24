@@ -89,6 +89,9 @@ pub struct AppState {
     #[allow(dead_code)]
     pub approval_flow: Arc<crate::gateway::approval::flow::ApprovalFlow>,
     pub fix_flow_limit: Arc<tokio::sync::Semaphore>,
+    /// Live last-seen-per-service map fed by the heartbeat consumer, read by
+    /// `GET /status`.
+    pub heartbeat_state: Arc<crate::heartbeat::HeartbeatState>,
 }
 
 /// Read `CHAT_APPROVAL_TTL_SECONDS` env-var; fall back to 900s (15min) on
@@ -331,6 +334,18 @@ async fn run_cache_sweeper(cache: Arc<SqliteMemory>, mut shutdown_rx: watch::Rec
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Live per-service status derived from the heartbeat tap. Read-only +
+/// unauthenticated like `/health`/`/metrics` — non-sensitive, behind the Drupal
+/// proxy + network isolation. Services never seen are absent (Frontend renders
+/// them "unknown").
+async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let now = chrono::Utc::now();
+    Json(serde_json::json!({
+        "services": crate::heartbeat::snapshot(&state.heartbeat_state, now),
+        "checked_at": now.to_rfc3339(),
+    }))
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1296,6 +1311,7 @@ pub async fn serve(
         metrics_handle,
         approval_flow: approval_flow.clone(),
         fix_flow_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FIX_FLOW)),
+        heartbeat_state: Arc::new(crate::heartbeat::HeartbeatState::new()),
     });
     let teams_config = teams_config.map(Arc::new);
 
@@ -1342,6 +1358,14 @@ pub async fn serve(
         tokio::spawn(crate::rabbitmq::heartbeat::run(
             cfg.url.clone(),
             crate::rabbitmq::heartbeat::HeartbeatConfig::from_env(),
+            shutdown_rx.clone(),
+        ))
+    });
+
+    let heartbeat_tap_handle = consumer_config.as_ref().map(|cfg| {
+        tokio::spawn(crate::heartbeat::run(
+            cfg.clone(),
+            state.heartbeat_state.clone(),
             shutdown_rx.clone(),
         ))
     });
@@ -1407,6 +1431,7 @@ pub async fn serve(
         .route("/chat/stream", stream_route)
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/status", get(status))
         // route_layer (not layer): runs after routing so MatchedPath is set.
         .route_layer(axum::middleware::from_fn(crate::metrics::track_http))
         .with_state(state.clone())
@@ -1500,6 +1525,16 @@ pub async fn serve(
             Ok(Err(e)) => tracing::warn!("heartbeat publisher join error: {e:#}"),
             Err(_) => tracing::warn!(
                 "heartbeat publisher didn't drain in 2s — task left detached, runtime drop will reclaim"
+            ),
+        }
+    }
+    if let Some(h) = heartbeat_tap_handle {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), h).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::warn!("heartbeat consumer exited with error: {e:#}"),
+            Ok(Err(e)) => tracing::warn!("heartbeat consumer join error: {e:#}"),
+            Err(_) => tracing::warn!(
+                "heartbeat consumer didn't drain in 2s — task left detached, runtime drop will reclaim"
             ),
         }
     }
