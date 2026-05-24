@@ -5,6 +5,7 @@ use lapin::{Connection, ConnectionProperties};
 
 pub mod config;
 pub mod consumer;
+pub mod heartbeat;
 pub mod publisher;
 
 /// Lenient deadline on AMQP connection establishment. A half-up broker (TCP
