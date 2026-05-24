@@ -58,6 +58,10 @@ const REQUEST_TIMEOUT_SECONDS: u64 = 240;
 // queue te lang blijft staan.
 const MAX_CONCURRENT_CHAT: usize = 8;
 
+// Background /fix-flow runs detach from the request concurrency slot (it frees
+// at the 202), so they get their own cap to bound concurrent agent token-burn.
+const MAX_CONCURRENT_FIX_FLOW: usize = 4;
+
 // Wallclock cap for the entire `/chat/stream` run. TimeoutLayer is
 // deliberately not applied to the streaming route (would kill long-but-
 // legitimate tool-cascades) so this is the hard bound on a concurrency
@@ -84,6 +88,7 @@ pub struct AppState {
     /// (not Arc<AppState>) — keeps `Arc::try_unwrap` clean at shutdown.
     #[allow(dead_code)]
     pub approval_flow: Arc<crate::gateway::approval::flow::ApprovalFlow>,
+    pub fix_flow_limit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Read `CHAT_APPROVAL_TTL_SECONDS` env-var; fall back to 900s (15min) on
@@ -580,6 +585,15 @@ async fn fix_flow(
         }));
         return (StatusCode::BAD_REQUEST, body).into_response();
     }
+    let permit = match state.fix_flow_limit.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let body = Json(serde_json::json!({
+                "error": "fix-flow capacity reached — retry shortly"
+            }));
+            return (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+        }
+    };
 
     let correlation_id = req
         .correlation_id
@@ -602,22 +616,21 @@ async fn fix_flow(
     };
 
     let state_clone = state.clone();
-    let mut shutdown_rx = shutdown_rx;
     tokio::spawn(async move {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {}
-            _ = crate::fix_flow::run_fix_flow(
-                &state_clone.llm,
-                &state_clone.pool,
-                &state_clone.tool_specs,
-                &mode,
-                state_clone.publisher.as_deref(),
-                &req,
-                &ctx,
-                max_iterations,
-                MAX_TOKENS,
-            ) => {}
-        }
+        let _permit = permit;
+        crate::fix_flow::run_fix_flow(
+            &state_clone.llm,
+            &state_clone.pool,
+            &state_clone.tool_specs,
+            &mode,
+            state_clone.publisher.as_deref(),
+            &req,
+            &ctx,
+            max_iterations,
+            MAX_TOKENS,
+            shutdown_rx,
+        )
+        .await;
     });
 
     let body = Json(serde_json::json!({ "correlation_id": correlation_id }));
@@ -1282,6 +1295,7 @@ pub async fn serve(
         memory,
         metrics_handle,
         approval_flow: approval_flow.clone(),
+        fix_flow_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FIX_FLOW)),
     });
     let teams_config = teams_config.map(Arc::new);
 

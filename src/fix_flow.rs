@@ -8,6 +8,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use crate::agent::llm::{ContentBlock, LlmClient, Message, Role, ToolSpec};
 use crate::agent::modes::{AgentMode, DispatchContext};
@@ -77,11 +78,12 @@ pub fn outcome_event(outcome: &RunOutcome, service: &str, correlation_id: &str) 
     }
 }
 
-fn failed_event(service: &str, correlation_id: &str) -> Value {
+fn failed_event(service: &str, correlation_id: &str, reason: &str) -> Value {
     json!({
         "correlation_id": correlation_id,
         "service": service,
         "status": "failed",
+        "reason": reason,
     })
 }
 
@@ -99,6 +101,7 @@ pub async fn run_fix_flow(
     ctx: &DispatchContext,
     max_iterations: usize,
     max_tokens: u32,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let system_prompt = format!(
         "{SETUP_PROMPT}{}",
@@ -111,7 +114,7 @@ pub async fn run_fix_flow(
         }],
     }];
 
-    let payload = match tokio::time::timeout(
+    let run = tokio::time::timeout(
         std::time::Duration::from_secs(FIX_FLOW_TIMEOUT_SECS),
         orchestrator::run_with_messages_in_mode(
             messages,
@@ -124,17 +127,26 @@ pub async fn run_fix_flow(
             mode,
             ctx,
         ),
-    )
-    .await
-    {
-        Ok(Ok(outcome)) => outcome_event(&outcome, &req.service, &ctx.correlation_id),
-        Ok(Err(e)) => {
-            tracing::warn!(correlation_id = %ctx.correlation_id, "fix-flow run failed: {e:#}");
-            failed_event(&req.service, &ctx.correlation_id)
+    );
+
+    // Publish runs after this select!, not inside an arm, so a shutdown cancels
+    // only the agent run — never the fix_proposed event mid-flight.
+    let payload = tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => {
+            tracing::info!(correlation_id = %ctx.correlation_id, "fix-flow aborted by shutdown");
+            return;
         }
-        Err(_) => {
-            tracing::warn!(correlation_id = %ctx.correlation_id, "fix-flow run timed out");
-            failed_event(&req.service, &ctx.correlation_id)
+        result = run => match result {
+            Ok(Ok(outcome)) => outcome_event(&outcome, &req.service, &ctx.correlation_id),
+            Ok(Err(e)) => {
+                tracing::warn!(correlation_id = %ctx.correlation_id, "fix-flow run failed: {e:#}");
+                failed_event(&req.service, &ctx.correlation_id, "error")
+            }
+            Err(_) => {
+                tracing::warn!(correlation_id = %ctx.correlation_id, "fix-flow run timed out");
+                failed_event(&req.service, &ctx.correlation_id, "timeout")
+            }
         }
     };
 

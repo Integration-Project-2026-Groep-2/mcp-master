@@ -44,7 +44,7 @@ fn outcome(traces: Vec<ToolCallTrace>) -> RunOutcome {
 }
 
 #[test]
-fn fix_event_proposed_carries_action_id() {
+fn outcome_event_proposed_carries_action_id() {
     let o = outcome(vec![trace(Some("pending"), Some("act-1"))]);
     let ev = outcome_event(&o, "crm", "corr-1");
     assert_eq!(ev["status"], "proposed");
@@ -54,10 +54,19 @@ fn fix_event_proposed_carries_action_id() {
 }
 
 #[test]
-fn fix_event_no_action_when_nothing_pending() {
+fn outcome_event_no_action_when_nothing_pending() {
     // A normal dispatched read (no pending write) -> no proposal.
     let o = outcome(vec![trace(None, None)]);
     let ev = outcome_event(&o, "crm", "corr-1");
     assert_eq!(ev["status"], "no_action");
     assert!(ev.get("action_id").is_none());
+}
+
+#[test]
+fn failed_event_carries_reason() {
+    let ev = failed_event("crm", "corr-1", "timeout");
+    assert_eq!(ev["status"], "failed");
+    assert_eq!(ev["reason"], "timeout");
+    assert_eq!(ev["service"], "crm");
+    assert_eq!(ev["correlation_id"], "corr-1");
 }
