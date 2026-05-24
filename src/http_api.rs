@@ -555,6 +555,75 @@ fn approval_error_response(e: ApprovalError) -> Response {
     (status, body).into_response()
 }
 
+/// Trigger a background fix-flow for an incident. Returns 202 immediately; the
+/// spawned Actionable run proposes a `request_changes_with_files` PR (a pending
+/// action) and publishes `fix_proposed` on `ai.events`. Approval via /chat/approve.
+async fn fix_flow(
+    scope: crate::gateway::auth::AuthScope,
+    State(state): State<Arc<AppState>>,
+    axum::Extension(shutdown_rx): axum::Extension<watch::Receiver<bool>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<crate::fix_flow::FixFlowRequest>,
+) -> Response {
+    if scope != crate::gateway::auth::AuthScope::ReadAndAct {
+        return scope_required_response();
+    }
+    // The proposed write's PendingAction.user_id must equal the later
+    // /chat/approve caller's JWT sub, or confirm() 403s — require a real sub.
+    let user_id = match crate::gateway::auth::current_user_id(&headers) {
+        Some(id) => id,
+        None => return scope_required_response(),
+    };
+    if req.service.trim().is_empty() || req.suggested_action.trim().is_empty() {
+        let body = Json(serde_json::json!({
+            "error": "service and suggested_action are required"
+        }));
+        return (StatusCode::BAD_REQUEST, body).into_response();
+    }
+
+    let correlation_id = req
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    tracing::info!(
+        correlation_id = %correlation_id,
+        service = %req.service,
+        "/fix-flow accepted — spawning background fix-flow"
+    );
+
+    let mode = crate::agent::modes::AgentMode::Actionable(
+        crate::agent::modes::ActionableMode::new(state.approval_flow.clone()),
+    );
+    let max_iterations = max_iterations_for(&mode);
+    let ctx = crate::agent::modes::DispatchContext {
+        correlation_id: correlation_id.clone(),
+        user_id,
+        scope,
+    };
+
+    let state_clone = state.clone();
+    let mut shutdown_rx = shutdown_rx;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {}
+            _ = crate::fix_flow::run_fix_flow(
+                &state_clone.llm,
+                &state_clone.pool,
+                &state_clone.tool_specs,
+                &mode,
+                state_clone.publisher.as_deref(),
+                &req,
+                &ctx,
+                max_iterations,
+                MAX_TOKENS,
+            ) => {}
+        }
+    });
+
+    let body = Json(serde_json::json!({ "correlation_id": correlation_id }));
+    (StatusCode::ACCEPTED, body).into_response()
+}
+
 fn scope_required_response() -> Response {
     let body = Json(serde_json::json!({ "error": "scope read+act required" }));
     (StatusCode::FORBIDDEN, body).into_response()
@@ -1283,6 +1352,7 @@ pub async fn serve(
     let mut approve_route = post(chat_approve);
     let mut reject_route = post(chat_reject);
     let mut stream_route = post(chat_stream);
+    let mut fix_flow_route = post(fix_flow);
     let forget_route = delete(forget_memory);
     // GlobalConcurrencyLimit shares one Arc<Semaphore> across all per-request
     // service clones; the non-global variant builds a fresh semaphore per
@@ -1293,6 +1363,7 @@ pub async fn serve(
     chat_route = chat_route.route_layer(chat_concurrency.clone());
     approve_route = approve_route.route_layer(chat_concurrency.clone());
     reject_route = reject_route.route_layer(chat_concurrency.clone());
+    fix_flow_route = fix_flow_route.route_layer(chat_concurrency.clone());
     stream_route = stream_route.route_layer(chat_concurrency);
 
     // Router-split: TimeoutLayer applies only to non-streaming routes. SSE
@@ -1302,6 +1373,7 @@ pub async fn serve(
         .route("/chat", chat_route)
         .route("/chat/approve", approve_route)
         .route("/chat/reject", reject_route)
+        .route("/fix-flow", fix_flow_route)
         .route("/memory/user/{user_id}", forget_route)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

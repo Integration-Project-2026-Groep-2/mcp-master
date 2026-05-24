@@ -1,5 +1,6 @@
 mod agent;
 mod debug_client;
+mod fix_flow;
 mod gateway;
 mod http_api;
 mod incident;
