@@ -43,7 +43,7 @@ pub type HeartbeatState = DashMap<String, DateTime<Utc>>;
 struct RawHeartbeat {
     #[serde(rename = "serviceId")]
     service_id: String,
-    timestamp: Option<DateTime<Utc>>,
+    timestamp: Option<String>,
 }
 
 /// Parse a heartbeat XML body into `(service, last_seen)`. `last_seen` falls
@@ -55,7 +55,15 @@ fn parse_heartbeat(body: &[u8], now: DateTime<Utc>) -> Result<(String, DateTime<
     if service.is_empty() {
         anyhow::bail!("heartbeat missing serviceId");
     }
-    Ok((service, hb.timestamp.unwrap_or(now)))
+    let last_seen = hb
+        .timestamp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(now);
+    Ok((service, last_seen))
 }
 
 /// Per-service status as served by `GET /status`. `status` is `up`/`down`;

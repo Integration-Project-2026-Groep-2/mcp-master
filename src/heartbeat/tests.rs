@@ -27,6 +27,39 @@ fn parse_heartbeat_falls_back_to_now_when_timestamp_absent() {
 }
 
 #[test]
+fn parse_heartbeat_falls_back_to_now_when_timestamp_empty() {
+    let now = ts("2026-05-24T13:00:00Z");
+    let body = b"<heartbeat><serviceId>crm</serviceId><timestamp></timestamp></heartbeat>";
+
+    let (service, last) = parse_heartbeat(body, now).unwrap();
+
+    assert_eq!(service, "crm");
+    assert_eq!(last, now);
+}
+
+#[test]
+fn parse_heartbeat_falls_back_to_now_when_timestamp_lacks_timezone() {
+    let now = ts("2026-05-24T13:00:00Z");
+    let body = b"<heartbeat><serviceId>crm</serviceId><timestamp>2026-05-24T12:59:30</timestamp></heartbeat>";
+
+    let (service, last) = parse_heartbeat(body, now).unwrap();
+
+    assert_eq!(service, "crm");
+    assert_eq!(last, now);
+}
+
+#[test]
+fn parse_heartbeat_accepts_non_utc_offset_and_converts() {
+    let now = ts("2026-05-24T13:00:00Z");
+    let body = b"<heartbeat><serviceId>crm</serviceId><timestamp>2026-05-24T14:59:30+02:00</timestamp></heartbeat>";
+
+    let (service, last) = parse_heartbeat(body, now).unwrap();
+
+    assert_eq!(service, "crm");
+    assert_eq!(last, ts("2026-05-24T12:59:30Z"));
+}
+
+#[test]
 fn parse_heartbeat_rejects_blank_service() {
     let now = ts("2026-05-24T13:00:00Z");
     let body = b"<heartbeat><serviceId>   </serviceId></heartbeat>";
