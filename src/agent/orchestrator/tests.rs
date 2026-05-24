@@ -1030,6 +1030,91 @@ async fn streaming_tool_loop_emits_started_and_completed() {
 }
 
 #[tokio::test]
+async fn streaming_tooluse_start_emits_started_once_at_block_open() {
+    let llm = MockLlmClient::new(vec![]);
+    // Realistic provider stream: block-open + input deltas + stop, then Done.
+    llm.queue_stream(vec![
+        StreamEvent::ToolUseStart {
+            id: "toolu_1".into(),
+            name: "heartbeat_status".into(),
+        },
+        StreamEvent::ToolUseDelta {
+            id: "toolu_1".into(),
+            partial_json: "{\"limit\": 5}".into(),
+        },
+        StreamEvent::ToolUseStop {
+            id: "toolu_1".into(),
+        },
+        StreamEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            full_content: vec![ContentBlock::ToolUse {
+                id: "toolu_1".into(),
+                name: "heartbeat_status".into(),
+                input: json!({"limit": 5}),
+            }],
+        },
+    ])
+    .await;
+    llm.queue_stream(vec![StreamEvent::Done {
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+        full_content: vec![ContentBlock::Text {
+            text: "green".into(),
+        }],
+    }])
+    .await;
+    let exec = TestExecutor::new()
+        .with_response("heartbeat_status", "[]")
+        .await;
+    let mode = AgentMode::ReadOnly(ReadOnlyMode);
+    let ctx = dispatch_ctx();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+    let drain = async {
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        events
+    };
+    let run = run_with_messages_in_mode_streaming(
+        user_seed("status?"),
+        "system",
+        &llm,
+        &exec,
+        &[],
+        10,
+        4096,
+        &mode,
+        &ctx,
+        tx,
+    );
+    let (result, events) = tokio::join!(run, drain);
+    result.expect("run ok");
+
+    let started: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(e, ProgressEvent::ToolCallStarted { name, .. } if name == "heartbeat_status")
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "exactly one ToolCallStarted — block-open emit, post-Done fallback deduped"
+    );
+
+    let completed = events
+        .iter()
+        .position(|e| matches!(e, ProgressEvent::ToolCallCompleted { name, .. } if name == "heartbeat_status"))
+        .expect("got ToolCallCompleted");
+    assert!(started[0] < completed, "started precedes completed");
+}
+
+#[tokio::test]
 async fn streaming_parallel_tool_dispatch_preserves_order() {
     let llm = MockLlmClient::new(vec![]);
     llm.queue_stream(vec![StreamEvent::Done {
@@ -1088,6 +1173,110 @@ async fn streaming_parallel_tool_dispatch_preserves_order() {
     let (result, events) = tokio::join!(run, drain);
     result.expect("run ok");
 
+    let starts: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::ToolCallStarted { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, vec!["tool_a", "tool_b"]);
+
+    let completes: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::ToolCallCompleted { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completes, vec!["tool_a", "tool_b"]);
+}
+
+#[tokio::test]
+async fn streaming_two_streamed_tools_emit_started_once_each_in_order() {
+    let llm = MockLlmClient::new(vec![]);
+    llm.queue_stream(vec![
+        StreamEvent::ToolUseStart {
+            id: "toolu_a".into(),
+            name: "tool_a".into(),
+        },
+        StreamEvent::ToolUseDelta {
+            id: "toolu_a".into(),
+            partial_json: "{}".into(),
+        },
+        StreamEvent::ToolUseStop {
+            id: "toolu_a".into(),
+        },
+        StreamEvent::ToolUseStart {
+            id: "toolu_b".into(),
+            name: "tool_b".into(),
+        },
+        StreamEvent::ToolUseDelta {
+            id: "toolu_b".into(),
+            partial_json: "{}".into(),
+        },
+        StreamEvent::ToolUseStop {
+            id: "toolu_b".into(),
+        },
+        StreamEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+            full_content: vec![
+                ContentBlock::ToolUse {
+                    id: "toolu_a".into(),
+                    name: "tool_a".into(),
+                    input: json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_b".into(),
+                    name: "tool_b".into(),
+                    input: json!({}),
+                },
+            ],
+        },
+    ])
+    .await;
+    llm.queue_stream(vec![StreamEvent::Done {
+        stop_reason: StopReason::EndTurn,
+        usage: None,
+        full_content: vec![ContentBlock::Text {
+            text: "done".into(),
+        }],
+    }])
+    .await;
+    let exec = TestExecutor::new()
+        .with_response("tool_a", "ra")
+        .await
+        .with_response("tool_b", "rb")
+        .await;
+    let mode = AgentMode::ReadOnly(ReadOnlyMode);
+    let ctx = dispatch_ctx();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressEvent>(64);
+    let drain = async {
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        events
+    };
+    let run = run_with_messages_in_mode_streaming(
+        user_seed("q"),
+        "system",
+        &llm,
+        &exec,
+        &[],
+        10,
+        4096,
+        &mode,
+        &ctx,
+        tx,
+    );
+    let (result, events) = tokio::join!(run, drain);
+    result.expect("run ok");
+
+    // Each streamed tool emits exactly one Started at block-open, in order; the
+    // post-Done fallback is id-deduped, so no duplicate (would be a,b,a,b if broken).
     let starts: Vec<&str> = events
         .iter()
         .filter_map(|e| match e {

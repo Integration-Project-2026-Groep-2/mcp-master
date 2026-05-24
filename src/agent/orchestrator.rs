@@ -401,6 +401,8 @@ pub async fn run_with_messages_in_mode_streaming(
 
         let mut full_content: Vec<ContentBlock> = Vec::new();
         let mut stop_reason = StopReason::Other("stream_ended_without_done".into());
+        let mut announced_tool_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         while let Some(event_result) = stream.next().await {
             match event_result {
@@ -410,13 +412,16 @@ pub async fn run_with_messages_in_mode_streaming(
                 Ok(StreamEvent::ThinkingDelta(text)) => {
                     let _ = tx.send(ProgressEvent::Thinking { text }).await;
                 }
-                Ok(StreamEvent::ToolUseStart { .. })
-                | Ok(StreamEvent::ToolUseDelta { .. })
-                | Ok(StreamEvent::ToolUseStop { .. }) => {
-                    // Provider-level deltas — the orchestrator emits the
-                    // higher-level ToolCallStarted from the aggregated
-                    // tool_use blocks in `full_content` instead.
+                Ok(StreamEvent::ToolUseStart { id, name }) => {
+                    // Announce at block-open: the input can stream for many
+                    // seconds (a full-file arg), leaving the SSE otherwise silent.
+                    let server = mcp.server_label_for(&name);
+                    let _ = tx
+                        .send(ProgressEvent::ToolCallStarted { name, server })
+                        .await;
+                    announced_tool_ids.insert(id);
                 }
+                Ok(StreamEvent::ToolUseDelta { .. }) | Ok(StreamEvent::ToolUseStop { .. }) => {}
                 Ok(StreamEvent::Done {
                     stop_reason: sr,
                     usage,
@@ -497,16 +502,18 @@ pub async fn run_with_messages_in_mode_streaming(
                     bail!(msg);
                 }
 
-                // Surface each upcoming dispatch before we kick off the
-                // parallel join — the UI can render "Calling tool: X" in
-                // the order the assistant requested.
-                for (_, name, _) in &tool_calls {
-                    let _ = tx
-                        .send(ProgressEvent::ToolCallStarted {
-                            name: name.clone(),
-                            server: mcp.server_label_for(name),
-                        })
-                        .await;
+                // Fallback for tools without a streamed ToolUseStart (a
+                // non-streaming provider's default stream_chat yields a
+                // Done-only stream); already-announced ids are skipped.
+                for (id, name, _) in &tool_calls {
+                    if !announced_tool_ids.contains(id) {
+                        let _ = tx
+                            .send(ProgressEvent::ToolCallStarted {
+                                name: name.clone(),
+                                server: mcp.server_label_for(name),
+                            })
+                            .await;
+                    }
                 }
 
                 let tool_futs = tool_calls.into_iter().map(|(id, name, input)| async move {
