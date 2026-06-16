@@ -1,0 +1,60 @@
+name: knowledge-mcp
+
+on:
+  push:
+    branches: [main, dev]
+    paths: ['knowledge-mcp/**', '.github/workflows/knowledge-mcp.yml']
+  pull_request:
+    paths: ['knowledge-mcp/**', '.github/workflows/knowledge-mcp.yml']
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/integration-project-2026-groep-2/knowledge-mcp
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: knowledge-mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-kmcp-cargo-${{ hashFiles('knowledge-mcp/Cargo.lock') }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # excludes the #[ignore] model tests — no ONNX model download in CI
+      - run: cargo test
+
+  image:
+    name: Build image (push on main/dev)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      # Build on every PR too — validates the Dockerfile (incl. --warm/ONNX) before merge.
+      - name: Build image
+        run: docker build -t "$IMAGE:${{ steps.meta.outputs.tag }}" -t "$IMAGE:latest-dev" knowledge-mcp
+      - name: Log in to registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push tags
+        if: github.event_name == 'push'
+        run: |
+          docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
+          docker push "$IMAGE:latest-dev"
